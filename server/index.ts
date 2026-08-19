@@ -1,7 +1,7 @@
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -14,6 +14,19 @@ const OraLob = (oracledb as unknown as {
 
 const PORT = Number(process.env.PORT ?? 3001);
 const MAX_ROWS = 1000;
+const HOST = process.env.HOST || "127.0.0.1";
+const IS_LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
+const AUTH_TOKEN = process.env.DATAFORGE_AUTH_TOKEN ?? "";
+const CREDENTIALS_KEY = (() => {
+  const encoded = process.env.DATAFORGE_ENCRYPTION_KEY;
+  if (!encoded) return null;
+  const key = Buffer.from(encoded, "base64");
+  if (key.length !== 32) throw new Error("DATAFORGE_ENCRYPTION_KEY must be a base64-encoded 32-byte key.");
+  return key;
+})();
+
+if (!IS_LOOPBACK && !AUTH_TOKEN) throw new Error("DATAFORGE_AUTH_TOKEN is required when HOST is not loopback.");
+if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required when HOST is not loopback.");
 
 interface ConnConfig {
   name: string;
@@ -41,18 +54,36 @@ interface QueryOutcome {
   truncated?: boolean;
 }
 
-// Connection registry, persisted to data/connections.json so connections
-// survive restarts. NOTE (prototype tradeoff): passwords are stored in plain
-// text in that local file — a real deployment needs a secrets vault instead.
+// Connection registry, persisted with AES-256-GCM when DATAFORGE_ENCRYPTION_KEY is set.
 const registry = new Map<string, LiveConnection>();
 let seq = 1;
 
 const DATA_DIR = path.resolve(import.meta.dirname, "../data");
 const DATA_FILE = path.join(DATA_DIR, "connections.json");
 
+type StoredConnection = ConnConfig & { id: string };
+type EncryptedRegistry = { version: 2; iv: string; tag: string; data: string };
+
+function decryptRegistry(raw: EncryptedRegistry): StoredConnection[] {
+  if (!CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required to read saved connections.");
+  const decipher = createDecipheriv("aes-256-gcm", CREDENTIALS_KEY, Buffer.from(raw.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(raw.tag, "base64"));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(raw.data, "base64")), decipher.final()]).toString("utf8")) as StoredConnection[];
+}
+
+function encryptRegistry(arr: StoredConnection[]): EncryptedRegistry {
+  if (!CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required to persist connections.");
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", CREDENTIALS_KEY, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(arr)), cipher.final()]);
+  return { version: 2, iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") };
+}
+
 function loadRegistry() {
   try {
-    const arr = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as (ConnConfig & { id: string })[];
+    const stored = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as StoredConnection[] | EncryptedRegistry;
+    if (Array.isArray(stored) && !IS_LOOPBACK) throw new Error("Plaintext connection storage is not allowed for LAN access. Configure DATAFORGE_ENCRYPTION_KEY and migrate the file.");
+    const arr = Array.isArray(stored) ? stored : decryptRegistry(stored);
     for (const c of arr) if (c.engine === "oracle") registry.set(c.id, { ...c });
     seq = arr.reduce((m, c) => Math.max(m, Number(c.id.replace(/\D/g, "")) || 0), 0) + 1;
     if (arr.length) console.log(`Restored ${arr.length} saved connection(s) from ${DATA_FILE}`);
@@ -65,7 +96,7 @@ function saveRegistry() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const arr = [...registry.values()].map(({ oraPool, ...cfg }) => cfg);
-    fs.writeFileSync(DATA_FILE, JSON.stringify(arr, null, 2));
+    fs.writeFileSync(DATA_FILE, CREDENTIALS_KEY ? JSON.stringify(encryptRegistry(arr), null, 2) : JSON.stringify(arr, null, 2), { mode: 0o600 });
   } catch (e) {
     console.error("Could not persist connections:", e);
   }
@@ -2404,7 +2435,9 @@ async function oraJobRunOutput(c: LiveConnection, logId: number) {
   const conn = await getOraConn(c);
   try {
     const result = await conn.execute<Record<string, unknown>>(
-      `SELECT output, binary_errors, binary_output
+      `SELECT DBMS_LOB.SUBSTR(output, 32767, 1) AS output,
+              DBMS_LOB.SUBSTR(binary_errors, 32767, 1) AS binary_errors,
+              DBMS_LOB.SUBSTR(binary_output, 32767, 1) AS binary_output
          FROM user_scheduler_job_run_details
         WHERE log_id = :logId`,
       { logId },
@@ -2811,6 +2844,19 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
 /* ---------------- HTTP API ---------------- */
 
 const app = express();
+
+/** HTTP Basic auth protects every API and UI route on a LAN deployment. Browser requests
+ * retain the header for same-origin API calls, so no application token is stored in JS. */
+app.use((req, res, next) => {
+  if (!AUTH_TOKEN) return next();
+  const encoded = req.headers.authorization?.match(/^Basic\s+(.+)$/i)?.[1];
+  const decoded = encoded ? Buffer.from(encoded, "base64").toString("utf8") : "";
+  const supplied = decoded.startsWith("dataforge:") ? decoded.slice("dataforge:".length) : "";
+  const valid = supplied.length === AUTH_TOKEN.length && timingSafeEqual(Buffer.from(supplied), Buffer.from(AUTH_TOKEN));
+  if (valid) return next();
+  res.setHeader("WWW-Authenticate", 'Basic realm="Oracle DataForge", charset="UTF-8"');
+  return res.status(401).json({ error: "Authentication required." });
+});
 
 /**
  * Same-origin guard — the API has no authentication, so the browser's origin is the
@@ -4645,7 +4691,6 @@ if (fs.existsSync(dist)) {
  * machines on the trusted local network. Set HOST=127.0.0.1 to limit it to this
  * machine, or bind a specific interface address when required.
  */
-const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, () => {
   console.log(`Oracle DataForge listening on http://${HOST}:${PORT} (static: ${fs.existsSync(dist) ? "on" : "off"})`);
 });
