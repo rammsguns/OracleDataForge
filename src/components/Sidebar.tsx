@@ -416,6 +416,35 @@ export default function Sidebar() {
     }
   };
 
+  /** Starts a scheduler job asynchronously. The API's write guard supplies the confirmation
+   * wording; after approval Oracle owns the run and its outcome appears in Job Run Log. */
+  const runJobNow = async (name: string, confirmed = false) => {
+    if (!activeConn) return;
+    const jobName = name.replace(/'/g, "''");
+    const statement = `BEGIN DBMS_SCHEDULER.RUN_JOB(job_name => '${jobName}', use_current_session => FALSE); END;`;
+    try {
+      const result = await api.query(activeConn.id, statement, confirmed);
+      if (result.confirmation) {
+        const confirmation = result.confirmation;
+        s.askConfirm({
+          title: `Run ${name} now?`,
+          body: `${confirmation.body} Oracle will start the job in the background; its outcome will appear in Job Run Log.`,
+          confirmLabel: "Run job",
+          danger: false,
+          onConfirm: () => { void runJobNow(name, true); },
+        });
+        return;
+      }
+      if (result.error) {
+        s.toast("error", `Could not start ${name} — ${result.error.message}`);
+        return;
+      }
+      s.toast("success", `${name} started — refresh Job Run Log to see its outcome`);
+    } catch (e) {
+      s.toast("error", `Could not start ${name} — ${(e as Error).message}`);
+    }
+  };
+
   const objectMenu = (name: string, kind: string, groupLabel: string): MenuItem[] => {
     const isTable = kind === "table";
     const designable = isTable && canDesignTable;
@@ -427,6 +456,12 @@ export default function Sidebar() {
         : []),
       ...(designable ? [{ label: "Design table…", action: () => openTableDesigner(name) }] : []),
       ...(runnable ? [{ label: "Run / Test…", action: () => openRoutineRunner(name) }] : []),
+      ...(activeConn?.live && kind === "job"
+        ? [
+            ...(!activeConn.readOnly ? [{ label: "Run now…", action: () => void runJobNow(name) }] : []),
+            { label: "View run log…", action: () => s.openTab("joblog", `${name} (Run Log)`, name) },
+          ]
+        : []),
       ...(canCompileGroup && COMPILABLE_KINDS.has(kind)
         ? [{ label: "Compile…", action: () => s.openTab("compile", `Compile: ${name}`, `object:${name}`) }]
         : []),
@@ -537,18 +572,9 @@ export default function Sidebar() {
             return (
               <div
                 key={c.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => {
-                  s.setActiveConnId(c.id);
-                  // the real driver message was toasted when the attempt failed — don't invent a code here
-                  if (c.status === "error") s.toast("error", `${c.name} is not connected — use Reconnect to try again.`);
-                }}
-                onKeyDown={(e) => e.key === "Enter" && s.setActiveConnId(c.id)}
-                className={`group w-full flex items-center gap-2 pl-6 pr-2.5 py-1.5 text-[12px] cursor-pointer transition-colors ${
-                  s.activeConnId === c.id ? "bg-accentdim text-ink border-l-2 border-accent" : "text-soft hover:bg-panel2 border-l-2 border-transparent"
+                className={`group w-full text-[12px] transition-colors border-l-2 ${
+                  s.activeConnId === c.id ? "bg-accentdim text-ink border-accent" : "text-soft hover:bg-panel2 border-transparent"
                 }`}
-                title={`${ENGINE_LABEL[c.engine]} — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setMenu({
@@ -576,14 +602,32 @@ export default function Sidebar() {
                   });
                 }}
               >
-                <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
-                <Database size={13} className="shrink-0" style={{ color: c.color }} />
-                <span className="truncate">{c.name}</span>
-                {c.readOnly && (
-                  <Lock size={11} className="shrink-0 text-warn" aria-label="Read-only connection" />
-                )}
-                <span className="ml-auto flex items-center gap-0.5 shrink-0">
-                  {c.live && (
+                {/* Keep selection and the connection name separate from the controls: on a
+                    narrow Explorer the old one-row layout made both the name and buttons hard to see. */}
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    s.setActiveConnId(c.id);
+                    // the real driver message was toasted when the attempt failed — don't invent a code here
+                    if (c.status === "error") s.toast("error", `${c.name} is not connected — use Reconnect to try again.`);
+                  }}
+                  onKeyDown={(e) => e.key === "Enter" && s.setActiveConnId(c.id)}
+                  className="flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 cursor-pointer"
+                  title={`${ENGINE_LABEL[c.engine]} — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
+                >
+                  <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
+                  <Database size={13} className="shrink-0" style={{ color: c.color }} />
+                  <span className="truncate font-medium">{c.name}</span>
+                  {c.readOnly && <Lock size={11} className="shrink-0 text-warn" aria-label="Read-only connection" />}
+                </div>
+                <div className="flex items-center gap-1 pl-10 pr-2 py-1 border-t border-bdrsoft/70 bg-panel2/35">
+                  <span className={`text-[10px] font-semibold uppercase tracking-wide ${offline ? "text-mute" : c.status === "error" ? "text-err" : "text-ok"}`}>
+                    {offline ? "Offline" : c.status}
+                  </span>
+                  <span className="text-[10px] text-mute uppercase">{ENGINE_LABEL[c.engine]}</span>
+                  <span className="ml-auto flex items-center gap-0.5 shrink-0">
+                    {c.live && (
                     <button
                       aria-label={`${offline ? "Connect" : "Reconnect"} ${c.name}`}
                       title={
@@ -592,9 +636,7 @@ export default function Sidebar() {
                           : "Reconnect — closes the pooled sessions and opens a new one"
                       }
                       disabled={busy}
-                      className={`p-1 rounded text-mute hover:text-ok hover:bg-panel3 disabled:opacity-40 transition-opacity ${
-                        offline ? "text-ok" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
-                      }`}
+                      className="p-1 rounded text-mute hover:text-ok hover:bg-panel3 disabled:opacity-40"
                       onClick={(e) => {
                         e.stopPropagation();
                         doReconnect();
@@ -608,7 +650,7 @@ export default function Sidebar() {
                       aria-label={`Disconnect ${c.name}`}
                       title="Disconnect — closes the pooled sessions (the connection stays saved)"
                       disabled={busy}
-                      className="p-1 rounded text-mute hover:text-warn hover:bg-panel3 disabled:opacity-40 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                      className="p-1 rounded text-mute hover:text-warn hover:bg-panel3 disabled:opacity-40"
                       onClick={(e) => {
                         e.stopPropagation();
                         doDisconnect();
@@ -620,7 +662,7 @@ export default function Sidebar() {
                   <button
                     aria-label={`Edit connection ${c.name}`}
                     title="Edit connection"
-                    className="p-1 rounded text-mute hover:text-accenthi hover:bg-panel3 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                    className="p-1 rounded text-mute hover:text-accenthi hover:bg-panel3"
                     onClick={(e) => {
                       e.stopPropagation();
                       startEdit();
@@ -631,7 +673,7 @@ export default function Sidebar() {
                   <button
                     aria-label={`Remove connection ${c.name}`}
                     title="Remove connection"
-                    className="p-1 rounded text-mute hover:text-err hover:bg-panel3 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                    className="p-1 rounded text-mute hover:text-err hover:bg-panel3"
                     onClick={(e) => {
                       e.stopPropagation();
                       askRemove();
@@ -639,8 +681,8 @@ export default function Sidebar() {
                   >
                     <Trash2 size={12} />
                   </button>
-                  <span className="text-[10px] text-mute uppercase group-hover:hidden">{ENGINE_LABEL[c.engine]}</span>
-                </span>
+                  </span>
+                </div>
               </div>
             );
           })}

@@ -64,7 +64,7 @@ npm run build
 npm start
 ```
 
-The backend serves the built frontend when `dist/` exists. It binds to `127.0.0.1:3001` by default. Set `HOST=0.0.0.0` only when an external proxy, container boundary, or trusted network setup is intentional.
+The backend serves the built frontend when `dist/` exists and binds to `127.0.0.1:3001` by default. For trusted-LAN access, explicitly set `HOST=0.0.0.0`, `DATAFORGE_AUTH_TOKEN`, and `DATAFORGE_ENCRYPTION_KEY`; the browser will request the access token once via HTTP Basic authentication. Generate the encryption key with `openssl rand -base64 32` and keep both values out of source control. To migrate an existing plaintext connection file, first start on loopback with the encryption key set, then save any connection once; its registry is rewritten encrypted.
 
 ## Docker
 
@@ -80,8 +80,8 @@ The application is deliberately a lightweight core IDE, without the source repos
 
 - Database credentials never reach browser storage; the browser receives connection metadata only.
 - The backend stores saved credentials in `data/connections.json` so connections survive restarts.
-- That local file contains plaintext passwords. Keep `data/` private, never commit it, restrict filesystem access, and use a dedicated least-privilege Oracle account.
-- Bind to loopback for local use. If exposing the application, put authentication and TLS in front of it and protect the data volume.
+- With `DATAFORGE_ENCRYPTION_KEY` configured, saved credentials are encrypted with AES-256-GCM. Existing plaintext connection files must be migrated before LAN startup; keep `data/` private regardless.
+- LAN startup requires HTTP Basic authentication and an encryption key. Put TLS in front of the app before using it beyond a trusted network.
 - Read-only mode and confirmation guards reduce accidental writes; they are not a substitute for Oracle privileges.
 
 ## Verification
