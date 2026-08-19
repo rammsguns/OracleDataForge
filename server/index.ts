@@ -2397,6 +2397,39 @@ async function oraQuery(c: LiveConnection, sql: string): Promise<QueryOutcome> {
   }
 }
 
+/** Scheduler keeps textual job output in a CLOB and its error/output streams in BLOBs.
+ * Fetch the BLOBs as Buffers here so they can be rendered instead of the generic query
+ * endpoint's deliberately-safe `[BLOB]` placeholder. */
+async function oraJobRunOutput(c: LiveConnection, logId: number) {
+  const conn = await getOraConn(c);
+  try {
+    const result = await conn.execute<Record<string, unknown>>(
+      `SELECT output, binary_errors, binary_output
+         FROM user_scheduler_job_run_details
+        WHERE log_id = :logId`,
+      { logId },
+      {
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
+        fetchInfo: {
+          BINARY_ERRORS: { type: oracledb.BUFFER },
+          BINARY_OUTPUT: { type: oracledb.BUFFER },
+        },
+      }
+    );
+    const row = result.rows?.[0];
+    if (!row) return null;
+    const content = (value: unknown) =>
+      value == null ? null : Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
+    return {
+      output: content(row.OUTPUT),
+      binaryErrors: content(row.BINARY_ERRORS),
+      binaryOutput: content(row.BINARY_OUTPUT),
+    };
+  } finally {
+    await conn.close();
+  }
+}
+
 /** Compute a 1-based error line from Oracle's character offset into the statement. */
 function oraErrorLine(e: unknown, sql: string): number {
   const off = (e as { offset?: number }).offset;
@@ -4513,6 +4546,21 @@ app.get("/api/connections/:id/changelog", (req, res) => {
   res.json({ connKey: key, entries: log.filter((e) => e.connKey === key).reverse() });
 });
 
+/** Full captured output for one DBMS_SCHEDULER run. Read-only by design. */
+app.get("/api/connections/:id/job-runs/:logId/output", async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
+  const logId = Number(req.params.logId);
+  if (!Number.isSafeInteger(logId) || logId < 0) return res.status(400).json({ error: "Invalid scheduler run ID" });
+  try {
+    const output = await oraJobRunOutput(c, logId);
+    if (!output) return res.status(404).json({ error: "Scheduler run no longer exists" });
+    res.json(output);
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
+  }
+});
+
 app.post("/api/connections/:id/query", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
@@ -4593,12 +4641,11 @@ if (fs.existsSync(dist)) {
 }
 
 /**
- * Loopback by default: an unauthenticated SQL gateway must not be reachable from the
- * LAN just because the dev machine is on one. The container overrides this with
- * HOST=0.0.0.0 (see docker-compose.yml) — it has to, or the published port would
- * forward into a socket bound to the container's own loopback.
+ * Listen on every interface by default so a production build can be opened by other
+ * machines on the trusted local network. Set HOST=127.0.0.1 to limit it to this
+ * machine, or bind a specific interface address when required.
  */
-const HOST = process.env.HOST || "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, () => {
   console.log(`Oracle DataForge listening on http://${HOST}:${PORT} (static: ${fs.existsSync(dist) ? "on" : "off"})`);
 });

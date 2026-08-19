@@ -64,7 +64,7 @@ npm run build
 npm start
 ```
 
-The backend serves the built frontend when `dist/` exists. It binds to `127.0.0.1:3001` by default. Set `HOST=0.0.0.0` only when an external proxy, container boundary, or trusted network setup is intentional.
+The backend serves the built frontend when `dist/` exists. It binds to all local interfaces on port `3001` by default, so other machines on the same network can open `http://<this-machine's-LAN-IP>:3001`. Set `HOST=127.0.0.1` to restrict it to this machine, or bind a specific interface address when required.
 
 ## Docker
 
@@ -81,7 +81,7 @@ The application is deliberately a lightweight core IDE, without the source repos
 - Database credentials never reach browser storage; the browser receives connection metadata only.
 - The backend stores saved credentials in `data/connections.json` so connections survive restarts.
 - That local file contains plaintext passwords. Keep `data/` private, never commit it, restrict filesystem access, and use a dedicated least-privilege Oracle account.
-- Bind to loopback for local use. If exposing the application, put authentication and TLS in front of it and protect the data volume.
+- The server is reachable from the local network by default. Restrict it with `HOST=127.0.0.1`, or put authentication and TLS in front of it before using it beyond a trusted network; protect the data volume in either case.
 - Read-only mode and confirmation guards reduce accidental writes; they are not a substitute for Oracle privileges.
 
 ## Verification

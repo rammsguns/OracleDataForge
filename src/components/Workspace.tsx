@@ -7,6 +7,7 @@ import {
   GitCompareArrows,
   Hammer,
   History,
+  ListChecks,
   Network,
   Play,
   Plus,
@@ -30,6 +31,7 @@ import DependencyExplorer from "./DependencyExplorer";
 import VersionHistory from "./VersionHistory";
 import RoutineRunner from "./RoutineRunner";
 import CompileInvalid from "./CompileInvalid";
+import JobRunLog from "./JobRunLog";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
   worksheet: <Terminal size={12} />,
@@ -45,6 +47,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   deps: <Waypoints size={12} />,
   versions: <History size={12} />,
   compile: <Hammer size={12} />,
+  joblog: <ListChecks size={12} />,
 };
 
 const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
@@ -55,6 +58,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
+  { kind: "joblog", title: "Job Run Log", label: "Job Runs" },
 ];
 
 export default function Workspace() {
@@ -134,6 +138,7 @@ export default function Workspace() {
         {active.kind === "deps" && <DependencyExplorer key={active.id} initialObject={active.payload} />}
         {active.kind === "versions" && <VersionHistory key={active.id} />}
         {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}
+        {active.kind === "joblog" && <JobRunLog key={active.id} initialJob={active.payload} />}
       </div>
     </div>
   );

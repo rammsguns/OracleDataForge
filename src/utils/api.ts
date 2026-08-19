@@ -516,6 +516,12 @@ export interface ChangeLogEntry {
   version: number | null;
 }
 
+export interface JobRunOutput {
+  output: string | null;
+  binaryErrors: string | null;
+  binaryOutput: string | null;
+}
+
 /** Thrown when the backend refused a change because it was not acknowledged (HTTP 409). */
 export class ConfirmRequiredError extends Error {
   constructor(message: string, readonly confirmation: GuardConfirmation) {
@@ -592,6 +598,8 @@ export const api = {
   versionsOf: (id: string, name: string, type: string) =>
     request<VersionFile>(`/api/connections/${id}/versions/object?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`),
   changelog: (id: string) => request<{ connKey: string; entries: ChangeLogEntry[] }>(`/api/connections/${id}/changelog`),
+  /** Captured DBMS_SCHEDULER output, including the BLOB-backed error/output streams. */
+  jobRunOutput: (id: string, logId: number) => request<JobRunOutput>(`/api/connections/${id}/job-runs/${logId}/output`),
   /**
    * Mutating calls carry `confirm` — false (the default) makes the backend describe the
    * change instead of running it. Only pass true right after a user confirmed *this* action.

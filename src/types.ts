@@ -90,7 +90,8 @@ export type TabKind =
   | "dba"
   | "deps"
   | "versions"
-  | "compile";
+  | "compile"
+  | "joblog";
 
 export interface Tab {
   id: string;
