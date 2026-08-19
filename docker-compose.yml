@@ -1,0 +1,16 @@
+services:
+  oracle-dataforge:
+    build: .
+    image: oracle-dataforge:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      NODE_ENV: production
+    ports:
+      - "8080:3001"
+    volumes:
+      - oracle-dataforge-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  oracle-dataforge-data:

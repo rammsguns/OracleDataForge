@@ -1,0 +1,30 @@
+# ── Secrets and runtime state ───────────────────────────────────────────────
+# data/ holds the local connection registry, credentials, code-version history,
+# and changelog. It is runtime state and must never be committed.
+data/
+*.env
+.env
+.env.*
+
+# ── Dependencies and build output ───────────────────────────────────────────
+node_modules/
+dist/
+tsconfig.tsbuildinfo
+
+# ── Test and coverage output ────────────────────────────────────────────────
+coverage/
+.vitest/
+test-results/
+playwright-report/
+
+# ── Local editor / tool settings ─────────────────────────────────────────────
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# ── Logs and OS noise ───────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+desktop.ini

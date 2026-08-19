@@ -1,0 +1,25 @@
+# Normalize line endings to LF in the repository and in the working copy.
+# Development happens on Windows but the image is built on Alpine, so a file
+# checked out with CRLF (git's autocrlf default here) can break shell scripts
+# and produces whole-file diffs whenever another machine touches it.
+* text=auto eol=lf
+
+# Files that must keep LF regardless of platform.
+*.sh          text eol=lf
+Dockerfile*   text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.sql         text eol=lf
+
+# Generated — collapse in diffs and mark for language statistics.
+package-lock.json linguist-generated=true -diff
+
+# Binary: never diff or normalize.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.pdf  binary
