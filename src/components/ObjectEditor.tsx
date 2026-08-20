@@ -9,6 +9,25 @@ import { Btn, Badge, Spinner } from "./ui";
 
 /** Oracle code types editable + compilable in place (BODY variants are reached via the SPEC/BODY toggle). */
 const EDITABLE = new Set(["PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE", "VIEW"]);
+const GITHUB_REPOSITORY_KEY = "dataforge-github-repository";
+const GITHUB_FILES_KEY = "dataforge-github-plsql-files";
+type GitHubRepository = { url?: string; branch?: string; path?: string };
+
+function configuredRepository(): GitHubRepository | null {
+  try {
+    const config = JSON.parse(localStorage.getItem(GITHUB_REPOSITORY_KEY) ?? "{}") as GitHubRepository;
+    return config.url ? config : null;
+  } catch { return null; }
+}
+
+/** Keep the Repository tab in sync with a successful server-side GitHub write. */
+function recordGitHubFile(name: string, type: string, path: string) {
+  try {
+    const existing = JSON.parse(localStorage.getItem(GITHUB_FILES_KEY) ?? "[]") as Array<Record<string, unknown>>;
+    const file = { id: `${name}-${type}`, name, type, path, state: "Synced", updated: "Just now" };
+    localStorage.setItem(GITHUB_FILES_KEY, JSON.stringify([...existing.filter((f) => f.id !== file.id), file]));
+  } catch { /* repository history is a convenience; compilation remains successful */ }
+}
 
 function plsqlOffset(text: string): { lines: number; cols: number } {
   const m = /\b(procedure|function|package(\s+body)?|trigger|type(\s+body)?|view)\b/i.exec(text);
@@ -119,7 +138,8 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   // tree distinguishes SYS.STANDARD from your own package, and recompiling a dictionary
   // object can leave the instance unusable. The backend refuses these too.
   const systemObject = src?.systemObject === true;
-  const editable = !conn?.readOnly && !!type && EDITABLE.has(type) && !systemObject;
+  const canWrite = s.accessRole === "Administrator" || s.accessRole === "Developer";
+  const editable = canWrite && !conn?.readOnly && !!type && EDITABLE.has(type) && !systemObject;
   const effType = type ? (showingBody ? `${type} BODY` : type) : null;
 
   const setPart = (p: "spec" | "body") => {
@@ -166,6 +186,18 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
         setOrig((o) => (p === "body" ? { ...o, body: source } : { ...o, spec: source }));
         const r = await api.compile(connId, object, t, true);
         statuses.push(`${r.type} ${r.status}`);
+        // GitHub is deliberately best-effort: the database compile is authoritative, and a
+        // missing token/network problem must not make a successful Oracle compile look failed.
+        const repo = configuredRepository();
+        if (repo && r.errors.length === 0) {
+          try {
+            const synced = await api.githubSync({ repositoryUrl: repo.url!, branch: repo.branch || "main", directory: repo.path || "database/plsql", object, type: t, source });
+            recordGitHubFile(object, t, synced.path);
+            s.toast("info", `GitHub synced ${synced.path}${synced.commit ? ` · ${synced.commit.slice(0, 7)}` : ""}`);
+          } catch (syncError) {
+            s.toast("warning", `Compiled, but GitHub was not updated: ${(syncError as Error).message}`);
+          }
+        }
         const off = plsqlOffset(source);
         collected.push(
           ...r.errors.map((e) => ({
@@ -261,7 +293,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
           </div>
         )}
         <div className="ml-auto flex gap-1.5">
-          {!systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
+          {canWrite && !systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
             <Btn
               variant="outline"
               onClick={() => s.openTab("run", `${object} (Run)`, object)}

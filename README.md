@@ -104,6 +104,11 @@ server/index.ts      Express API and Oracle runtime
 data/                Local runtime state (ignored)
 docs/                Reference documentation
 ```
+## GitHub PL/SQL sync
+
+GitHub integration is optional. To sync a successfully compiled PL/SQL object, configure a GitHub repository in the Repository tab and set `GITHUB_TOKEN` in `.env.local`. Create a fine-grained GitHub token restricted to the target repository with **Contents: Read and write** permission. For example, the test repository is `https://github.com/rammsguns/PLSQL`.
+
+The token stays in the local backend. After Oracle compilation succeeds without errors, Dataforge writes the source to the configured directory and branch using GitHub's Contents API. Packages are saved as `.pks` / `.pkb`; procedures, functions, and triggers use `.prc`, `.fnc`, and `.trg`.
 
 ## Documentation
 

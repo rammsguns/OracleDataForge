@@ -18,6 +18,8 @@ const MAX_ROWS = 1000;
 const HOST = process.env.HOST || "127.0.0.1";
 const IS_LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 const AUTH_TOKEN = process.env.DATAFORGE_AUTH_TOKEN ?? "";
+/** Fine-grained token with Contents: Read and write permission for the configured repository. Never sent to the browser. */
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
 const CREDENTIALS_KEY = (() => {
   const encoded = process.env.DATAFORGE_ENCRYPTION_KEY;
   if (!encoded) return null;
@@ -2962,6 +2964,52 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "16mb" })); // generous headroom for CSV/JSON imports
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, connections: registry.size }));
+
+type GitHubSyncRequest = { repositoryUrl?: unknown; branch?: unknown; directory?: unknown; object?: unknown; type?: unknown; source?: unknown };
+
+/** Accept only a normal github.com owner/repository URL; the caller never chooses an API host. */
+function parseGitHubRepository(value: unknown): { owner: string; repo: string } | null {
+  const raw = String(value ?? "").trim().replace(/\.git$/i, "");
+  const match = raw.match(/^(?:https?:\/\/github\.com\/|git@github\.com:|github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  return match ? { owner: match[1], repo: match[2] } : null;
+}
+
+function gitHubSourcePath(directory: string, object: string, type: string) {
+  const safeDir = directory.replace(/^\/+|\/+$/g, "").split("/").filter((p) => /^[A-Za-z0-9_.-]+$/.test(p)).join("/");
+  const safeName = object.toLowerCase().replace(/[^a-z0-9_$#]/gi, "_");
+  const normalized = type.toUpperCase().replace(/\s+BODY$/, " BODY");
+  const ext = normalized === "PACKAGE" ? "pks" : normalized === "PACKAGE BODY" ? "pkb" : normalized === "PROCEDURE" ? "prc" : normalized === "FUNCTION" ? "fnc" : normalized === "TRIGGER" ? "trg" : "sql";
+  return `${safeDir ? `${safeDir}/` : ""}${safeName}.${ext}`;
+}
+
+app.post("/api/github/sync", async (req, res) => {
+  if (!GITHUB_TOKEN) return res.status(503).json({ error: "GitHub sync is not configured on this server. Set GITHUB_TOKEN and restart Dataforge." });
+  const body = req.body as GitHubSyncRequest;
+  const repo = parseGitHubRepository(body.repositoryUrl);
+  const object = String(body.object ?? "").trim();
+  const type = String(body.type ?? "").trim();
+  const branch = String(body.branch ?? "main").trim();
+  const directory = String(body.directory ?? "database/plsql").trim();
+  const source = String(body.source ?? "");
+  if (!repo || !object || !type || !branch || !source) return res.status(400).json({ error: "Repository URL, branch, object, type, and source are required." });
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || source.length > 4 * 1024 * 1024) return res.status(400).json({ error: "The branch or source content is invalid." });
+  const filePath = gitHubSourcePath(directory, object, type);
+  const apiPath = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/contents/${filePath.split("/").map(encodeURIComponent).join("/")}`;
+  const headers = { Accept: "application/vnd.github+json", Authorization: `Bearer ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Oracle-DataForge" };
+  try {
+    const existing = await fetch(`${apiPath}?ref=${encodeURIComponent(branch)}`, { headers });
+    let sha: string | undefined;
+    if (existing.ok) sha = (await existing.json() as { sha?: string }).sha;
+    else if (existing.status !== 404) return res.status(existing.status).json({ error: `GitHub could not read ${filePath}: ${await existing.text()}` });
+    const message = `Dataforge: compile ${type.toUpperCase()} ${object.toUpperCase()}`;
+    const saved = await fetch(apiPath, { method: "PUT", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ message, content: Buffer.from(source.endsWith("\n") ? source : `${source}\n`, "utf8").toString("base64"), branch, ...(sha ? { sha } : {}) }) });
+    if (!saved.ok) return res.status(saved.status).json({ error: `GitHub could not write ${filePath}: ${await saved.text()}` });
+    const result = await saved.json() as { commit?: { sha?: string; html_url?: string } };
+    return res.json({ ok: true, path: filePath, commit: result.commit?.sha ?? null, url: result.commit?.html_url ?? null });
+  } catch (e) {
+    return res.status(502).json({ error: `GitHub sync failed: ${errMsg(e)}` });
+  }
+});
 
 async function runTest(cfg: ConnConfig) {
   const bad = validate(cfg);

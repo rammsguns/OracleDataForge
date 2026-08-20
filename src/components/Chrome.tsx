@@ -1,4 +1,4 @@
-import { Keyboard, Moon, PanelLeft, Sun } from "lucide-react";
+import { Keyboard, Moon, PanelLeft, ShieldCheck, Sun } from "lucide-react";
 import { useState } from "react";
 import { schemaOf, useStudio } from "../state/store";
 import { Modal } from "./ui";
@@ -43,6 +43,13 @@ export function TitleBar() {
       )}
 
       <div className="ml-auto flex items-center gap-1">
+        <label className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute" title="Preview workspace access for a role">
+          <ShieldCheck size={13} className="text-accenthi" />
+          <span className="sr-only">Access role</span>
+          <select value={s.accessRole} onChange={(e) => s.setAccessRole(e.target.value as typeof s.accessRole)} className="bg-transparent text-soft font-medium outline-none cursor-pointer">
+            <option>Administrator</option><option>Developer</option><option>Analyst</option><option>Viewer</option>
+          </select>
+        </label>
         <button
           onClick={() => setShortcutsOpen(true)}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"
