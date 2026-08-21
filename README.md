@@ -102,4 +102,17 @@ The health response is JSON with `ok: true` and the number of saved Oracle conne
 src/                 React/TypeScript Oracle IDE
 server/index.ts      Express API and Oracle runtime
 data/                Local runtime state (ignored)
+docs/                Reference documentation
 ```
+
+## Documentation
+
+| Document | Covers |
+| --- | --- |
+| [architecture.md](docs/architecture.md) | How the frontend, backend, and Oracle layer fit together |
+| [deployment.md](docs/deployment.md) | Development, production, LAN access, environment variables |
+| [security.md](docs/security.md) | Authentication, read-only mode, write guards, injection defenses |
+| [credentials.md](docs/credentials.md) | Credential storage, encryption, migrating a plaintext registry |
+| [performance.md](docs/performance.md) | Row limits, pooling, caching, and what gets slow at scale |
+| [known_limitations.md](docs/known_limitations.md) | Caps, unsupported inputs, and single-instance assumptions |
+| [changelog.md](docs/changelog.md) | What changed, when, and why |
