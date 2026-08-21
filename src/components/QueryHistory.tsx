@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import { CircleCheck, CircleX, Clock3, Play, Search, Star, Tag, Trash2 } from "lucide-react";
-import { SNIPPETS } from "../data/catalog";
 import { useStudio } from "../state/store";
 import { Btn, Badge, EmptyState } from "./ui";
 
@@ -26,9 +25,9 @@ export default function QueryHistory() {
   };
 
   return (
-    <div className="h-full grid lg:grid-cols-[1fr_320px] min-h-0">
+    <div className="h-full grid min-h-0">
       {/* history list */}
-      <div className="flex flex-col min-h-0 border-r border-bdrsoft">
+      <div className="flex flex-col min-h-0">
         <div className="flex items-center gap-2 px-3 py-2 border-b border-bdrsoft shrink-0">
           <div className="relative flex-1 max-w-72">
             <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-mute" />
@@ -102,31 +101,6 @@ export default function QueryHistory() {
               </div>
             ))
           )}
-        </div>
-      </div>
-
-      {/* snippets */}
-      <div className="flex flex-col min-h-0 max-lg:border-t max-lg:border-bdrsoft">
-        {/* These are canned examples, not the user's own saved queries — they reference
-            tables like `customers` that a given schema may not have. Labelled so a failing
-            click reads as "that example doesn't fit this schema", not "the app is broken". */}
-        <div className="px-3 py-2.5 border-b border-bdrsoft text-[11px] font-bold uppercase tracking-wider text-mute shrink-0">
-          Example snippets
-          <span className="ml-1.5 normal-case tracking-normal font-normal text-mute/80">— edit them for your schema</span>
-        </div>
-        <div className="flex-1 overflow-y-auto p-2.5 space-y-2 min-h-0">
-          {SNIPPETS.map((sn) => (
-            <button
-              key={sn.id}
-              onClick={() => load(sn.sql)}
-              className="w-full text-left border border-bdr rounded-lg p-2.5 hover:border-accent/60 hover:bg-accentdim transition-colors"
-              title="Click to load into worksheet"
-            >
-              <div className="text-[12.5px] font-semibold text-ink">{sn.name}</div>
-              <div className="text-[11.5px] text-mute mt-0.5">{sn.description}</div>
-              <pre className="font-mono text-[10.5px] text-soft mt-1.5 line-clamp-2 whitespace-pre-wrap">{sn.sql}</pre>
-            </button>
-          ))}
         </div>
       </div>
     </div>
