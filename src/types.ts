@@ -70,13 +70,6 @@ export interface HistoryEntry {
   tags: string[];
 }
 
-export interface Snippet {
-  id: string;
-  name: string;
-  sql: string;
-  description: string;
-}
-
 export type TabKind =
   | "worksheet"
   | "data"

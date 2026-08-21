@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, FileSpreadsheet, Loader2, PlugZap, XCircle } from "lucide-react";
-import { ENGINE_LABEL } from "../data/catalog";
 import { useStudio } from "../state/store";
 import { api, type ImportRequest, type ImportResult } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
@@ -184,7 +183,7 @@ export function ConnectionWizard() {
       {step === 2 && (
         <div className="space-y-4">
           <div className="border border-bdr rounded-xl p-4 text-[12.5px] space-y-1.5">
-            <div><span className="text-mute w-24 inline-block">Engine</span> <b>{ENGINE_LABEL[engine]}</b> <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span></div>
+            <div><span className="text-mute w-24 inline-block">Engine</span> <b>Oracle</b> <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span></div>
             <div><span className="text-mute w-24 inline-block">Name</span> <b>{name}</b></div>
             <div><span className="text-mute w-24 inline-block">Target</span> <span className="font-mono">{`${host}:${port}`}</span></div>
             <div>

@@ -1,6 +1,5 @@
 import { Keyboard, Moon, PanelLeft, Sun } from "lucide-react";
 import { useState } from "react";
-import { ENGINE_LABEL } from "../data/catalog";
 import { schemaOf, useStudio } from "../state/store";
 import { Modal } from "./ui";
 
@@ -39,7 +38,7 @@ export function TitleBar() {
         <div className="hidden sm:flex items-center gap-2 border border-bdr rounded-full pl-2 pr-3 h-7 text-[11.5px]" title={`${conn.host}:${conn.port} as ${conn.user}`}>
           <span className={`w-2 h-2 rounded-full ${conn.status === "connected" ? "bg-ok shadow-[0_0_6px_var(--ok)]" : conn.status === "error" ? "bg-err" : "bg-mute"}`} />
           <span className="font-medium text-soft">{conn.name}</span>
-          <span className="text-mute uppercase text-[10px]">{ENGINE_LABEL[conn.engine]}</span>
+          <span className="text-mute uppercase text-[10px]">Oracle</span>
         </div>
       )}
 

@@ -1,7 +1,8 @@
 # ── Secrets and runtime state ───────────────────────────────────────────────
 # data/ holds the local connection registry, credentials, code-version history,
 # and changelog. It is runtime state and must never be committed.
-data/
+# Anchored to the repo root so it doesn't also match src/data/ etc.
+/data/
 *.env
 .env
 .env.*

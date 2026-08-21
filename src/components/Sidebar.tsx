@@ -32,13 +32,27 @@ import {
   Zap,
   Eye,
 } from "lucide-react";
-import { ENGINE_LABEL, schemaForConnection, type SchemaDef } from "../data/catalog";
 import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { NEW_TABLE_SENTINEL } from "../utils/tableDdl";
 import { download, toCsv, toJson } from "../utils/sql";
 import { ContextMenu, Spinner } from "./ui";
 import type { MenuItem } from "../types";
+
+interface SchemaGroup {
+  label: string;
+  kind: string;
+  items: string[];
+  invalid?: string[];
+}
+
+interface SchemaDef {
+  schemaName: string;
+  groups: SchemaGroup[];
+}
+
+/** shown before a live schema has loaded — the tree only renders once status is "ready" */
+const EMPTY_SCHEMA: SchemaDef = { schemaName: "", groups: [] };
 
 type LiveSchemaState =
   | { status: "loading" }
@@ -343,8 +357,7 @@ export default function Sidebar() {
   }, [s.schemaBump]);
 
   const liveState = activeConn?.live ? liveSchemas[activeConn.id] : undefined;
-  const schema: SchemaDef =
-    liveState?.status === "ready" ? liveState.schema : schemaForConnection(activeConn);
+  const schema: SchemaDef = liveState?.status === "ready" ? liveState.schema : EMPTY_SCHEMA;
   const liveRowCounts = liveState?.status === "ready" ? liveState.rowCounts : undefined;
   const browsed = schemaOf(activeConn) ?? schema.schemaName;
   const schemaLabel = !activeConn ? "no connection" : `${browsed} schema`;
@@ -614,7 +627,7 @@ export default function Sidebar() {
                   }}
                   onKeyDown={(e) => e.key === "Enter" && s.setActiveConnId(c.id)}
                   className="flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 cursor-pointer"
-                  title={`${ENGINE_LABEL[c.engine]} — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
+                  title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
                 >
                   <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
                   <Database size={13} className="shrink-0" style={{ color: c.color }} />
@@ -625,7 +638,7 @@ export default function Sidebar() {
                   <span className={`text-[10px] font-semibold uppercase tracking-wide ${offline ? "text-mute" : c.status === "error" ? "text-err" : "text-ok"}`}>
                     {offline ? "Offline" : c.status}
                   </span>
-                  <span className="text-[10px] text-mute uppercase">{ENGINE_LABEL[c.engine]}</span>
+                  <span className="text-[10px] text-mute uppercase">Oracle</span>
                   <span className="ml-auto flex items-center gap-0.5 shrink-0">
                     {c.live && (
                     <button
@@ -736,7 +749,7 @@ export default function Sidebar() {
         ) : activeConn?.status === "error" ? (
           <div className="mx-2.5 my-1.5 border border-err/30 bg-err/8 rounded-lg px-2.5 py-2 text-[11.5px] text-soft">
             <span className="text-err font-semibold">Connection failed</span> — can't browse{" "}
-            <span className="font-mono">{schema.schemaName}</span>. Check host/port and retry.
+            <span className="font-mono">{browsed}</span>. Check host/port and retry.
           </div>
         ) : liveState?.status === "loading" ? (
           <div className="px-3 py-3">
