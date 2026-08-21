@@ -25,15 +25,19 @@ There is no Copilot panel, AI endpoint, provider configuration, model SDK, alter
 
 ## Requirements
 
-- Node.js 22 or newer
+- Node.js 22 or newer (tested through 24)
 - npm
 - A reachable Oracle Database service
 
-The backend uses `node-oracledb` in Thin mode, so Oracle Instant Client is not required for normal username/password connections.
+The backend uses `node-oracledb` in Thin mode, so Oracle Instant Client is not required for normal username/password connections. Nothing in the dependency tree compiles native code either, so there is no build toolchain, Python, or container runtime to install — Node and npm are the whole prerequisite list.
+
+The application installs and starts without a database; it just has nothing to connect to until one is configured.
 
 ## Development
 
 ```bash
+git clone https://github.com/rammsguns/OracleDataForge.git
+cd OracleDataForge
 npm install
 cp env.example .env.local
 npm run dev:server
@@ -46,6 +50,12 @@ npm run dev
 ```
 
 Open `http://localhost:5173`. The Vite development server proxies `/api` to the backend on port 3001.
+
+Recent npm versions block package install scripts until they are approved. `package.json` pre-approves the three this project needs — `oracledb` and both `esbuild` builds — but if `npm install` still reports them as pending, approve them and rebuild. Until esbuild fetches its platform binary, `npm run build` fails:
+
+```bash
+npm approve-scripts esbuild oracledb && npm rebuild
+```
 
 Create a connection with:
 
@@ -72,7 +82,7 @@ The application is deliberately a lightweight core IDE, without the source repos
 
 - Database credentials never reach browser storage; the browser receives connection metadata only.
 - The backend stores saved credentials in `data/connections.json` so connections survive restarts.
-- With `DATAFORGE_ENCRYPTION_KEY` configured, saved credentials are encrypted with AES-256-GCM. Existing plaintext connection files must be migrated before LAN startup; keep `data/` private regardless.
+- With `DATAFORGE_ENCRYPTION_KEY` configured, saved credentials are encrypted with AES-256-GCM. The key is optional on loopback, so **a default local install writes passwords to `data/connections.json` in clear text** — set the key before saving a connection whose password matters. Existing plaintext files must be migrated before LAN startup; keep `data/` private regardless.
 - LAN startup requires HTTP Basic authentication and an encryption key. Put TLS in front of the app before using it beyond a trusted network.
 - Read-only mode and confirmation guards reduce accidental writes; they are not a substitute for Oracle privileges.
 
