@@ -362,14 +362,19 @@ function errMsg(e: unknown): string {
   return err.message || err.code || "Connection failed";
 }
 
-const IN_CONTAINER = process.env.NODE_ENV === "production";
+/**
+ * True only when this process is actually inside a container. NODE_ENV is not a proxy for
+ * that — the supported production install (`npm run build && npm start`) sets NODE_ENV
+ * to production on the host, where a "you are in Docker" hint is simply wrong.
+ */
+const IN_CONTAINER = fs.existsSync("/.dockerenv");
 
-/** Adds a Docker-networking hint when a connection to localhost is refused from inside the container. */
+/** Adds a container-networking hint when a connection to localhost is refused from inside one. */
 function withNetworkHint(msg: string, host: string): string {
   const refused = /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|NJS-5\d\d|Connection failed/i.test(msg);
   const isLocal = ["localhost", "127.0.0.1", "::1"].includes(host.toLowerCase());
   if (IN_CONTAINER && refused && isLocal) {
-    return `${msg} — this app runs inside Docker, where "localhost" is the container itself. Use host.docker.internal to reach a database on your machine, or the container name if it runs in Docker too.`;
+    return `${msg} — this app runs inside a container, where "localhost" is the container itself. Use host.docker.internal to reach a database on your machine, or the container name if it runs in a container too.`;
   }
   return msg;
 }

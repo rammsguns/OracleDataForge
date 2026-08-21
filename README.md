@@ -66,14 +66,6 @@ npm start
 
 The backend serves the built frontend when `dist/` exists and binds to `127.0.0.1:3001` by default. For trusted-LAN access, explicitly set `HOST=0.0.0.0`, `DATAFORGE_AUTH_TOKEN`, and `DATAFORGE_ENCRYPTION_KEY`; the browser will request the access token once via HTTP Basic authentication. Generate the encryption key with `openssl rand -base64 32` and keep both values out of source control. To migrate an existing plaintext connection file, first start on loopback with the encryption key set, then save any connection once; its registry is rewritten encrypted.
 
-## Docker
-
-```bash
-docker compose up -d --build
-```
-
-Open `http://localhost:8080`. The named volume keeps connection metadata and local version history across container restarts.
-
 ## Runtime data and security
 
 The application is deliberately a lightweight core IDE, without the source repository's identity, tenant, vault, or audit control plane.
@@ -100,6 +92,4 @@ The health response is JSON with `ok: true` and the number of saved Oracle conne
 src/                 React/TypeScript Oracle IDE
 server/index.ts      Express API and Oracle runtime
 data/                Local runtime state (ignored)
-Dockerfile           Production container
-docker-compose.yml   Single-service deployment
 ```
