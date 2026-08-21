@@ -92,10 +92,33 @@ function loadRegistry() {
   }
 }
 
+/** set once the plaintext warning has been printed, so a busy session says it one time */
+let warnedPlaintext = false;
+
+/**
+ * DATAFORGE_ENCRYPTION_KEY is optional on loopback, so the default local install writes
+ * real passwords to disk in clear text. That is a deliberate convenience, but a silent
+ * one: nothing in the UI or the log says it is happening. Say it out loud instead —
+ * `data/` frequently sits inside a synced folder (OneDrive, Dropbox, iCloud) or a backup
+ * set, which copies those credentials off the machine.
+ */
+function warnIfPlaintextCredentials() {
+  if (CREDENTIALS_KEY || warnedPlaintext) return;
+  warnedPlaintext = true;
+  console.warn(
+    `WARNING  Connection passwords are stored unencrypted in ${DATA_FILE}\n` +
+      `         Set DATAFORGE_ENCRYPTION_KEY to encrypt them with AES-256-GCM, then save each\n` +
+      `         connection once to rewrite the file. Generate a key with:\n` +
+      `           openssl rand -base64 32\n` +
+      `         Until then, keep data/ out of synced folders and backups.`
+  );
+}
+
 function saveRegistry() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const arr = [...registry.values()].map(({ oraPool, ...cfg }) => cfg);
+    if (arr.length) warnIfPlaintextCredentials();
     fs.writeFileSync(DATA_FILE, CREDENTIALS_KEY ? JSON.stringify(encryptRegistry(arr), null, 2) : JSON.stringify(arr, null, 2), { mode: 0o600 });
   } catch (e) {
     console.error("Could not persist connections:", e);
@@ -4692,10 +4715,13 @@ if (fs.existsSync(dist)) {
 }
 
 /**
- * Listen on every interface by default so a production build can be opened by other
- * machines on the trusted local network. Set HOST=127.0.0.1 to limit it to this
- * machine, or bind a specific interface address when required.
+ * Listen on loopback by default, so nothing is reachable from the network until that is
+ * asked for explicitly. Set HOST=0.0.0.0 for trusted-LAN access, which additionally
+ * requires DATAFORGE_AUTH_TOKEN and DATAFORGE_ENCRYPTION_KEY (enforced at startup above),
+ * or bind a specific interface address when required.
  */
 app.listen(PORT, HOST, () => {
   console.log(`Oracle DataForge listening on http://${HOST}:${PORT} (static: ${fs.existsSync(dist) ? "on" : "off"})`);
+  // only meaningful once something is actually saved — a fresh install has nothing at risk yet
+  if (registry.size) warnIfPlaintextCredentials();
 });
