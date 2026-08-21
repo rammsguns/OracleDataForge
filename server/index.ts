@@ -1,4 +1,5 @@
 import express from "express";
+import compression from "compression";
 import fs from "node:fs";
 import path from "node:path";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -2872,6 +2873,18 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
 /* ---------------- HTTP API ---------------- */
 
 const app = express();
+
+/**
+ * gzip the responses that are worth it. The built SPA is a single ~950 kB bundle that the
+ * backend serves itself in production, and result payloads are JSON — both compress by
+ * roughly 4-5x, which is the difference between a snappy first load and a visible one over
+ * anything slower than loopback.
+ *
+ * Registered first so it also covers the static SPA mounted at the end of this file.
+ * The default 1 kB threshold is left alone: below that, the gzip header costs more than
+ * the saving.
+ */
+app.use(compression());
 
 /** HTTP Basic auth protects every API and UI route on a LAN deployment. Browser requests
  * retain the header for same-origin API calls, so no application token is stored in JS. */

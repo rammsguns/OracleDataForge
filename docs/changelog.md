@@ -8,7 +8,12 @@ Dates are the date the change landed on `main`.
 
 ## Unreleased
 
-Nothing pending.
+### Added
+
+- **Response compression.** The backend serves the built SPA itself, and was shipping the
+  ~946 kB bundle uncompressed. gzip is now applied to responses above 1 kB, measured at
+  **4.56× on first load** (989 kB → 217 kB) and applying equally to large JSON result
+  payloads.
 
 ## 2026-08-21
 

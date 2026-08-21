@@ -132,7 +132,7 @@ Group refreshes run **serially**, because the groups share one pooled session.
 Server-side caching is limited to a single per-connection flag recording whether the schema is
 Oracle-maintained — "one dictionary read per connection, not one per object opened."
 
-There is **no HTTP caching and no response compression**.
+There is **no HTTP caching**. Responses are gzipped — see [Compression](#compression).
 
 ## The expensive paths
 
@@ -209,9 +209,26 @@ dynamic `import()` or `React.lazy` anywhere in the source.
 The largest single contributor is the Table Designer at 2,467 lines, followed by the icon
 library. Both are the obvious split candidates.
 
-> **Worth fixing:** the production server has no compression middleware, so it ships the full
-> **946 kB uncompressed** rather than the 208 kB gzip figure Vite reports. Adding
-> `compression` is a one-line change with a 4.5× effect on first load.
+## Compression
+
+The backend gzips responses, so the bundle is **not** shipped at its on-disk size. Measured
+against a production build:
+
+| Asset | Uncompressed | gzip | Ratio |
+| --- | --- | --- | --- |
+| JS bundle | 946,160 B | 208,518 B | 4.54× |
+| CSS | 43,158 B | 8,371 B | 5.16× |
+| **First load total** | **989,318 B** | **216,889 B** | **4.56×** |
+
+Compression is registered as the first middleware so it also covers the static SPA, which is
+mounted last. `Vary: Accept-Encoding` is set, so shared caches stay correct.
+
+The default 1 kB threshold is deliberate — smaller responses are sent uncompressed, since
+below that the gzip framing costs more than it saves. `/api/health` is a good example: it
+comes back plain.
+
+JSON result payloads compress on the same terms, which matters most for wide 1,000-row
+results.
 
 ## Version history overhead
 
@@ -228,12 +245,14 @@ rather than an append.
 None of these are bugs; all are known trade-offs worth revisiting if the app is used against
 very large schemas:
 
-1. Add response compression — largest win for the least work.
-2. Parallelize the twelve dedicated-type queries in the schema tree load.
-3. Align migration concurrency (6) with `poolMax` (4).
-4. Code-split the Table Designer and icon imports.
-5. Batch imports rather than one `executeMany` for up to 50,000 rows.
-6. Make changelog appends append-only instead of rewrite-whole-file.
+1. Parallelize the twelve dedicated-type queries in the schema tree load.
+2. Align migration concurrency (6) with `poolMax` (4).
+3. Code-split the Table Designer and icon imports — worth less now that responses are gzipped,
+   but it would cut parse time as well as transfer.
+4. Batch imports rather than one `executeMany` for up to 50,000 rows.
+5. Make changelog appends append-only instead of rewrite-whole-file.
+
+Done: response compression (4.56× on first load).
 
 ## See also
 
