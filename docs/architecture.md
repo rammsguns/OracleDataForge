@@ -84,8 +84,9 @@ not import each other.
 
 ## Backend
 
-Middleware order is: Basic auth → same-origin guard → `express.json({ limit: "16mb" })` →
-routes → error handler → static `dist/`.
+Middleware order is: gzip compression → Basic auth → same-origin guard →
+`express.json({ limit: "16mb" })` → routes → error handler → static `dist/`. Compression is
+registered first so it also covers the static SPA mounted last.
 
 All data routes are namespaced `/api/connections/:id/…` and begin with the same registry
 lookup and 404.
