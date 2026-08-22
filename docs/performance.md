@@ -138,9 +138,12 @@ There is **no HTTP caching**. Responses are gzipped — see [Compression](#compr
 
 ### Schema tree load — ~17 sequential queries
 
-Loading the tree runs roughly nineteen dictionary queries on one session, **all sequentially**,
-including a serial loop over twelve "dedicated" object types (synonyms, DB links, directories,
-editions, semantic models, recycle bin).
+Loading the tree runs roughly nineteen dictionary queries, most of them sequentially on one
+session. The twelve "dedicated" object-type queries (synonyms, DB links, directories, editions,
+semantic models, recycle bin) are the exception: they're independent, so they now run as two
+groups of six on two pooled connections at once, roughly halving that portion of tree-load
+latency. Each connection still runs its own six one at a time — node-oracledb does not support
+concurrent `execute()` calls on a single connection.
 
 Real optimizations are already applied: public synonyms are restricted and capped at 500 rows
 because "the full list is thousands of Oracle-owned entries"; validity for the whole schema is
@@ -149,10 +152,6 @@ receipts:
 
 > A single Oracle Text CONTEXT index adds ten `DR$<index>$B/$C/$G/…` tables: in one real
 > 37-table schema they were 20 of the entities and 90 of the 201 columns.
-
-> **Opportunity:** the twelve dedicated-type queries are a serial `await` loop. They are
-> independent, and parallelizing them would materially cut tree-load latency — though it needs
-> a second pooled connection, since they currently share one session.
 
 ### ER diagram — the one query with measured tuning
 
@@ -175,8 +174,9 @@ bounds it. On a large schema this is the heaviest single request in the app.
 Table metadata costs **twelve sequential dictionary queries per table**. The assistant compares
 up to 250 tables across two connections, so a full compare approaches **~6,000 round trips**.
 
-> **Tuning mismatch:** the client runs 6 concurrent metadata fetches while the pool allows 4.
-> Two requests sit queued in the driver at all times. Aligning these would help.
+The client's concurrency cap now matches the pool: 4 metadata fetches at once, same as
+`poolMax`, so requests don't sit queued in the driver behind a client-side limit the pool can't
+actually serve.
 
 ### Import
 
@@ -245,14 +245,13 @@ rather than an append.
 None of these are bugs; all are known trade-offs worth revisiting if the app is used against
 very large schemas:
 
-1. Parallelize the twelve dedicated-type queries in the schema tree load.
-2. Align migration concurrency (6) with `poolMax` (4).
-3. Code-split the Table Designer and icon imports — worth less now that responses are gzipped,
+1. Code-split the Table Designer and icon imports — worth less now that responses are gzipped,
    but it would cut parse time as well as transfer.
-4. Batch imports rather than one `executeMany` for up to 50,000 rows.
-5. Make changelog appends append-only instead of rewrite-whole-file.
+2. Batch imports rather than one `executeMany` for up to 50,000 rows.
+3. Make changelog appends append-only instead of rewrite-whole-file.
 
-Done: response compression (4.56× on first load).
+Done: response compression (4.56× on first load); parallelized the schema tree's dedicated-type
+queries across two connections; aligned migration assistant concurrency with `poolMax`.
 
 ## See also
 

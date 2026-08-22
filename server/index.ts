@@ -631,8 +631,37 @@ async function oraSchema(c: LiveConnection) {
       return { label: g.label, kind: g.kind, items: byType(g.type), invalid: invalidFor(g) };
     };
 
+    // The dedicated-type queries are independent, so a second pooled connection runs half
+    // of them while `conn` runs the other half — cutting this section's latency roughly
+    // in half instead of the previous fully serial loop. Each half still runs its own
+    // queries one at a time: a single node-oracledb connection cannot execute concurrently.
     const dedicated: Record<string, string[]> = {};
-    for (const d of ORA_DEDICATED) dedicated[d.label] = await tryList(d.sql);
+    {
+      const conn2 = await getOraConn(c);
+      const tryList2 = async (sql: string): Promise<string[]> => {
+        try {
+          const r = await conn2.execute<[unknown]>(sql, [], { outFormat: oracledb.OUT_FORMAT_ARRAY });
+          return (r.rows ?? []).map((x) => String(x[0]));
+        } catch {
+          return [];
+        }
+      };
+      try {
+        const mid = Math.ceil(ORA_DEDICATED.length / 2);
+        const runHalf = async (items: typeof ORA_DEDICATED, list: typeof tryList) => {
+          const out: [string, string[]][] = [];
+          for (const d of items) out.push([d.label, await list(d.sql)]);
+          return out;
+        };
+        const [first, second] = await Promise.all([
+          runHalf(ORA_DEDICATED.slice(0, mid), tryList),
+          runHalf(ORA_DEDICATED.slice(mid), tryList2),
+        ]);
+        for (const [label, items] of [...first, ...second]) dedicated[label] = items;
+      } finally {
+        await conn2.close();
+      }
+    }
     const users = await tryList(ORA_OTHER_USERS_SQL);
 
     const dGroup = (label: string) => {

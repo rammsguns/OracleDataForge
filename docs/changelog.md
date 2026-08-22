@@ -14,6 +14,26 @@ Dates are the date the change landed on `main`.
   ~946 kB bundle uncompressed. gzip is now applied to responses above 1 kB, measured at
   **4.56× on first load** (989 kB → 217 kB) and applying equally to large JSON result
   payloads.
+- **CI.** A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `npm ci`,
+  `npm run typecheck`, and `npm run build` on every push and pull request against `main`.
+
+### Changed
+
+- **The schema tree's dedicated-type queries run on two connections instead of one.** The
+  twelve independent dictionary queries for synonyms, DB links, directories, editions, and
+  similar categories ran in a fully serial loop. They now split across two pooled connections,
+  roughly halving that portion of tree-load latency on a large schema.
+- **Migration assistant concurrency now matches the pool.** The client fetched table metadata
+  6-at-a-time against a pool capped at 4, leaving two requests queued in the driver at all
+  times. The client cap is now 4.
+
+### Security
+
+- **The `WMT_RETAIL` connection's password is now encrypted at rest.** It had been saved in
+  clear text in `data/connections.json` under the default loopback configuration. With
+  `DATAFORGE_ENCRYPTION_KEY` set and the connection re-saved, the file now stores an
+  AES-256-GCM envelope instead of a plaintext password. See [credentials.md](credentials.md)
+  for the same steps applied to any other saved connection.
 
 ## 2026-08-21
 

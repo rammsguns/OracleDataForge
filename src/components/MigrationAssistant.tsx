@@ -13,8 +13,9 @@ const CLS: Record<string, string> = {
 
 /** How many source tables we compare before stopping (each costs two metadata fetches). */
 const MAX_TABLES = 250;
-/** Metadata fetches to run at once — gentle on the connection pool. */
-const CONCURRENCY = 6;
+/** Metadata fetches to run at once — matches the server's poolMax of 4 per connection,
+ *  so this never queues more requests than the pool can serve at once. */
+const CONCURRENCY = 4;
 
 type TableStatus = "new" | "changed" | "same";
 interface TableResult {
