@@ -19,6 +19,7 @@ Dates are the date the change landed on `main`.
   single-table preview the Data Browser generates. A guard refuses any change that would leave
   zero active Administrators. Until the first account is created, the app behaves exactly as
   before. See [security.md](security.md#workspace-roles).
+  ([#10](https://github.com/rammsguns/OracleDataForge/pull/10))
 
 ## 2026-08-22
 
