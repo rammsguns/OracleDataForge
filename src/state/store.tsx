@@ -116,6 +116,15 @@ interface Store {
 
   selectedObject: string | null;
   setSelectedObject: (o: string | null) => void;
+
+  /**
+   * Table whose Data tab should open straight into edit mode, set by "Edit data…" in the
+   * tree. Tabs are keyed by kind+payload, so the mode cannot ride along in the payload
+   * without opening a second tab for the same table — the Data Browser reads this on mount
+   * and clears it.
+   */
+  editDataRequest: string | null;
+  setEditDataRequest: (table: string | null) => void;
 }
 
 /**
@@ -240,6 +249,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [editingConn, setEditingConn] = useState<Connection | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [selectedObject, setSelectedObject] = useState<string | null>(null);
+  const [editDataRequest, setEditDataRequest] = useState<string | null>(null);
 
   const sqlRef = useRef(sql);
   sqlRef.current = sql;
@@ -728,8 +738,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setImportOpen,
       selectedObject,
       setSelectedObject,
+      editDataRequest,
+      setEditDataRequest,
     }),
-    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject]
+    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

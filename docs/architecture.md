@@ -103,6 +103,7 @@ lookup and 404.
 | Object source | `GET …/source?name=&type=` |
 | Routines | `GET …/routine`, `POST …/routine/run` |
 | Table design | `table`, `table/apply`, `table/stats`, `table/storage`, `table/advisor`, `table/maintenance` |
+| Row editor | `GET …/table/rows?name=` (rows + their ROWIDs), `POST …/table/rows` (insert / update / delete one row) |
 | Import | `POST …/import` |
 | Analysis | `dba`, `perf`, `deps`, `erd` |
 | Versions | `versions`, `versions/object`, `changelog` |

@@ -431,6 +431,55 @@ export interface TableMeta {
   error?: string;
 }
 
+/* ---- Data Browser edit mode: rows identified by ROWID ---- */
+
+export interface RowEditColumn {
+  name: string;
+  /** display type, e.g. VARCHAR2(50) */
+  dataType: string;
+  baseType: string;
+  nullable: boolean;
+  pk: boolean;
+  /** false = shown but not writable from the grid; `reason` says why */
+  editable: boolean;
+  reason?: string;
+  maxLength?: number;
+}
+
+export interface TableRowsResult {
+  table: string;
+  columns: RowEditColumn[];
+  rows: (string | number | null)[][];
+  /** parallel to `rows` — the ROWID each one is written back through */
+  rowIds: string[];
+  truncated: boolean;
+  /** false when nothing here can be written (a view, or every column unsupported) */
+  writable: boolean;
+  reason?: string;
+}
+
+export type RowAction = "insert" | "update" | "delete";
+
+export interface RowChangeRequest {
+  table: string;
+  action: RowAction;
+  /** update/delete only */
+  rowId?: string;
+  /** insert/update only — just the columns being written */
+  values?: Record<string, string | number | null>;
+}
+
+export interface RowChangeResult {
+  ok: boolean;
+  action: RowAction;
+  table: string;
+  /** the statement that ran, binds left as placeholders */
+  sql: string;
+  rowId: string | null;
+  /** the row as it stands after the write, re-read so defaults and triggers show */
+  row: (string | number | null)[] | null;
+}
+
 export interface ApplyStmtResult {
   sql: string;
   ok: boolean;
@@ -638,6 +687,11 @@ export const api = {
   tableMeta: (id: string, name: string) => request<TableMeta>(`/api/connections/${id}/table?name=${encodeURIComponent(name)}`),
   applyTableDdl: (id: string, statements: string[], confirm = false) =>
     request<ApplyTableResult>(`/api/connections/${id}/table/apply`, { statements, confirm }),
+  /** Rows of a table plus their ROWIDs — the Data Browser edit-mode read (any browsing role). */
+  tableRows: (id: string, name: string) => request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`),
+  /** Insert / update / delete one row. Unacknowledged calls come back as ConfirmRequiredError. */
+  changeTableRow: (id: string, req: RowChangeRequest, confirm = false) =>
+    request<RowChangeResult>(`/api/connections/${id}/table/rows`, { ...req, confirm }),
   tableStats: (id: string, name: string) => request<TableStats>(`/api/connections/${id}/table/stats?name=${encodeURIComponent(name)}`),
   tableStatsAction: (id: string, name: string, action: StatsAction, confirm = false) =>
     request<{ ok: boolean; action: StatsAction }>(`/api/connections/${id}/table/stats`, { name, action, confirm }),

@@ -515,7 +515,15 @@ function splitHelpUrl(msg: string): { message: string; helpUrl?: string } {
 
 function mapVal(v: unknown): string | number | null {
   if (v === null || v === undefined) return null;
-  if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString().slice(0, 19).replace("T", " ");
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return null;
+    // node-oracledb builds the Date from the Oracle value's own components in the process's
+    // local zone, so toISOString() re-reads it as UTC and shifts every value by the local
+    // offset — a DATE stored as 09:15 came back as 15:15 on a UTC-6 machine. An Oracle DATE
+    // carries no time zone to convert into, so the local components go back out unchanged.
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())} ${p(v.getHours())}:${p(v.getMinutes())}:${p(v.getSeconds())}`;
+  }
   if (Buffer.isBuffer(v)) return `0x${v.toString("hex").slice(0, 64)}`;
   if (typeof v === "bigint") return v.toString();
   if (typeof v === "number" || typeof v === "string") return v;
@@ -2853,6 +2861,278 @@ async function oraImport(c: LiveConnection, body: ImportBody): Promise<ImportRes
   }
 }
 
+/* ---------------- Row editor: insert / update / delete single rows (Oracle) ---------------- */
+
+interface RowEditColumn {
+  name: string;
+  /** display type, e.g. VARCHAR2(50) */
+  dataType: string;
+  baseType: string;
+  nullable: boolean;
+  pk: boolean;
+  /** false = the grid shows the value but refuses to write it back; `reason` says why */
+  editable: boolean;
+  reason?: string;
+  /** characters the column accepts, for the input's maxLength (character types only) */
+  maxLength?: number;
+}
+
+interface TableRowsResult {
+  table: string;
+  columns: RowEditColumn[];
+  rows: (string | number | null)[][];
+  /** parallel to `rows` — the ROWID each one is written back through */
+  rowIds: string[];
+  truncated: boolean;
+  /** false when no row here can be written at all (a view, or every column unsupported) */
+  writable: boolean;
+  reason?: string;
+}
+
+type RowAction = "insert" | "update" | "delete";
+
+interface RowChangeBody {
+  table: string;
+  action: RowAction;
+  /** update/delete: which row. Ignored for insert. */
+  rowId?: string;
+  /** insert/update: column name → new value. Only the columns being written. */
+  values?: Record<string, string | number | null>;
+}
+
+interface RowChangeResult {
+  ok: boolean;
+  action: RowAction;
+  table: string;
+  /** the statement that ran, binds left as placeholders — there to be shown, not re-parsed */
+  sql: string;
+  /** ROWID of the inserted/updated row (null after a delete) */
+  rowId: string | null;
+  /** the row re-read from the database, so defaults and triggers are visible immediately */
+  row: (string | number | null)[] | null;
+}
+
+/**
+ * Types a single-line text box can round-trip without losing anything. Everything else is
+ * shown read-only on purpose: `mapVal` renders LOBs as `[BLOB]`, RAW as a truncated hex
+ * prefix and VECTOR as JSON, so writing the *rendered* text back would quietly replace the
+ * value with its own preview. Time-zone timestamps are excluded for the same reason — the
+ * grid shows them normalised to UTC, and saving that back would move the stored offset.
+ */
+function rowEditReason(baseType: string, virtual: boolean, identity: string | null): string | null {
+  if (virtual) return "virtual column — Oracle computes it from the other columns.";
+  if (identity === "ALWAYS") return "identity column generated always — Oracle assigns the value.";
+  const t = baseType.toUpperCase();
+  if (/^(VARCHAR2|NVARCHAR2|CHAR|NCHAR|NUMBER|FLOAT|BINARY_FLOAT|BINARY_DOUBLE|DATE)$/.test(t)) return null;
+  if (/^TIMESTAMP\(\d+\)$/.test(t)) return null;
+  if (/TIME ZONE/.test(t)) return `${t} carries a time zone that the grid renders in UTC — editing it here would move the stored value.`;
+  if (/^(CLOB|NCLOB|BLOB|BFILE|LONG|LONG RAW)$/.test(t)) return `${t} is shown as a placeholder rather than its contents.`;
+  if (t === "RAW") return "RAW is shown as a truncated hex preview, not the full bytes.";
+  return `${t} values cannot be edited from the data grid.`;
+}
+
+/** Normalise a typed-in date to the one format the TO_DATE/TO_TIMESTAMP calls below use. */
+function normalizeStamp(raw: string | number): { value: string } | { error: string } {
+  const m = String(raw).trim().match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?Z?$/);
+  if (!m) return { error: `expected a date as YYYY-MM-DD or YYYY-MM-DD HH24:MI:SS, got "${String(raw).slice(0, 40)}"` };
+  return { value: `${m[1]} ${m[2] ?? "00"}:${m[3] ?? "00"}:${m[4] ?? "00"}` };
+}
+
+/**
+ * How one column's value reaches Oracle. Every value is a bind — the only text this builds
+ * from the request is the placeholder name, so a value can never become SQL.
+ */
+function rowValueBind(
+  baseType: string,
+  raw: string | number | null
+): { sql: (ph: string) => string; value: string | number | null } | { error: string } {
+  const t = baseType.toUpperCase();
+  // Oracle stores '' as NULL anyway, so an emptied box means NULL — there is no third state.
+  if (raw === null || (typeof raw === "string" && raw.trim() === "")) return { sql: (ph) => ph, value: null };
+  if (/^(NUMBER|FLOAT|BINARY_FLOAT|BINARY_DOUBLE)$/.test(t)) {
+    const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+    if (!Number.isFinite(n)) return { error: `"${String(raw).slice(0, 40)}" is not a valid ${t}` };
+    return { sql: (ph) => ph, value: n };
+  }
+  if (t === "DATE" || /^TIMESTAMP\(\d+\)$/.test(t)) {
+    const s = normalizeStamp(raw);
+    if ("error" in s) return { error: s.error };
+    const fn = t === "DATE" ? "TO_DATE" : "TO_TIMESTAMP";
+    return { sql: (ph) => `${fn}(${ph}, 'YYYY-MM-DD HH24:MI:SS')`, value: s.value };
+  }
+  return { sql: (ph) => ph, value: String(raw) };
+}
+
+/** Double-quote an identifier that came from the data dictionary, not from the request. */
+const quoteIdent = (s: string) => `"${s.replace(/"/g, '""')}"`;
+
+/**
+ * Resolve a name to the exact dictionary spelling of a **table** in this schema. Views are
+ * deliberately not resolved: a view's ROWID is the base table's only in the simplest
+ * key-preserving cases, so writing rows back through one is not dependable.
+ */
+async function oraResolveTable(conn: oracledb.Connection, name: string): Promise<string | null> {
+  const rows = await oraRows(conn, `SELECT table_name FROM user_tables WHERE table_name = :n OR table_name = UPPER(:n)`, { n: name });
+  // exact spelling wins, so a real lowercase "orders" is never answered with "ORDERS"
+  const exact = rows.find((r) => String(r.TABLE_NAME) === name);
+  return exact ? String(exact.TABLE_NAME) : rows.length ? String(rows[0].TABLE_NAME) : null;
+}
+
+/** The columns `SELECT *` returns, in that order, each marked editable or not. */
+async function oraRowColumns(conn: oracledb.Connection, table: string): Promise<RowEditColumn[]> {
+  // user_tab_cols (not user_tab_columns) is what carries VIRTUAL_COLUMN and HIDDEN_COLUMN;
+  // hidden columns are excluded because SELECT * does not return them either.
+  const cols = await oraRows(
+    conn,
+    `SELECT column_name, data_type, data_length, char_length, data_precision, data_scale, nullable, virtual_column
+       FROM user_tab_cols WHERE table_name = :n AND hidden_column = 'NO' ORDER BY column_id`,
+    { n: table }
+  );
+  // separate query: user_tab_identity_cols is empty on a table with no identity column, and
+  // oraRows turns any failure into [] — a join would take the whole column list down with it
+  const idents = await oraRows(conn, `SELECT column_name, generation_type FROM user_tab_identity_cols WHERE table_name = :n`, { n: table });
+  const identMap = new Map(idents.map((r) => [String(r.COLUMN_NAME), String(r.GENERATION_TYPE ?? "").toUpperCase()]));
+  const pkRows = await oraRows(
+    conn,
+    `SELECT cc.column_name
+       FROM user_constraints uc JOIN user_cons_columns cc ON cc.constraint_name = uc.constraint_name
+      WHERE uc.table_name = :n AND uc.constraint_type = 'P'`,
+    { n: table }
+  );
+  const pkSet = new Set(pkRows.map((r) => String(r.COLUMN_NAME)));
+
+  return cols.map((r) => {
+    const name = String(r.COLUMN_NAME);
+    const baseType = String(r.DATA_TYPE);
+    const charLen = r.CHAR_LENGTH == null ? null : Number(r.CHAR_LENGTH) || null;
+    const precision = r.DATA_PRECISION == null ? null : Number(r.DATA_PRECISION);
+    const scale = r.DATA_SCALE == null ? null : Number(r.DATA_SCALE);
+    const reason = rowEditReason(baseType, String(r.VIRTUAL_COLUMN) === "YES", identMap.get(name) ?? null);
+    return {
+      name,
+      baseType,
+      dataType: composeOraType(baseType, charLen, precision, scale),
+      nullable: String(r.NULLABLE) === "Y",
+      pk: pkSet.has(name),
+      editable: reason === null,
+      ...(reason ? { reason } : {}),
+      ...(charLen && /^(VARCHAR2|NVARCHAR2|CHAR|NCHAR)$/.test(baseType.toUpperCase()) ? { maxLength: charLen } : {}),
+    };
+  });
+}
+
+/** Read a page of rows together with the ROWID that identifies each one. */
+async function oraTableRows(c: LiveConnection, name: string, limit: number): Promise<TableRowsResult> {
+  const lim = Math.min(MAX_ROWS, Math.max(1, limit));
+  const conn = await getOraConn(c);
+  try {
+    const table = await oraResolveTable(conn, name);
+    if (!table) {
+      return {
+        table: name, columns: [], rows: [], rowIds: [], truncated: false, writable: false,
+        reason: `${name} is not a table in this schema. Rows are edited through a table's ROWID, which a view does not dependably have.`,
+      };
+    }
+    const columns = await oraRowColumns(conn, table);
+    if (!columns.length) {
+      return { table, columns: [], rows: [], rowIds: [], truncated: false, writable: false, reason: `Could not read the columns of ${table}.` };
+    }
+    const list = columns.map((col) => `t.${quoteIdent(col.name)}`).join(", ");
+    // lim is clamped above, so inlining it is safe — FETCH FIRST will not take a bind here
+    const r = await conn.execute<unknown[]>(
+      `SELECT t.ROWID, ${list} FROM ${quoteIdent(table)} t FETCH FIRST ${lim + 1} ROWS ONLY`,
+      [],
+      { outFormat: oracledb.OUT_FORMAT_ARRAY }
+    );
+    const all = (r.rows ?? []) as unknown[][];
+    const page = all.slice(0, lim);
+    const editable = columns.filter((col) => col.editable).length;
+    return {
+      table,
+      columns,
+      rows: page.map((row) => row.slice(1).map(mapVal)),
+      rowIds: page.map((row) => String(row[0])),
+      truncated: all.length > lim,
+      writable: editable > 0,
+      ...(editable ? {} : { reason: `No column of ${table} holds a type the data grid can write back.` }),
+    };
+  } finally {
+    await conn.close();
+  }
+}
+
+/** Apply one row change. Identifiers come from the dictionary, values are always binds. */
+async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<RowChangeResult | { error: string }> {
+  const conn = await getOraConn(c);
+  try {
+    const table = await oraResolveTable(conn, body.table);
+    if (!table) return { error: `${body.table} is not a table in this schema — rows can only be edited on tables.` };
+    const columns = await oraRowColumns(conn, table);
+    const byName = new Map(columns.map((col) => [col.name.toUpperCase(), col]));
+    const gone = "That row is not there any more — it was deleted (or moved) since this grid was loaded. Refresh to see the current rows.";
+
+    if (body.action === "delete") {
+      if (!body.rowId) return { error: "The row to delete could not be identified. Refresh the grid and try again." };
+      const sql = `DELETE FROM ${quoteIdent(table)} WHERE ROWID = :rid`;
+      const r = await conn.execute(sql, { rid: body.rowId }, { autoCommit: true });
+      if (!r.rowsAffected) return { error: gone };
+      return { ok: true, action: "delete", table, sql, rowId: null, row: null };
+    }
+
+    const entries = Object.entries(body.values ?? {});
+    if (!entries.length) {
+      return { error: body.action === "update" ? "Nothing changed — no column was given a new value." : "A new row needs at least one column value." };
+    }
+    const assignments: string[] = [];
+    const insertCols: string[] = [];
+    const insertVals: string[] = [];
+    const binds: Record<string, unknown> = {};
+    for (const [i, [rawName, rawValue]] of entries.entries()) {
+      const col = byName.get(rawName.trim().toUpperCase());
+      if (!col) return { error: `${table} has no column named ${rawName}.` };
+      if (!col.editable) return { error: `${col.name} cannot be edited here — ${col.reason}` };
+      const bound = rowValueBind(col.baseType, rawValue);
+      if ("error" in bound) return { error: `${col.name}: ${bound.error}.` };
+      const key = `v${i}`;
+      binds[key] = bound.value;
+      assignments.push(`${quoteIdent(col.name)} = ${bound.sql(`:${key}`)}`);
+      insertCols.push(quoteIdent(col.name));
+      insertVals.push(bound.sql(`:${key}`));
+    }
+
+    let sql: string;
+    let rowId: string;
+    if (body.action === "update") {
+      if (!body.rowId) return { error: "The row to update could not be identified. Refresh the grid and try again." };
+      sql = `UPDATE ${quoteIdent(table)} SET ${assignments.join(", ")} WHERE ROWID = :rid`;
+      const r = await conn.execute(sql, { ...binds, rid: body.rowId }, { autoCommit: true });
+      if (!r.rowsAffected) return { error: gone };
+      rowId = body.rowId;
+    } else {
+      // RETURNING hands back the new ROWID, so the grid can keep editing the row it just made
+      sql = `INSERT INTO ${quoteIdent(table)} (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")}) RETURNING ROWID INTO :df_rowid`;
+      const r = await conn.execute(
+        sql,
+        { ...binds, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
+        { autoCommit: true }
+      );
+      rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
+    }
+
+    // re-read: defaults, identity values and row triggers only show up after the write
+    const list = columns.map((col) => `t.${quoteIdent(col.name)}`).join(", ");
+    const back = await conn.execute<unknown[]>(
+      `SELECT ${list} FROM ${quoteIdent(table)} t WHERE t.ROWID = :rid`,
+      { rid: rowId },
+      { outFormat: oracledb.OUT_FORMAT_ARRAY }
+    );
+    const row = back.rows?.[0] ? back.rows[0].map(mapVal) : null;
+    return { ok: true, action: body.action, table, sql, rowId, row };
+  } finally {
+    await conn.close();
+  }
+}
+
 /* ---------------- ER diagram (live FKs) ---------------- */
 
 export interface ErdColumn { name: string; type: string; pk: boolean; fk: boolean; nullable: boolean; }
@@ -4763,6 +5043,77 @@ app.post("/api/connections/:id/table/apply", requireFullAccess, async (req, res)
     res.json(await oraApplyTableDdl(c, statements));
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
+  }
+});
+
+/**
+ * Rows of one table plus the ROWID of each — what the Data Browser's edit mode reads.
+ * A read, so every role that may browse table data may call it; writing them back is the
+ * POST below, which is Administrator/Developer only.
+ */
+app.get("/api/connections/:id/table/rows", async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "Editing rows currently supports Oracle connections only." });
+  const name = String(req.query.name ?? "").trim();
+  if (!name) return res.status(400).json({ error: "Missing table name (?name=...)" });
+  const limit = Number(req.query.limit) || MAX_ROWS;
+  try {
+    res.json(await oraTableRows(c, name, limit));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
+  }
+});
+
+/** Insert / update / delete one row: body { table, action, rowId?, values? } (Oracle only). */
+app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "Editing rows currently supports Oracle connections only." });
+  if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — row changes are blocked. Edit the connection to disable read-only mode." });
+  const action = String(req.body?.action ?? "");
+  if (action !== "insert" && action !== "update" && action !== "delete") {
+    return res.status(400).json({ error: `Unknown row action "${action}" — expected insert, update or delete.` });
+  }
+  const table = String(req.body?.table ?? "").trim();
+  if (!table) return res.status(400).json({ error: "Missing `table`." });
+  const values = req.body?.values;
+  if (action !== "delete" && (!values || typeof values !== "object" || Array.isArray(values))) {
+    return res.status(400).json({ error: "`values` must be an object of column name → value." });
+  }
+  // same default-deny as every other write: nothing runs until the caller acknowledges it
+  if (!acknowledged(req)) {
+    const changed = action === "delete" ? [] : Object.keys(values as Record<string, unknown>);
+    return confirmRequired(res, describeOperation({
+      level: action === "delete" ? "destructive" : "write",
+      verb: action.toUpperCase(),
+      target: table,
+      title: action === "delete" ? `Delete this row from ${table}?` : action === "insert" ? `Insert a row into ${table}?` : `Save this row in ${table}?`,
+      body:
+        action === "delete"
+          ? `The row is removed from ${table} on "${c.name}" and committed straight away — there is no undo.`
+          : action === "insert"
+            ? `A new row is written to ${table} on "${c.name}" and committed straight away.`
+            : `${changed.length === 1 ? "1 column" : `${changed.length} columns`} (${changed.join(", ")}) ${changed.length === 1 ? "is" : "are"} overwritten on this row of ${table} on "${c.name}", committed straight away.`,
+      confirmLabel: action === "delete" ? "Delete row" : action === "insert" ? "Insert row" : "Save row",
+      danger: action === "delete",
+    }));
+  }
+  try {
+    const out = await oraRowChange(c, {
+      table,
+      action,
+      rowId: req.body?.rowId == null ? undefined : String(req.body.rowId),
+      values: values as Record<string, string | number | null> | undefined,
+    });
+    if ("error" in out) return res.status(400).json({ error: out.error });
+    res.json(out);
+  } catch (e) {
+    // an ORA-nnnnn here is Oracle rejecting the values that were submitted (NOT NULL, a check
+    // or FK constraint, value too large) — that is a bad request, not a backend fault, and the
+    // grid should show it next to the row rather than as a server error
+    const status = (e as { errorNum?: number }).errorNum ? 400 : 500;
+    res.status(status).json({ error: withNetworkHint(errMsg(e), c.host) });
   }
 });
 

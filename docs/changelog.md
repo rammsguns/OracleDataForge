@@ -8,6 +8,30 @@ Dates are the date the change landed on `main`.
 
 ## Unreleased
 
+### Added
+
+- **Edit data: insert, update and delete rows from the Data Browser.** A table's Data tab now
+  has an **Edit data** toggle (and an **Edit data…** entry in the tree's table context menu)
+  that swaps the read-only preview for an editable grid — edit a row in place, delete it, or
+  add a new one. Rows are identified by **ROWID** rather than the primary key, so a table
+  without one is still editable and changing a key column does not lose the row. Each change is
+  one statement that goes through the same write guard as everything else: the first call is
+  unacknowledged and comes back as the confirmation dialog's wording, and only the user's
+  confirmation runs it. Column names are matched against the data dictionary and every value is
+  bound, so nothing from the request becomes SQL. Columns the grid cannot round-trip losslessly
+  — LOBs, RAW, VECTOR, time-zone timestamps, virtual and GENERATED ALWAYS identity columns —
+  are shown read-only with the reason, rather than silently writing their rendered preview back.
+
+### Fixed
+
+- **Dates and timestamps were displayed shifted by the machine's UTC offset.** node-oracledb
+  builds a JavaScript `Date` from the Oracle value's own components in the process's local
+  zone, and the server then formatted it with `toISOString()` — re-reading those local
+  components as UTC. On a UTC-6 machine a `DATE` stored as `09:15` was shown everywhere as
+  `15:15`. An Oracle `DATE` carries no time zone to convert into, so the local components are
+  now formatted back unchanged. This affected every grid, export and preview in the app, and
+  would have made the new row editor move a date by the offset on every save.
+
 ### Security
 
 - **Workspace roles are now enforced server-side, not just by the client's tab-gating.** The
