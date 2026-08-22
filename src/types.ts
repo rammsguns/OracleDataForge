@@ -1,5 +1,8 @@
 export type Engine = "oracle";
 
+/** Workspace permissions. Authentication can supply this role in a production deployment. */
+export type AccessRole = "Administrator" | "Developer" | "Analyst" | "Viewer";
+
 export interface Connection {
   id: string;
   name: string;
@@ -84,7 +87,9 @@ export type TabKind =
   | "deps"
   | "versions"
   | "compile"
-  | "joblog";
+  | "joblog"
+  | "admin"
+  | "repository";
 
 export interface Tab {
   id: string;

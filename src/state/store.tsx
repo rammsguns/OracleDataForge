@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  AccessRole,
   Connection,
   HistoryEntry,
   ResultSet,
@@ -30,6 +31,9 @@ export interface ConfirmState {
 }
 
 interface Store {
+  accessRole: AccessRole;
+  setAccessRole: (role: AccessRole) => void;
+
   theme: "dark" | "light";
   toggleTheme: () => void;
 
@@ -131,6 +135,16 @@ const CONN_STORAGE_KEY = "dataforge-connections";
 const CONN_COLORS = ["#4f8ef7", "#f4b13e", "#3fbf7f", "#e0665a", "#a97bf0", "#3fb8c4"];
 const HIST_STORAGE_KEY = "dataforge-history";
 const HIST_MAX = 200;
+const ACCESS_ROLE_STORAGE_KEY = "dataforge-access-role";
+
+function loadAccessRole(): AccessRole {
+  try {
+    const value = localStorage.getItem(ACCESS_ROLE_STORAGE_KEY);
+    return value === "Administrator" || value === "Developer" || value === "Analyst" || value === "Viewer" ? value : "Administrator";
+  } catch {
+    return "Administrator";
+  }
+}
 
 /* ---- Panel layout (collapsed state + widths) ---- */
 
@@ -208,6 +222,7 @@ function loadStoredHistory(): HistoryEntry[] {
 }
 
 export function StudioProvider({ children }: { children: ReactNode }) {
+  const [accessRole, setAccessRoleState] = useState<AccessRole>(loadAccessRole);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [sidebarOpen, setSidebarOpen] = useState(() => loadLayout().sidebarOpen);
   const [connections, setConnections] = useState<Connection[]>(loadStoredConnections);
@@ -242,6 +257,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     document.documentElement.classList.toggle("light", theme === "light");
   }, [theme]);
+
+  const setAccessRole = useCallback((role: AccessRole) => {
+    setAccessRoleState(role);
+    try { localStorage.setItem(ACCESS_ROLE_STORAGE_KEY, role); } catch { /* session-only */ }
+  }, []);
 
   // remember which side panels the user collapsed (see loadLayout)
   useEffect(() => {
@@ -325,6 +345,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const openTab = useCallback((kind: TabKind, title: string, payload?: string) => {
+    const fullAccess = accessRole === "Administrator" || accessRole === "Developer";
+    const viewerTabs: TabKind[] = ["worksheet", "data", "object", "history", "deps", "versions"];
+    const allowed = fullAccess || (accessRole === "Viewer" ? viewerTabs.includes(kind) : kind === "data");
+    if (!allowed) {
+      toast("warning", accessRole === "Analyst" ? "Analyst access is limited to table data" : "Your role does not have access to this feature");
+      return;
+    }
     setTabs((prev) => {
       const existing = prev.find((t) => t.kind === kind && t.payload === payload);
       if (existing) {
@@ -335,7 +362,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setActiveTabId(id);
       return [...prev, { id, kind, title, payload }];
     });
-  }, []);
+  }, [accessRole, toast]);
 
   const doCloseTab = useCallback((id: string) => {
     setTabs((prev) => {
@@ -478,6 +505,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const runSql = useCallback(
     (override?: string) => {
       const statement = override ?? sqlRef.current;
+      if (accessRole === "Analyst") {
+        toast("warning", "Analyst access is limited to table data");
+        return;
+      }
+      if (accessRole === "Viewer" && !isReadOnlySql(statement)) {
+        toast("warning", "Viewer access is read-only — only SELECT statements can run");
+        return;
+      }
       // read-only connection: block writes before they go anywhere (the backend enforces
       // this too — this is just instant feedback with no round trip)
       if (statement.trim() && !isReadOnlySql(statement) && activeConnRef.current?.readOnly) {
@@ -497,7 +532,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       // writes with a confirmation for the dialog above (see reallyRun)
       reallyRun(statement);
     },
-    [reallyRun, toast]
+    [accessRole, reallyRun, toast]
   );
 
   const doFormat = useCallback(() => {
@@ -634,6 +669,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<Store>(
     () => ({
+      accessRole,
+      setAccessRole,
       theme,
       toggleTheme: () => setTheme((t) => (t === "dark" ? "light" : "dark")),
       sidebarOpen,
@@ -686,7 +723,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       selectedObject,
       setSelectedObject,
     }),
-    [theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject]
+    [accessRole, setAccessRole, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

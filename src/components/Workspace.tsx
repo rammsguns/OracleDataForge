@@ -5,6 +5,7 @@ import {
   FileCode2,
   Gauge,
   GitCompareArrows,
+  Github,
   Hammer,
   History,
   ListChecks,
@@ -13,6 +14,7 @@ import {
   Plus,
   Table2,
   Terminal,
+  UserCog,
   Waypoints,
   X,
 } from "lucide-react";
@@ -32,6 +34,9 @@ import VersionHistory from "./VersionHistory";
 import RoutineRunner from "./RoutineRunner";
 import CompileInvalid from "./CompileInvalid";
 import JobRunLog from "./JobRunLog";
+import UserAdmin from "./UserAdmin";
+import PlsqlRepository from "./PlsqlRepository";
+import { EmptyState } from "./ui";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
   worksheet: <Terminal size={12} />,
@@ -48,6 +53,8 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   versions: <History size={12} />,
   compile: <Hammer size={12} />,
   joblog: <ListChecks size={12} />,
+  admin: <UserCog size={12} />,
+  repository: <Github size={12} />,
 };
 
 const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
@@ -59,11 +66,17 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
   { kind: "joblog", title: "Job Run Log", label: "Job Runs" },
+  { kind: "admin", title: "Admin", label: "Admin" },
+  { kind: "repository", title: "PL/SQL Repository", label: "Repository" },
 ];
 
 export default function Workspace() {
   const s = useStudio();
   const active = s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0];
+  const fullAccess = s.accessRole === "Administrator" || s.accessRole === "Developer";
+  const viewerTabs: TabKind[] = ["worksheet", "data", "object", "history", "deps", "versions"];
+  const canView = (kind: TabKind) => fullAccess || (s.accessRole === "Viewer" ? viewerTabs.includes(kind) : kind === "data");
+  const canUseActive = canView(active.kind);
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-panel">
@@ -101,7 +114,7 @@ export default function Workspace() {
         ))}
         {/* quick launchers */}
         <div className="flex items-center gap-0.5 px-2 ml-auto">
-          {LAUNCHERS.map((l) => (
+          {LAUNCHERS.filter((l) => canView(l.kind)).map((l) => (
             <button
               key={l.kind}
               onClick={() => s.openTab(l.kind, l.title)}
@@ -112,19 +125,20 @@ export default function Workspace() {
               <span className="max-lg:hidden">{l.label}</span>
             </button>
           ))}
-          <button
+          {s.accessRole !== "Analyst" && <button
             onClick={() => s.openTab("worksheet", `Worksheet ${s.tabs.filter((t) => t.kind === "worksheet").length + 1}`, `ws-${Date.now()}`)}
             className="p-1.5 rounded text-mute hover:text-accenthi hover:bg-accentdim transition-colors"
             title="New worksheet (Ctrl+T)"
             aria-label="New worksheet"
           >
             <Plus size={14} />
-          </button>
+          </button>}
         </div>
       </div>
 
       {/* tab content */}
       <div className="flex-1 min-h-0" role="tabpanel" aria-label={active.title}>
+        {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>
         {active.kind === "worksheet" && <SqlWorksheet />}
         {active.kind === "data" && <DataBrowser table={active.payload!} />}
         {active.kind === "object" && <ObjectEditor object={active.payload!} tabId={active.id} />}
@@ -139,6 +153,9 @@ export default function Workspace() {
         {active.kind === "versions" && <VersionHistory key={active.id} />}
         {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}
         {active.kind === "joblog" && <JobRunLog key={active.id} initialJob={active.payload} />}
+        {active.kind === "admin" && <UserAdmin />}
+        {active.kind === "repository" && <PlsqlRepository />}
+        </>}
       </div>
     </div>
   );

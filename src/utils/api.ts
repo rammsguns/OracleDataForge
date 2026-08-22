@@ -236,6 +236,9 @@ export interface LiveQueryResult {
   confirmation?: GuardConfirmation;
 }
 
+export interface GitHubSyncRequest { repositoryUrl: string; branch: string; directory: string; object: string; type: string; source: string; }
+export interface GitHubSyncResult { ok: boolean; path: string; commit: string | null; url: string | null; }
+
 export interface PlanNode {
   op: string;
   object?: string;
@@ -558,6 +561,8 @@ const compileScopeQuery = (ref: CompileScopeRef) =>
       : "scope=schema";
 
 export const api = {
+  /** Writes compiled PL/SQL to GitHub through the local backend; the GitHub token stays server-side. */
+  githubSync: (req: GitHubSyncRequest) => request<GitHubSyncResult>("/api/github/sync", req),
   /** Saved connections from the backend registry (metadata only) — lets a browser that has
    *  never seen them rehydrate its list instead of showing "No connections yet". */
   list: () => request<{ connections: StoredConnection[] }>("/api/connections"),
