@@ -3347,7 +3347,7 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
  * query re-opens a pool lazily, so this is also the way out of a pool left
  * stale by a database or network restart.
  */
-app.post("/api/connections/:id/disconnect", requireFullAccess, async (req, res) => {
+app.post("/api/connections/:id/disconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const wasOpen = await closePools(c);
@@ -3355,7 +3355,7 @@ app.post("/api/connections/:id/disconnect", requireFullAccess, async (req, res) 
 });
 
 /** Reconnect: close whatever is open, then prove a fresh session can be established. */
-app.post("/api/connections/:id/reconnect", requireFullAccess, async (req, res) => {
+app.post("/api/connections/:id/reconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   await closePools(c);
