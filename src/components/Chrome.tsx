@@ -43,13 +43,13 @@ export function TitleBar() {
       )}
 
       <div className="ml-auto flex items-center gap-1">
-        <label className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute" title="Preview workspace access for a role">
+        <div
+          className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute"
+          title={s.session?.name ? `Signed in as ${s.session.name}` : "Server-enforced access role for this session"}
+        >
           <ShieldCheck size={13} className="text-accenthi" />
-          <span className="sr-only">Access role</span>
-          <select value={s.accessRole} onChange={(e) => s.setAccessRole(e.target.value as typeof s.accessRole)} className="bg-transparent text-soft font-medium outline-none cursor-pointer">
-            <option>Administrator</option><option>Developer</option><option>Analyst</option><option>Viewer</option>
-          </select>
-        </label>
+          <span className="text-soft font-medium">{s.accessRole}</span>
+        </div>
         <button
           onClick={() => setShortcutsOpen(true)}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"

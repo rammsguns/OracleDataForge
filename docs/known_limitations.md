@@ -150,9 +150,16 @@ The app assumes **one operator per instance**. It is not a defect that it behave
 two — the control plane that would make it safe was deliberately removed — but the specific
 failure modes are worth knowing:
 
-1. **No identity.** Authentication is a single shared token with a fixed username. Everyone
-   who has it is the same principal. On loopback there is typically no authentication at all.
-2. **The connection registry is global.** Anyone can list and use any saved connection,
+1. **Identity is optional, and only as granular as an email/password/role triple.** Named
+   accounts and server-enforced roles exist (see
+   [security.md](security.md#workspace-roles)), but there is still a single break-glass
+   credential that is always Administrator, no session expiry, no MFA enforcement, and no
+   per-account audit trail — anyone with an account can see everything short of what their
+   role blocks. On a bare loopback install with no accounts created, there is still no
+   authentication at all.
+2. **The connection registry is global regardless of role.** Any authenticated account can list
+   and use any saved connection, including its stored password, which is replayed server-side.
+   Editing and deleting a connection (Administrator/Developer only) affect everyone.
    including its stored password, which is replayed server-side. Editing and deleting affect
    everyone.
 3. **Disconnect is global** — it closes pooled sessions another person is working through.

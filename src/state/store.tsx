@@ -17,7 +17,7 @@ import type {
   TabKind,
   Toast,
 } from "../types";
-import { api, type ExplainResult } from "../utils/api";
+import { api, type ExplainResult, type SessionInfo } from "../utils/api";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { destructiveCheck, formatSql, isReadOnlySql } from "../utils/sql";
@@ -31,8 +31,13 @@ export interface ConfirmState {
 }
 
 interface Store {
+  /** The role the server actually authenticated this browser as (see /api/session) —
+   *  "Viewer" (the most restrictive) until that first response lands, so nothing flashes
+   *  full access before the real answer is known. This can no longer be self-selected;
+   *  it reflects who's really logged in and is what the server will enforce regardless. */
   accessRole: AccessRole;
-  setAccessRole: (role: AccessRole) => void;
+  session: SessionInfo | null;
+  refreshSession: () => Promise<void>;
 
   theme: "dark" | "light";
   toggleTheme: () => void;
@@ -135,16 +140,6 @@ const CONN_STORAGE_KEY = "dataforge-connections";
 const CONN_COLORS = ["#4f8ef7", "#f4b13e", "#3fbf7f", "#e0665a", "#a97bf0", "#3fb8c4"];
 const HIST_STORAGE_KEY = "dataforge-history";
 const HIST_MAX = 200;
-const ACCESS_ROLE_STORAGE_KEY = "dataforge-access-role";
-
-function loadAccessRole(): AccessRole {
-  try {
-    const value = localStorage.getItem(ACCESS_ROLE_STORAGE_KEY);
-    return value === "Administrator" || value === "Developer" || value === "Analyst" || value === "Viewer" ? value : "Administrator";
-  } catch {
-    return "Administrator";
-  }
-}
 
 /* ---- Panel layout (collapsed state + widths) ---- */
 
@@ -222,7 +217,8 @@ function loadStoredHistory(): HistoryEntry[] {
 }
 
 export function StudioProvider({ children }: { children: ReactNode }) {
-  const [accessRole, setAccessRoleState] = useState<AccessRole>(loadAccessRole);
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  const accessRole: AccessRole = session?.role ?? "Viewer";
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [sidebarOpen, setSidebarOpen] = useState(() => loadLayout().sidebarOpen);
   const [connections, setConnections] = useState<Connection[]>(loadStoredConnections);
@@ -258,10 +254,19 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     document.documentElement.classList.toggle("light", theme === "light");
   }, [theme]);
 
-  const setAccessRole = useCallback((role: AccessRole) => {
-    setAccessRoleState(role);
-    try { localStorage.setItem(ACCESS_ROLE_STORAGE_KEY, role); } catch { /* session-only */ }
+  const refreshSession = useCallback(async () => {
+    try {
+      setSession(await api.session());
+    } catch {
+      // network hiccup or a 401 mid-flight (browser re-prompting for Basic auth) — the
+      // next successful call will refresh this; staying on the last-known role is safer
+      // than silently granting a permissive default.
+    }
   }, []);
+
+  useEffect(() => {
+    refreshSession();
+  }, [refreshSession]);
 
   // remember which side panels the user collapsed (see loadLayout)
   useEffect(() => {
@@ -670,7 +675,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const value = useMemo<Store>(
     () => ({
       accessRole,
-      setAccessRole,
+      session,
+      refreshSession,
       theme,
       toggleTheme: () => setTheme((t) => (t === "dark" ? "light" : "dark")),
       sidebarOpen,
@@ -723,7 +729,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       selectedObject,
       setSelectedObject,
     }),
-    [accessRole, setAccessRole, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject]
+    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
