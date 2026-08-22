@@ -8,14 +8,33 @@ Dates are the date the change landed on `main`.
 
 ## Unreleased
 
+### Security
+
+- **Workspace roles are now enforced server-side, not just by the client's tab-gating.** The
+  role picker used to be a client-chosen `localStorage` value — trivially bypassed by anyone
+  editing storage or calling the API directly. The server now authenticates named accounts
+  (HTTP Basic, `data/users.json`, scrypt-hashed passwords) and enforces Administrator/Developer,
+  Analyst, and Viewer independently on every endpoint: write/DDL/GitHub-sync endpoints require
+  full access, Viewer is restricted to read statements, and Analyst is restricted to the exact
+  single-table preview the Data Browser generates. A guard refuses any change that would leave
+  zero active Administrators. Until the first account is created, the app behaves exactly as
+  before. See [security.md](security.md#workspace-roles).
+
+## 2026-08-22
+
 ### Added
 
+- **Administration and GitHub PL/SQL sync.** An Admin workspace for managing users and roles,
+  and an optional PL/SQL Repository workspace that syncs successfully compiled objects to a
+  configured GitHub repository through the backend (`GITHUB_TOKEN` stays server-side).
+  ([#2](https://github.com/rammsguns/OracleDataForge/pull/2))
 - **Response compression.** The backend serves the built SPA itself, and was shipping the
   ~946 kB bundle uncompressed. gzip is now applied to responses above 1 kB, measured at
   **4.56× on first load** (989 kB → 217 kB) and applying equally to large JSON result
-  payloads.
+  payloads. ([#9](https://github.com/rammsguns/OracleDataForge/pull/9))
 - **CI.** A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `npm ci`,
   `npm run typecheck`, and `npm run build` on every push and pull request against `main`.
+  ([#9](https://github.com/rammsguns/OracleDataForge/pull/9))
 
 ### Changed
 
@@ -23,9 +42,10 @@ Dates are the date the change landed on `main`.
   twelve independent dictionary queries for synonyms, DB links, directories, editions, and
   similar categories ran in a fully serial loop. They now split across two pooled connections,
   roughly halving that portion of tree-load latency on a large schema.
+  ([#9](https://github.com/rammsguns/OracleDataForge/pull/9))
 - **Migration assistant concurrency now matches the pool.** The client fetched table metadata
   6-at-a-time against a pool capped at 4, leaving two requests queued in the driver at all
-  times. The client cap is now 4.
+  times. The client cap is now 4. ([#9](https://github.com/rammsguns/OracleDataForge/pull/9))
 
 ### Security
 

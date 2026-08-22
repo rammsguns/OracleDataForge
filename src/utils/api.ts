@@ -239,6 +239,19 @@ export interface LiveQueryResult {
 export interface GitHubSyncRequest { repositoryUrl: string; branch: string; directory: string; object: string; type: string; source: string; }
 export interface GitHubSyncResult { ok: boolean; path: string; commit: string | null; url: string | null; }
 
+export type AccessRole = "Administrator" | "Developer" | "Analyst" | "Viewer";
+
+/** Who the server actually authenticated this browser as — the real role it will enforce,
+ *  not a client-chosen guess. `accountsConfigured` is false only in the zero-setup state
+ *  (no workspace accounts created yet), where every request is treated as Administrator. */
+export interface SessionInfo { role: AccessRole; email: string | null; name: string | null; accountsConfigured: boolean; }
+
+export interface WorkspaceUser {
+  id: string; name: string; email: string; role: AccessRole;
+  status: "Active" | "Suspended"; mfa: boolean; createdAt: string;
+}
+export interface WorkspaceUserInput { name: string; email: string; role: AccessRole; mfa: boolean; password?: string; }
+
 export interface PlanNode {
   op: string;
   object?: string;
@@ -563,6 +576,15 @@ const compileScopeQuery = (ref: CompileScopeRef) =>
 export const api = {
   /** Writes compiled PL/SQL to GitHub through the local backend; the GitHub token stays server-side. */
   githubSync: (req: GitHubSyncRequest) => request<GitHubSyncResult>("/api/github/sync", req),
+  /** The role the server will actually enforce for this browser — see SessionInfo. */
+  session: () => request<SessionInfo>("/api/session"),
+  users: () => request<{ users: WorkspaceUser[] }>("/api/users"),
+  createUser: (input: WorkspaceUserInput) => request<{ user: WorkspaceUser }>("/api/users", input),
+  updateUser: (id: string, input: WorkspaceUserInput & { status: "Active" | "Suspended" }) =>
+    request<{ user: WorkspaceUser }>(`/api/users/${id}`, input, "PUT"),
+  setUserStatus: (id: string, status: "Active" | "Suspended") =>
+    request<{ user: WorkspaceUser }>(`/api/users/${id}/status`, { status }),
+  removeUser: (id: string) => request<{ ok: boolean }>(`/api/users/${id}`, undefined, "DELETE"),
   /** Saved connections from the backend registry (metadata only) — lets a browser that has
    *  never seen them rehydrate its list instead of showing "No connections yet". */
   list: () => request<{ connections: StoredConnection[] }>("/api/connections"),

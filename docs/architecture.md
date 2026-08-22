@@ -94,6 +94,8 @@ lookup and 404.
 | Area | Endpoints |
 | --- | --- |
 | Health | `GET /api/health` |
+| Session | `GET /api/session` — the role the server authenticated this caller as |
+| Users | list, create, update, `:id/status`, delete — Administrator-only |
 | Connections | list, test, test-existing, create, update, delete, disconnect, reconnect |
 | Schema | `GET …/schema`, `GET …/schema/group?label=` |
 | Query | `POST …/query`, `POST …/explain` |
@@ -105,6 +107,7 @@ lookup and 404.
 | Analysis | `dba`, `perf`, `deps`, `erd` |
 | Versions | `versions`, `versions/object`, `changelog` |
 | Jobs | `GET …/job-runs/:logId/output` |
+| GitHub sync | `POST /api/github/sync` — writes compiled PL/SQL to a configured repository |
 
 `src/utils/api.ts` mirrors this one-to-one.
 
@@ -202,8 +205,11 @@ at 1000 entries.
 
 ## Security boundary
 
-- **HTTP Basic auth** (username `dataforge`, token as password), compared with
-  `timingSafeEqual`. Required when not on loopback.
+- **HTTP Basic auth**, comparing either the break-glass `dataforge` / token pair or a workspace
+  account's email/password (`timingSafeEqual`, scrypt). Required once a token is set or the
+  first workspace account exists; open on a bare loopback install.
+- **Four roles enforced server-side** (Administrator, Developer, Analyst, Viewer) — see
+  [security.md](security.md#workspace-roles) for exactly what each can call.
 - **A same-origin guard** rejects requests carrying a foreign `Origin`, allowing only this
   host and the dev origins. It replaced a wildcard CORS setup.
 - **Non-loopback binding throws at startup** unless both the auth token and encryption key are

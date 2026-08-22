@@ -78,13 +78,14 @@ The backend serves the built frontend when `dist/` exists and binds to `127.0.0.
 
 ## Runtime data and security
 
-The application is deliberately a lightweight core IDE, without the source repository's identity, tenant, vault, or audit control plane.
+The application is deliberately a lightweight core IDE, without the source repository's tenant, vault, or audit control plane.
 
 - Database credentials never reach browser storage; the browser receives connection metadata only.
 - The backend stores saved credentials in `data/connections.json` so connections survive restarts.
 - With `DATAFORGE_ENCRYPTION_KEY` configured, saved credentials are encrypted with AES-256-GCM. The key is optional on loopback, so **a default local install writes passwords to `data/connections.json` in clear text** — set the key before saving a connection whose password matters. Existing plaintext files must be migrated before LAN startup; keep `data/` private regardless.
 - LAN startup requires HTTP Basic authentication and an encryption key. Put TLS in front of the app before using it beyond a trusted network.
 - Read-only mode and confirmation guards reduce accidental writes; they are not a substitute for Oracle privileges.
+- Optional workspace accounts (Admin tab → Add user) add named logins with a real, server-enforced role — Administrator, Developer, Analyst, or Viewer. Until you create the first one, the app stays exactly as open as before. See [security.md](docs/security.md#workspace-roles).
 
 ## Verification
 
