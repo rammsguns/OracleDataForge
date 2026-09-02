@@ -38,6 +38,13 @@ export default function DataBrowser({ table }: { table: string }) {
     setMode("view");
   }, [table]);
 
+  // Edit rights can go away under an open editor — switching to a read-only connection, or a
+  // session refresh that downgrades the role. Fall back to the preview rather than leaving
+  // buttons up that every one of the backend's guards would refuse.
+  useEffect(() => {
+    if (!canEdit) setMode("view");
+  }, [canEdit]);
+
   // "Edit data…" in the tree opens (or re-focuses) this tab and asks for edit mode; tabs are
   // keyed by kind+payload, so the request cannot ride in the payload without opening a second
   // tab for the same table. Declared after the reset above so it wins when both fire.

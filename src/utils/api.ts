@@ -467,6 +467,8 @@ export interface RowChangeRequest {
   rowId?: string;
   /** insert/update only — just the columns being written */
   values?: Record<string, string | number | null>;
+  /** update/delete only — the row as the grid read it, so a reused ROWID matches nothing */
+  original?: Record<string, string | number | null>;
 }
 
 export interface RowChangeResult {

@@ -2898,6 +2898,8 @@ interface RowChangeBody {
   rowId?: string;
   /** insert/update: column name → new value. Only the columns being written. */
   values?: Record<string, string | number | null>;
+  /** update/delete: the row as the grid last read it, so a reused ROWID matches nothing. */
+  original?: Record<string, string | number | null>;
 }
 
 interface RowChangeResult {
@@ -2950,9 +2952,15 @@ function rowValueBind(
   // Oracle stores '' as NULL anyway, so an emptied box means NULL — there is no third state.
   if (raw === null || (typeof raw === "string" && raw.trim() === "")) return { sql: (ph) => ph, value: null };
   if (/^(NUMBER|FLOAT|BINARY_FLOAT|BINARY_DOUBLE)$/.test(t)) {
-    const n = typeof raw === "number" ? raw : Number(String(raw).trim());
-    if (!Number.isFinite(n)) return { error: `"${String(raw).slice(0, 40)}" is not a valid ${t}` };
-    return { sql: (ph) => ph, value: n };
+    const text = String(raw).trim();
+    if (!Number.isFinite(typeof raw === "number" ? raw : Number(text))) {
+      return { error: `"${String(raw).slice(0, 40)}" is not a valid ${t}` };
+    }
+    // Number() is only the validity check. Binding the parsed double would round a NUMBER(38)
+    // past the ~15 significant digits a double holds — 12345678901234567890 would commit
+    // silently as 12345678901234567000 — so the digits reach Oracle as text, as the
+    // importer's do, and Oracle converts them at full precision.
+    return { sql: (ph) => ph, value: text };
   }
   if (t === "DATE" || /^TIMESTAMP\(\d+\)$/.test(t)) {
     const s = normalizeStamp(raw);
@@ -2965,6 +2973,45 @@ function rowValueBind(
 
 /** Double-quote an identifier that came from the data dictionary, not from the request. */
 const quoteIdent = (s: string) => `"${s.replace(/"/g, '""')}"`;
+
+/**
+ * Extra WHERE predicates pinning a change to the row the grid actually read. A ROWID on its
+ * own is not an identity: Oracle hands a deleted row's ROWID to the next insert that lands in
+ * that block, so a stale grid could delete or overwrite a row it never showed. Comparing the
+ * values it displayed makes that case match nothing, which surfaces as the "row is gone"
+ * message instead — and catches a concurrent edit of the same row on the way.
+ *
+ * Only editable columns take part; `mapVal` renders the rest as placeholders that would never
+ * compare equal. Dates go through the same mask `mapVal` prints them with, so a fractional
+ * second the grid never showed cannot make an untouched row look changed, and NUMBER is
+ * compared in double space, where node-oracledb has already put the value the grid holds.
+ */
+function rowMatchWhere(
+  columns: RowEditColumn[],
+  original: Record<string, string | number | null> | undefined
+): { sql: string; binds: Record<string, unknown> } {
+  const byName = new Map(columns.map((col) => [col.name.toUpperCase(), col]));
+  const parts: string[] = [];
+  const binds: Record<string, unknown> = {};
+  let i = 0;
+  for (const [rawName, was] of Object.entries(original ?? {})) {
+    const col = byName.get(rawName.trim().toUpperCase());
+    if (!col?.editable) continue;
+    const ident = quoteIdent(col.name);
+    // Oracle stores '' as NULL, so both spellings of "empty" mean the same predicate
+    if (was === null || (typeof was === "string" && was === "")) {
+      parts.push(`${ident} IS NULL`);
+      continue;
+    }
+    const key = `w${i++}`;
+    binds[key] = String(was);
+    const t = col.baseType.toUpperCase();
+    if (t === "DATE" || /^TIMESTAMP\(\d+\)$/.test(t)) parts.push(`TO_CHAR(${ident}, 'YYYY-MM-DD HH24:MI:SS') = :${key}`);
+    else if (/^(NUMBER|FLOAT)$/.test(t)) parts.push(`TO_BINARY_DOUBLE(${ident}) = TO_BINARY_DOUBLE(:${key})`);
+    else parts.push(`${ident} = :${key}`);
+  }
+  return { sql: parts.length ? ` AND ${parts.join(" AND ")}` : "", binds };
+}
 
 /**
  * Resolve a name to the exact dictionary spelling of a **table** in this schema. Views are
@@ -3069,12 +3116,13 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     if (!table) return { error: `${body.table} is not a table in this schema — rows can only be edited on tables.` };
     const columns = await oraRowColumns(conn, table);
     const byName = new Map(columns.map((col) => [col.name.toUpperCase(), col]));
-    const gone = "That row is not there any more — it was deleted (or moved) since this grid was loaded. Refresh to see the current rows.";
+    const gone = "That row is not there any more — it was deleted, moved or changed by someone else since this grid was loaded. Refresh to see the current rows.";
+    const match = rowMatchWhere(columns, body.original);
 
     if (body.action === "delete") {
       if (!body.rowId) return { error: "The row to delete could not be identified. Refresh the grid and try again." };
-      const sql = `DELETE FROM ${quoteIdent(table)} WHERE ROWID = :rid`;
-      const r = await conn.execute(sql, { rid: body.rowId }, { autoCommit: true });
+      const sql = `DELETE FROM ${quoteIdent(table)} WHERE ROWID = :rid${match.sql}`;
+      const r = await conn.execute(sql, { ...match.binds, rid: body.rowId }, { autoCommit: true });
       if (!r.rowsAffected) return { error: gone };
       return { ok: true, action: "delete", table, sql, rowId: null, row: null };
     }
@@ -3104,10 +3152,17 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     let rowId: string;
     if (body.action === "update") {
       if (!body.rowId) return { error: "The row to update could not be identified. Refresh the grid and try again." };
-      sql = `UPDATE ${quoteIdent(table)} SET ${assignments.join(", ")} WHERE ROWID = :rid`;
-      const r = await conn.execute(sql, { ...binds, rid: body.rowId }, { autoCommit: true });
+      // RETURNING, not body.rowId: an update that moves the row — a partition key on a table
+      // with ENABLE ROW MOVEMENT — leaves it at a new ROWID, and re-reading the old one would
+      // find nothing and hand the grid back its stale values under a "saved" toast.
+      sql = `UPDATE ${quoteIdent(table)} SET ${assignments.join(", ")} WHERE ROWID = :rid${match.sql} RETURNING ROWID INTO :df_rowid`;
+      const r = await conn.execute(
+        sql,
+        { ...binds, ...match.binds, rid: body.rowId, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
+        { autoCommit: true }
+      );
       if (!r.rowsAffected) return { error: gone };
-      rowId = body.rowId;
+      rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
     } else {
       // RETURNING hands back the new ROWID, so the grid can keep editing the row it just made
       sql = `INSERT INTO ${quoteIdent(table)} (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")}) RETURNING ROWID INTO :df_rowid`;
@@ -5081,6 +5136,10 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
   if (action !== "delete" && (!values || typeof values !== "object" || Array.isArray(values))) {
     return res.status(400).json({ error: "`values` must be an object of column name → value." });
   }
+  const original = req.body?.original;
+  if (original != null && (typeof original !== "object" || Array.isArray(original))) {
+    return res.status(400).json({ error: "`original` must be an object of column name → value." });
+  }
   // same default-deny as every other write: nothing runs until the caller acknowledges it
   if (!acknowledged(req)) {
     const changed = action === "delete" ? [] : Object.keys(values as Record<string, unknown>);
@@ -5105,6 +5164,7 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
       action,
       rowId: req.body?.rowId == null ? undefined : String(req.body.rowId),
       values: values as Record<string, string | number | null> | undefined,
+      original: (original ?? undefined) as Record<string, string | number | null> | undefined,
     });
     if ("error" in out) return res.status(400).json({ error: out.error });
     res.json(out);
