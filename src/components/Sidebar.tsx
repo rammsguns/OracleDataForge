@@ -388,6 +388,12 @@ export default function Sidebar() {
   const canDesignTable = !!activeConn?.live;
   const canCreateTable = canDesignTable && !activeConn?.readOnly;
   const openTableDesigner = (name: string) => s.openTab("tabledesign", `${name} (Table)`, name);
+  // Row editor inside the Data tab — the same bar the backend puts on the row endpoint
+  const canEditRows = canCreateTable && (s.accessRole === "Administrator" || s.accessRole === "Developer");
+  const openRowEditor = (name: string) => {
+    s.setEditDataRequest(name);
+    s.openTab("data", name, name);
+  };
   const openNewTable = () => s.openTab("tabledesign", "New table", NEW_TABLE_SENTINEL);
 
   // Run/Test tab (Oracle only): procedures, functions and packages are the runnable kinds
@@ -467,6 +473,7 @@ export default function Sidebar() {
       ...(isTable || kind === "view"
         ? [{ label: "Open Data", action: () => s.openTab("data", name, name) }]
         : []),
+      ...(isTable && canEditRows ? [{ label: "Edit data…", action: () => openRowEditor(name) }] : []),
       ...(designable ? [{ label: "Design table…", action: () => openTableDesigner(name) }] : []),
       ...(runnable ? [{ label: "Run / Test…", action: () => openRoutineRunner(name) }] : []),
       ...(activeConn?.live && kind === "job"
