@@ -232,6 +232,15 @@ const CodeEditor = forwardRef<
     selectRange(matches[next].start, matches[next].end);
   };
 
+  /** Re-derive which hit the caret is on whenever the selection moves outside of `doFind`
+   *  (a click, an arrow key) so "3 of 12" keeps describing where the caret actually is. */
+  const syncActiveFromCaret = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const { selectionStart: s } = ta;
+    setActiveIdx(matches.findIndex((m) => s >= m.start && s <= m.end));
+  };
+
   const doReplace = () => {
     const ta = taRef.current;
     if (!ta || !matches.length || readOnly) return;
@@ -444,6 +453,7 @@ const CodeEditor = forwardRef<
           readOnly={readOnly}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onSelect={syncActiveFromCaret}
           onScroll={syncScroll}
           spellCheck={false}
           aria-label={ariaLabel ?? "Code editor"}

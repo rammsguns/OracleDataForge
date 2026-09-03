@@ -47,7 +47,7 @@ export function Btn({
   );
 }
 
-/** Hairline rule between groups of toolbar buttons, as SQL Developer separates its. */
+/** Hairline rule between groups of toolbar buttons, as SQL Developer separates its own. */
 export function ToolbarSep() {
   return <span aria-hidden className="w-px h-5 bg-bdr mx-0.5 shrink-0" />;
 }

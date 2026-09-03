@@ -112,6 +112,15 @@ An entry may include a port to pin it; without one, any port matches. If the app
 loopback but a browser using its hostname gets *"This server does not answer to that host
 name"*, this is the variable to set.
 
+**Behind a reverse proxy, tell Express which requests to trust.** Sign-in throttling keys
+off the request's source address; unset, that address is always the proxy's own once one
+sits in front of the app, so every client behind it shares one cooldown. Set
+`DATAFORGE_TRUST_PROXY` to how many hops to trust (`1` for a single reverse proxy) or a
+proxy/CIDR list — see [Express's proxy guide](https://expressjs.com/en/guide/behind-proxies.html)
+for the accepted forms. Leave it unset when the app is reached directly; trusting
+`X-Forwarded-For` from a client that isn't actually behind a trusted proxy lets it forge
+that header and pin its failures on someone else's address.
+
 ## Environment variables
 
 Copy `env.example` to `.env.local`; both `npm run dev:server` and `npm start` load it via
@@ -125,6 +134,7 @@ Node's `--env-file-if-exists`, so it is read automatically when present and igno
 | `DATAFORGE_AUTH_TOKEN` | unset | Required when `HOST` is not loopback. |
 | `DATAFORGE_ENCRYPTION_KEY` | unset | Required when `HOST` is not loopback. Base64, 32 bytes. |
 | `DATAFORGE_ALLOWED_HOSTS` | unset | Extra host names the server answers to, comma-separated. Only needed to reach it by DNS name. |
+| `DATAFORGE_TRUST_PROXY` | unset | How far to trust `X-Forwarded-For`. Only set behind a reverse proxy. |
 
 `.env.local` is gitignored. Keep the two secrets out of source control and stable across
 restarts — changing the encryption key makes an existing registry unreadable.

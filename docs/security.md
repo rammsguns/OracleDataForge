@@ -98,6 +98,18 @@ cooldown before anyone could type anything, so a credential-less request always 
 The cooldown is checked *after* the cache, so a browser whose credential is already warm keeps
 working while a guesser from the same address is being throttled.
 
+The cooldown is per source address, tracked in a map capped at 1,000 entries — once full, it
+sweeps expired entries and, if that still isn't enough, evicts the oldest tracked addresses
+rather than growing without bound. That address is the request's socket address unless
+`DATAFORGE_TRUST_PROXY` is set, in which case it's read from `X-Forwarded-For` as far as that
+setting trusts it — see [deployment.md](deployment.md#environment-variables). Behind a reverse
+proxy with this unset, every client shares the proxy's own address and therefore one cooldown.
+
+A password check that succeeds still gets one more look before it's honored: because scrypt
+runs off the event loop, the account could be suspended or its password changed while the
+derivation is in flight, so the account's current state is re-read after the derivation
+completes, not assumed from before it started.
+
 Because the browser replays the `Authorization` header on same-origin requests, **no
 application credential is ever stored in JavaScript**. There is nothing for a script to steal
 from `localStorage`.
