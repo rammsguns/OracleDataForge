@@ -28,9 +28,9 @@ Each finding names the code, what an attacker gets, and the fix. Line numbers re
 | 4 | Medium | Analyst and Viewer can read far more than table data | **Fixed** |
 | 5 | Medium | GitHub token is not pinned to a repository | **Fixed** |
 | 6 | Medium | Vulnerable dependency: `qs` via express and body-parser | **Fixed** |
-| 7 | Low | Account enumeration through response timing | Open |
-| 8 | Low | Source history stored with looser protection than credentials | Open |
-| 9 | Low | CI actions pinned to tags, not commits | Open |
+| 7 | Low | Account enumeration through response timing | **Fixed** |
+| 8 | Low | Source history stored with looser protection than credentials | **Fixed (mode; documented, not encrypted)** |
+| 9 | Low | CI actions pinned to tags, not commits | **Fixed** |
 
 Severity is practical impact on the documented default install (loopback, no token, no
 accounts) and on a small shared LAN install, not a CVSS score.
@@ -332,6 +332,23 @@ passwords, and finding 2 removes the cost of the guessing itself.
 **Fix:** run the derivation against a fixed dummy salt and hash when the user does not exist,
 so both paths take the same time, and log failed attempts with the source address.
 
+**Fixed**, exactly as suggested. `DUMMY_CREDENTIAL` is a salt/hash pair generated once at
+startup with no account behind it; the unknown-*or-suspended*-user branch (both were
+short-circuited the same way, so both get the same fix) now runs `verifyPassword` against it
+before responding, discarding the result — only the wall-clock cost matters. Every failure —
+unknown email, wrong password, or suspended account — is logged via `console.warn` with the
+source address and the attempted username, addressing the "not counted, logged or throttled"
+half of the finding (throttling was already added in finding 2).
+
+Verified with a timing measurement against a running server, 12 samples each, interleaved to
+cancel out drift: known-email-wrong-password averaged 33.36 ms, unknown-email averaged
+33.28 ms — a 0.2% difference, against roughly three orders of magnitude before the fix
+(sub-millisecond vs ~30 ms). The rate limiter from finding 2 was raised in the test copy only
+(never in the shipped code) so twenty-plus consecutive failures from one test address didn't
+trip its cooldown and contaminate the later samples with near-instant 429s. Log output was
+confirmed to contain `Failed sign-in for "<email>" from <address>` for every case, including
+the dummy-derivation path.
+
 ### 8. Source history stored with looser protection than credentials (Low)
 
 **Where:** `appendChangeLog` (around line 1395) and `captureCodeVersion` (around line 1481)
@@ -350,6 +367,27 @@ machine today. The credentials file is encrypted here and is fine; the version s
 the same key when it is configured, or documenting in credentials.md that the sync warning
 applies to `data/versions/` as much as to `connections.json`.
 
+**Fixed, taking the second (lighter) branch of the "or".** Both `fs.writeFileSync` calls now
+pass `{ mode: 0o600 }`, matching `connections.json` and `users.json` exactly. Encrypting the
+version store was not implemented: it would mean encrypting/decrypting on every version read
+and write, migrating existing unencrypted files, and deciding what happens when
+`DATAFORGE_ENCRYPTION_KEY` is rotated or absent — a materially larger change than a Low
+finding's mode fix, and the review itself offered the documentation route as an equal
+alternative rather than a fallback. `credentials.md` now has a
+["The version store carries the same risk, unencrypted"](credentials.md#the-version-store-carries-the-same-risk-unencrypted)
+section spelling out that the sync-folder warning and the "exclude `data/` from sync"
+guidance both already cover `data/versions/` and `data/changelog.json`, not just
+`connections.json`.
+
+Verified structurally (both write sites read `{ mode: 0o600 }` in the diff) and mechanically:
+on this Windows machine, a file written through the same code path (`users.json`, unchanged
+by this fix) shows mode `644` via `stat`, confirming what `credentials.md` already documents
+— POSIX mode bits are largely ignored on Windows, ACLs govern instead. That is not a defect
+in this fix; the new calls are byte-for-byte the same pattern as the two pre-existing ones.
+Exercising the actual write path (`captureCodeVersion`) needs a live Oracle connection and
+was not run end-to-end; the code change itself is a one-argument addition identical in form
+to calls already proven correct in this codebase.
+
 ### 9. CI actions pinned to tags, not commits (Low)
 
 **Where:** `.github/workflows/ci.yml`.
@@ -360,6 +398,17 @@ applies to `data/versions/` as much as to `connections.json`.
 repository. The workflow has no secrets today, so exposure is limited to the build itself.
 
 **Fix:** pin to full commit SHAs and let Dependabot or Renovate raise the bumps.
+
+**Fixed**, exactly as suggested. `actions/checkout@v4` and `actions/setup-node@v4` are now
+pinned to the commit SHA each tag currently resolves to
+(`11d5960a326750d5838078e36cf38b85af677262` and `49933ea5288caeca8642d1e84afbd3f7d6820020`
+respectively — both happen to be `v4.4.0`), resolved via `gh api repos/<owner>/<repo>/git/ref/tags/v4`
+rather than guessed, with the version noted in a trailing comment so the pin stays legible. A
+new `.github/dependabot.yml` watches the `github-actions` ecosystem weekly, so the pins get
+bump PRs instead of going stale — a pin with no update mechanism just trades "silently follows
+a moved tag" for "silently stops receiving security fixes," which isn't an improvement.
+
+Verified: `gh workflow view ci.yml` recognizes the edited workflow file without error.
 
 ## Verified as sound
 

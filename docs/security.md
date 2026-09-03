@@ -110,6 +110,17 @@ runs off the event loop, the account could be suspended or its password changed 
 derivation is in flight, so the account's current state is re-read after the derivation
 completes, not assumed from before it started.
 
+**Every rejected credential — unknown email, wrong password, or suspended account — costs the
+same wall-clock time.** An unknown or suspended username used to fail before scrypt ever ran,
+sub-millisecond, while a known email with a wrong password waited on the derivation first —
+tens of milliseconds. That gap is enough to enumerate which emails hold accounts before ever
+guessing a password. The short-circuit path now runs the same derivation against a fixed
+dummy salt/hash pair generated at startup, so it costs what a real check costs; only the
+result differs (always rejected). Every failure is also logged with the source address and
+the attempted username, since there is otherwise no server-side audit trail for sign-in
+attempts (see [Known gaps](#known-gaps-collected)) — the username is for the operator's own
+console, never echoed back to the caller.
+
 Because the browser replays the `Authorization` header on same-origin requests, **no
 application credential is ever stored in JavaScript**. There is nothing for a script to steal
 from `localStorage`.
@@ -414,7 +425,10 @@ For anyone assessing this honestly, in rough order of practical significance:
 2. **Plaintext credentials by default on loopback**, and the `0o600` file mode is applied only
    at file *creation* — migrating an existing looser-permissioned file leaves it as-is. On
    Windows POSIX modes are effectively ignored regardless. See
-   [credentials.md](credentials.md).
+   [credentials.md](credentials.md). `data/versions/*.json` and `data/changelog.json` carry
+   the same exposure and are also written `0o600`, but neither is covered by
+   `DATAFORGE_ENCRYPTION_KEY` — that key encrypts the connection registry only, not stored
+   PL/SQL source. See [the version-store note in credentials.md](credentials.md#the-version-store-carries-the-same-risk-unencrypted).
 3. **`confirm: true` is client-asserted**, not a bound server nonce.
 4. **No security headers** — no CSP, `X-Frame-Options`, or HSTS anywhere. The host and origin
    guards cover the cross-site vector, but nothing else does. Rate limiting exists only on
@@ -425,9 +439,11 @@ For anyone assessing this honestly, in rough order of practical significance:
    gains outbound connect and port-probe capability from the server. Restricted to those two
    roles (see [Beyond `/query`](#beyond-query-what-the-read-tiers-can-browse)); not a gap for
    Analyst or Viewer, who are refused outright.
-7. **Workspace accounts have no MFA, no session expiry, and no audit trail.** The `mfa` flag is
-   stored, not enforced; Basic auth credentials are valid indefinitely once set; and the
-   Admin panel's "Recent activity" list is local to one browser, not a server-side log.
+7. **Workspace accounts have no MFA and no session expiry.** The `mfa` flag is stored, not
+   enforced; Basic auth credentials are valid indefinitely once set. Failed sign-ins are now
+   logged server-side with the source address (see [Authentication](#authentication)), but
+   the Admin panel's "Recent activity" list is still local to one browser, not a server-side
+   log of successful sign-ins or account changes.
 
 ## Reporting
 
