@@ -84,9 +84,11 @@ not import each other.
 
 ## Backend
 
-Middleware order is: gzip compression → Basic auth → same-origin guard →
-`express.json({ limit: "16mb" })` → routes → error handler → static `dist/`. Compression is
-registered first so it also covers the static SPA mounted last.
+Middleware order is: host guard → gzip compression → Basic auth → same-origin guard →
+`express.json({ limit: "16mb" })` → routes → error handler → static `dist/`. The host guard
+comes first because the origin guard downstream compares `Origin` against `Host`, and
+because running ahead of auth is what covers the unauthenticated bootstrap state. Compression
+is registered next so it still covers the static SPA mounted last.
 
 All data routes are namespaced `/api/connections/:id/…` and begin with the same registry
 lookup and 404.
@@ -94,7 +96,7 @@ lookup and 404.
 | Area | Endpoints |
 | --- | --- |
 | Health | `GET /api/health` |
-| Session | `GET /api/session` — the role the server authenticated this caller as |
+| Session | `GET /api/session` — the role the server authenticated this caller as; `POST /api/session/password` — change your own password (any role) |
 | Users | list, create, update, `:id/status`, delete — Administrator-only |
 | Connections | list, test, test-existing, create, update, delete, disconnect, reconnect |
 | Schema | `GET …/schema`, `GET …/schema/group?label=` |
@@ -206,9 +208,14 @@ at 1000 entries.
 
 ## Security boundary
 
+- **A host guard** refuses any request whose `Host` header does not name this server — the
+  thing that makes the origin guard below meaningful, since a rebound DNS record otherwise
+  lets a page satisfy that check with its own name.
 - **HTTP Basic auth**, comparing either the break-glass `dataforge` / token pair or a workspace
   account's email/password (`timingSafeEqual`, scrypt). Required once a token is set or the
-  first workspace account exists; open on a bare loopback install.
+  first workspace account exists; open on a bare loopback install. Because Basic replays the
+  credential on every request, a verified result is cached briefly and the scrypt derivation
+  runs off the event loop, with a per-address cooldown on repeated failures.
 - **Four roles enforced server-side** (Administrator, Developer, Analyst, Viewer) — see
   [security.md](security.md#workspace-roles) for exactly what each can call.
 - **A same-origin guard** rejects requests carrying a foreign `Origin`, allowing only this

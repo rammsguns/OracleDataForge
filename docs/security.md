@@ -40,16 +40,63 @@ DATAFORGE_ENCRYPTION_KEY is required when HOST is not loopback.
 token on every request, so put a TLS-terminating reverse proxy in front of anything beyond
 loopback.
 
+### The host guard
+
+Before authentication, before the origin guard, before anything: every request's `Host`
+header must name this server. Anything else gets **403**.
+
+Accepted are loopback (`localhost`, `127.0.0.1`, `[::1]`), the configured `HOST`, any literal
+IP address, and any name listed in `DATAFORGE_ALLOWED_HOSTS` (comma-separated; an entry may
+carry a port to pin it, otherwise any port matches).
+
+This exists because the origin guard below cannot stand on its own. It compares `Origin`
+against `Host`, and a browser fills both in from the same URL, so they always agree —
+including for a page the operator did not intend to trust. A site on `attacker.example:3001`
+that re-points its own DNS record at `127.0.0.1` after the page loads sends
+`Origin: http://attacker.example:3001` and `Host: attacker.example:3001`, matches itself, and
+walks into the API: the connection list, arbitrary SQL with `confirm: true`, and
+`POST /api/users` to plant an Administrator on an install that has none. Pinning the names
+the server answers to closes that, because the attacker controls DNS and not this list.
+
+Literal IP addresses are allowed unconditionally, which costs nothing: rebinding needs a
+*name* to re-point, and a browser resolves nothing for `192.168.1.5`. A LAN install reached
+by address therefore needs no configuration; one reached by DNS name needs that name in
+`DATAFORGE_ALLOWED_HOSTS`.
+
 ## Authentication
 
-HTTP Basic. The middleware runs **first** — before the origin guard, the body parser, all API
-routes, and the static SPA — so it covers everything, UI included. Two kinds of credential are
-accepted:
+HTTP Basic. The middleware runs before the origin guard, the body parser, all API routes, and
+the static SPA — so it covers everything, UI included. Only the host guard above precedes it.
+Two kinds of credential are accepted:
 
 - **`dataforge` / `DATAFORGE_AUTH_TOKEN`** — the original break-glass credential, always
   Administrator. Compared with `timingSafeEqual` after a length check, so the comparison is
   constant-time on content.
 - **A workspace account's email / password** — see [Workspace roles](#workspace-roles).
+
+Basic replays the credential on **every** request — each API call and each static asset — and
+scrypt is deliberately expensive, so two things follow:
+
+- **Verified credentials are cached** for five minutes, keyed by a SHA-256 of the raw
+  `Authorization` header, so a page load costs one derivation rather than one per request.
+  The cache stores only successes. Any account change clears it wholesale, so a password
+  change, suspension or deletion takes effect on the next request; a cache hit still re-checks
+  that the account is Active.
+- **The derivation runs off the event loop**, and repeated failures from one address meet a
+  cooldown — ten failures inside a minute buy a minute of `429`s, during which no derivation
+  runs at all. Without both, anyone who knew a single account email could keep the process
+  busy with unauthenticated requests, since scrypt runs just as long for a wrong password as
+  for a right one.
+
+Only a credential that was **presented and rejected** counts as a failure. A request carrying
+no `Authorization` header at all is the first half of the Basic handshake — the browser asks
+with nothing, takes the challenge, and retries with the password — and a page load opens
+several of those at once. Counting them would let an ordinary first visit trip its own
+cooldown before anyone could type anything, so a credential-less request always gets a clean
+401 challenge, even mid-cooldown. It costs nothing to serve: no derivation runs on that path.
+
+The cooldown is checked *after* the cache, so a browser whose credential is already warm keeps
+working while a guesser from the same address is being throttled.
 
 Because the browser replays the `Authorization` header on same-origin requests, **no
 application credential is ever stored in JavaScript**. There is nothing for a script to steal
@@ -61,9 +108,10 @@ from `localStorage`.
 > default, but it means *anything able to reach port 3001 has full access* until either a token
 > is configured or the first account is created.
 
-Use an **ASCII token**. The length check compares JavaScript string length while
-`timingSafeEqual` receives UTF-8 byte buffers, so a multi-byte token can produce a `RangeError`
-(surfacing as a 500) rather than a clean 401. Not a bypass, but avoidable.
+The token's length check compares **UTF-8 byte lengths**, matching the buffers
+`timingSafeEqual` actually receives. A multi-byte token used to compare JavaScript string
+length instead, so it could raise a `RangeError` and surface as a 500 rather than a clean 401.
+Never a bypass, and no longer a wrong answer.
 
 ## Workspace roles
 
@@ -80,7 +128,11 @@ Every endpoint that changes Oracle data, DDL, the connection registry, or writes
 (`/api/github/sync`) requires Administrator or Developer — including `POST …/table/rows`, the
 Data Browser's row editor. Its read half (`GET …/table/rows`) is *not* restricted: it returns
 the same rows the preview already shows, so any role allowed to browse table data may call it.
-Account management (`/api/users/*`) requires Administrator specifically.
+Account management (`/api/users/*`) requires Administrator specifically. The one exception is
+`POST /api/session/password`, which any signed-in account may call to change **its own**
+password: it resolves the target from the credential the request authenticated with — never
+from the body — and re-checks the current password before writing, so it cannot be aimed at
+another account or used to take over an unattended session.
 
 > **Why Analyst and Viewer differ:** the server sees identical SQL text whether it was typed by
 > hand or generated by the Data Browser — there is no way to cryptographically distinguish
@@ -121,6 +173,11 @@ Current behavior:
   through untouched.
 - Requests **with** an `Origin` are allowed only if it matches this server's own host, or one
   of the dev origins. Anything else gets **403**.
+
+The `Host` it matches against is no longer attacker-controllable: the
+[host guard](#the-host-guard) has already rejected any request naming something this server
+does not answer to. That closes the DNS-rebinding hole this check had on its own, where
+`Origin` and `Host` both came from the attacker's page and so agreed with each other.
 
 > **Gap:** the dev origins — `localhost` and `127.0.0.1` on ports 5173 and 4173 — are allowed
 > **unconditionally**, not gated on `NODE_ENV`. On a default loopback install with no token, a
@@ -264,6 +321,8 @@ Denial-of-service resistance is incidental rather than designed, but the limits 
 | Routine output lines | 1,000 |
 | PL/SQL block binds | 32 |
 | Request body | 16 MB |
+| Failed sign-ins per address | 10 per minute, then a 60 s cooldown |
+| Verified-credential cache | 5 minutes, 500 entries |
 
 ## Error handling
 
@@ -293,8 +352,9 @@ For anyone assessing this honestly, in rough order of practical significance:
    Windows POSIX modes are effectively ignored regardless. See
    [credentials.md](credentials.md).
 3. **`confirm: true` is client-asserted**, not a bound server nonce.
-4. **No rate limiting and no security headers** — no CSP, `X-Frame-Options`, or HSTS anywhere.
-   The origin guard covers the main cross-site vector, but nothing else does.
+4. **No security headers** — no CSP, `X-Frame-Options`, or HSTS anywhere. The host and origin
+   guards cover the cross-site vector, but nothing else does. Rate limiting exists only on
+   failed authentication; every other endpoint is uncapped.
 5. **Dev origins are allowed unconditionally**, including in production builds.
 6. **`POST /api/connections/test` dials an arbitrary caller-supplied host and port.** That is
    what a database client does, but on a LAN deployment any token-holder gains outbound
@@ -314,4 +374,5 @@ filing publicly.
 - [credentials.md](credentials.md) — storage, encryption, migration, password replay
 - [architecture.md](architecture.md) — where these controls sit in the request path
 - [known_limitations.md](known_limitations.md) — non-security constraints
+- [security-review-2026-09-02.md](security-review-2026-09-02.md) — findings from the 2026-09-02 code review, with fixes
 - [deployment.md](deployment.md) — LAN startup requirements

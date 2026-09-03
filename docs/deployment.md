@@ -96,6 +96,22 @@ with the key set, save any connection once to rewrite the registry encrypted, th
 terminating HTTPS — before using it beyond a network you fully trust. The token crosses the
 wire on every request.
 
+**Reaching the app by a DNS name needs that name declared.** Every request's `Host` header
+must name this server, or it is refused with 403 — that is what stops a web page from
+re-pointing its own DNS record at this port and driving the API through the operator's
+browser. Loopback, whatever `HOST` is set to, and any literal IP address are always accepted,
+so `HOST=0.0.0.0` reached as `http://192.168.1.5:3001` needs nothing extra. A name — a
+hostname on the LAN, or the name a reverse proxy is fronted by — goes in
+`DATAFORGE_ALLOWED_HOSTS`, comma-separated:
+
+```bash
+DATAFORGE_ALLOWED_HOSTS=dataforge.lan,dataforge.internal.example
+```
+
+An entry may include a port to pin it; without one, any port matches. If the app answers on
+loopback but a browser using its hostname gets *"This server does not answer to that host
+name"*, this is the variable to set.
+
 ## Environment variables
 
 Copy `env.example` to `.env.local`; both `npm run dev:server` and `npm start` load it via
@@ -108,6 +124,7 @@ Node's `--env-file-if-exists`, so it is read automatically when present and igno
 | `NODE_ENV` | `development` | Set to `production` when serving the built SPA. |
 | `DATAFORGE_AUTH_TOKEN` | unset | Required when `HOST` is not loopback. |
 | `DATAFORGE_ENCRYPTION_KEY` | unset | Required when `HOST` is not loopback. Base64, 32 bytes. |
+| `DATAFORGE_ALLOWED_HOSTS` | unset | Extra host names the server answers to, comma-separated. Only needed to reach it by DNS name. |
 
 `.env.local` is gitignored. Keep the two secrets out of source control and stable across
 restarts — changing the encryption key makes an existing registry unreadable.

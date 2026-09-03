@@ -10,6 +10,23 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- **A permanent find strip in the PL/SQL editor, in SQL Developer's shape.** The object editor's
+  search is now always on screen above the code rather than a popover only Ctrl+F could
+  summon, and it carries the options SQL Developer offers: the **3 of 12** position of the
+  current hit, **match case**, **whole word**, **regular expression**, and **highlight every
+  match** painted into the syntax layer. A word boundary is Oracle-aware — `$` and `#` count
+  as identifier characters, so `session` does not match inside `v$session`. The editor's action
+  buttons (Find, Compile, Compile All, Run / Test) became flat icon buttons in one strip to
+  match. Fixes a bug on the way: replace-all was hard-coded to a case-insensitive search and
+  ignored the options entirely, so it could change more than find had shown you.
+- **Change your own password from the app.** The role chip in the title bar now opens an
+  **Account** dialog showing who the server authenticated you as, with a change-password form
+  behind it. It is the one account action that is *not* Administrator-only — a Developer,
+  Analyst or Viewer no longer has to ask someone else to rotate their credential — and it only
+  ever touches the account the request authenticated as, with the current password required
+  again so a session left unattended cannot lock its owner out. Because authentication is HTTP
+  Basic there is no session to re-issue: the dialog says plainly that the browser is still
+  sending the old password and you have to sign in again.
 - **Edit data: insert, update and delete rows from the Data Browser.** A table's Data tab now
   has an **Edit data** toggle (and an **Edit data…** entry in the tree's table context menu)
   that swaps the read-only preview for an editable grid — edit a row in place, delete it, or
@@ -34,6 +51,33 @@ Dates are the date the change landed on `main`.
 
 ### Security
 
+- **A host guard closes a DNS-rebinding hole in the same-origin check.** The origin guard
+  compared `Origin` against `Host`, and a browser fills both in from the same URL — so they
+  always agreed, including for a page the operator never meant to trust. A site that
+  re-pointed its own DNS record at `127.0.0.1` after loading matched itself and reached the
+  whole API: the connection list, arbitrary SQL with `confirm: true`, and `POST /api/users` to
+  plant an Administrator on an install that had none. Every request's `Host` header must now
+  name this server or it is refused with 403, checked ahead of authentication so the
+  unauthenticated bootstrap state is covered too. Loopback, the configured `HOST` and any
+  literal IP address are accepted — rebinding needs a *name* to re-point, so a LAN install
+  reached by address is unaffected — and reaching the app by DNS name means listing that name
+  in the new `DATAFORGE_ALLOWED_HOSTS`. See
+  [security.md](security.md#the-host-guard) and [deployment.md](deployment.md).
+- **Authentication no longer runs scrypt on the event loop for every request.** HTTP Basic
+  replays the credential on each API call and each static asset, and the derivation ran
+  synchronously for a wrong password just as long as for a right one — visible latency on a
+  shared instance, and a denial of service for anyone who knew a single account email. The
+  derivation now runs off-thread, a successful verification is cached for five minutes (keyed
+  by a hash of the `Authorization` header, and cleared outright whenever any account changes),
+  and ten rejected credentials from one address buy a 60-second cooldown answered with 429
+  before any derivation runs. A cached credential is honoured during that cooldown, so a
+  throttled guesser does not lock out a browser already signed in, and a request carrying no
+  credential — the first half of every Basic handshake, several per page load — always gets a
+  clean 401 rather than counting against the limit. Measured: ~29 ms cold, ~1 ms cached,
+  and an authenticated request served in ~12 ms while 25 failing sign-ins were in flight.
+  Fixes in passing a multi-byte `DATAFORGE_AUTH_TOKEN` returning 500 instead of 401, by
+  comparing UTF-8 byte lengths rather than JavaScript string length.
+  See [security.md](security.md#authentication).
 - **Workspace roles are now enforced server-side, not just by the client's tab-gating.** The
   role picker used to be a client-chosen `localStorage` value — trivially bypassed by anyone
   editing storage or calling the API directly. The server now authenticates named accounts
