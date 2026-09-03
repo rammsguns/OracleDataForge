@@ -3466,7 +3466,9 @@ const IPV6_LITERAL = /^\[[0-9a-f:.]+\]$/;
  * that isn't a well-formed authority. A bracketed host must end at its `]`, followed by
  * nothing or exactly `:<port>`; trailing junk like `[::1]attacker.com` used to be truncated
  * at the first `]` and silently accepted as `[::1]`, letting a Host this guard never actually
- * validated ride through on another literal's name.
+ * validated ride through on another literal's name. A bare host is held to the same rule: a
+ * name followed by anything other than `:<port>` — `localhost:evil`, `127.0.0.1:3001:evil` —
+ * used to truncate at the first `:` and be accepted as the bare name instead of rejected.
  */
 function stripPort(host: string): string | null {
   if (host.startsWith("[")) {
@@ -3476,7 +3478,11 @@ function stripPort(host: string): string | null {
     if (rest !== "" && !/^:\d+$/.test(rest)) return null;
     return host.slice(0, end + 1);
   }
-  return host.split(":")[0];
+  const colon = host.indexOf(":");
+  if (colon < 0) return host;
+  const rest = host.slice(colon);
+  if (!/^:\d+$/.test(rest)) return null;
+  return host.slice(0, colon);
 }
 function isAllowedHost(header: string | undefined): boolean {
   if (!header) return false; // HTTP/1.1 requires Host; a request without one names nothing
