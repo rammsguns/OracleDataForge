@@ -220,14 +220,24 @@ const CodeEditor = forwardRef<
   const doFind = (dir: 1 | -1) => {
     const ta = taRef.current;
     if (!ta || !matches.length) return;
-    const i =
-      dir === 1
-        ? matches.findIndex((m) => m.start >= ta.selectionEnd)
-        : (() => {
-            for (let k = matches.length - 1; k >= 0; k--) if (matches[k].end <= ta.selectionStart) return k;
-            return -1;
-          })();
-    const next = i >= 0 ? i : dir === 1 ? 0 : matches.length - 1; // wrap
+    let next: number;
+    if (activeIdx >= 0 && activeIdx < matches.length) {
+      // Already sitting on a hit — step by index rather than searching by position. A
+      // position search gets stuck on a zero-width match (e.g. from a lookahead like
+      // `(?=a)`): selecting one leaves selectionStart === selectionEnd === its own start,
+      // so ">= selectionEnd" / "<= selectionStart" finds that same match again instead of
+      // advancing, and "next" never moves.
+      next = (activeIdx + dir + matches.length) % matches.length;
+    } else {
+      const i =
+        dir === 1
+          ? matches.findIndex((m) => m.start >= ta.selectionEnd)
+          : (() => {
+              for (let k = matches.length - 1; k >= 0; k--) if (matches[k].end <= ta.selectionStart) return k;
+              return -1;
+            })();
+      next = i >= 0 ? i : dir === 1 ? 0 : matches.length - 1; // wrap
+    }
     setActiveIdx(next);
     selectRange(matches[next].start, matches[next].end);
   };
@@ -238,7 +248,10 @@ const CodeEditor = forwardRef<
     const ta = taRef.current;
     if (!ta) return;
     const { selectionStart: s } = ta;
-    setActiveIdx(matches.findIndex((m) => s >= m.start && s <= m.end));
+    // Exclusive end bound: a caret sitting right after a hit (e.g. having arrowed past it)
+    // is not "on" it. `s === m.start` is kept alongside so a zero-width match (an empty
+    // regex hit, where start === end) still counts as active for a caret placed on it.
+    setActiveIdx(matches.findIndex((m) => s >= m.start && (s < m.end || s === m.start)));
   };
 
   const doReplace = () => {
@@ -348,16 +361,25 @@ const CodeEditor = forwardRef<
             className={`text-[10px] w-16 text-center tabular-nums ${search.error ? "text-err" : "text-mute"}`}
             aria-live="polite"
           >
-            {!fr.q ? "" : search.error ? "bad regex" : !matches.length ? "no results" : `${activeIdx + 1 || 1} of ${matches.length}`}
+            {!fr.q
+              ? ""
+              : search.error
+                ? "bad regex"
+                : !matches.length
+                  ? "no results"
+                  : activeIdx < 0
+                    ? `${matches.length} results`
+                    : `${activeIdx + 1} of ${matches.length}`}
           </span>
-          <button aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
+          <button type="button" aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
             <ArrowUp size={12} />
           </button>
-          <button aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
+          <button type="button" aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
             <ArrowDown size={12} />
           </button>
           {!readOnly && (
             <button
+              type="button"
               aria-label="Toggle replace"
               aria-pressed={fr.withReplace}
               title="Replace (Ctrl+H)"
@@ -378,6 +400,7 @@ const CodeEditor = forwardRef<
           ).map(([key, Icon, label]) => (
             <button
               key={key}
+              type="button"
               aria-label={label}
               aria-pressed={fr[key]}
               title={label}
@@ -399,10 +422,10 @@ const CodeEditor = forwardRef<
               aria-label="Replace with"
               className="h-6.5 w-52 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
             />
-            <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
               Replace
             </button>
-            <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
               All
             </button>
           </div>

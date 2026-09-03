@@ -101,6 +101,7 @@ export function TitleBar() {
       </div>
 
       <button
+        type="button"
         onClick={s.toggleSidebar}
         className={`p-1.5 rounded-md transition-colors ${s.sidebarOpen ? "text-accenthi bg-accentdim" : "text-mute hover:text-soft hover:bg-panel3"}`}
         title="Toggle explorer (Ctrl+B)"
@@ -121,6 +122,7 @@ export function TitleBar() {
 
       <div className="ml-auto flex items-center gap-1">
         <button
+          type="button"
           onClick={() => setAccountOpen(true)}
           className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute hover:text-soft hover:border-accent/60 hover:bg-accentdim transition-colors"
           title={s.session?.name ? `Signed in as ${s.session.name} — open account settings` : "Server-enforced access role for this session"}
@@ -129,6 +131,7 @@ export function TitleBar() {
           <span className="text-soft font-medium">{s.accessRole}</span>
         </button>
         <button
+          type="button"
           onClick={() => setShortcutsOpen(true)}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"
           title="Keyboard shortcuts (Ctrl+/)"
@@ -137,6 +140,7 @@ export function TitleBar() {
           <Keyboard size={15} />
         </button>
         <button
+          type="button"
           onClick={s.toggleTheme}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"
           title={`Switch to ${s.theme === "dark" ? "light" : "dark"} mode`}

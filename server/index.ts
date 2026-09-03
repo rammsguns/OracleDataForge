@@ -2,6 +2,7 @@ import express from "express";
 import compression from "compression";
 import fs from "node:fs";
 import path from "node:path";
+import { isIPv4, isIPv6 } from "node:net";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import oracledb from "oracledb";
@@ -204,6 +205,16 @@ function hashPassword(password: string, salt: Buffer = randomBytes(16)) {
   return { salt: salt.toString("base64"), hash: scryptSync(password, salt, 64).toString("base64") };
 }
 const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, keylen: number) => Promise<Buffer>;
+
+/**
+ * `hashPassword`'s async twin, off the event loop for the same reason `verifyPassword` is:
+ * `POST /api/session/password` calls this on every request from any authenticated account,
+ * so a synchronous derivation there is a self-service event-loop DoS, not just a slow path.
+ */
+async function hashPasswordAsync(password: string, salt: Buffer = randomBytes(16)) {
+  const hash = await scryptAsync(password, salt, 64);
+  return { salt: salt.toString("base64"), hash: hash.toString("base64") };
+}
 
 /**
  * Deliberately expensive, so it must not run on the event loop. HTTP Basic replays the
@@ -3477,16 +3488,47 @@ if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST
  * It runs ahead of the auth middleware so it also covers the unauthenticated bootstrap
  * state, which is exactly where the damage would be greatest.
  */
-const IPV4_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$/;
-const IPV6_LITERAL = /^\[[0-9a-f:.]+\]$/;
+/**
+ * Real validation rather than a hand-rolled pattern: `net.isIP` is what Node itself uses to
+ * decide whether a string is an address, so it can't be fooled by something merely
+ * IP-*shaped* — a loose bracketed-hex-and-colons regex previously treated non-addresses like
+ * `[dead]` as a "literal IP" and let them through as one.
+ */
+function isIpLiteral(bare: string): boolean {
+  if (bare.startsWith("[") && bare.endsWith("]")) return isIPv6(bare.slice(1, -1));
+  return isIPv4(bare);
+}
+
+/**
+ * Strips a trailing `:<port>`, keeping a bracketed IPv6 literal intact — `null` for anything
+ * that isn't a well-formed authority. A bracketed host must end at its `]`, followed by
+ * nothing or exactly `:<port>`; trailing junk like `[::1]attacker.com` used to be truncated
+ * at the first `]` and silently accepted as `[::1]`, letting a Host this guard never actually
+ * validated ride through on another literal's name. A bare host is held to the same rule: a
+ * name followed by anything other than `:<port>` — `localhost:evil`, `127.0.0.1:3001:evil` —
+ * used to truncate at the first `:` and be accepted as the bare name instead of rejected.
+ */
+function stripPort(host: string): string | null {
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    if (end < 0) return null; // unterminated bracket
+    const rest = host.slice(end + 1);
+    if (rest !== "" && !/^:\d+$/.test(rest)) return null;
+    return host.slice(0, end + 1);
+  }
+  const colon = host.indexOf(":");
+  if (colon < 0) return host;
+  const rest = host.slice(colon);
+  if (!/^:\d+$/.test(rest)) return null;
+  return host.slice(0, colon);
+}
 function isAllowedHost(header: string | undefined): boolean {
   if (!header) return false; // HTTP/1.1 requires Host; a request without one names nothing
   const host = header.toLowerCase();
   if (ALLOWED_HOSTS.has(host)) return true;
-  // Strip the port, keeping a bracketed IPv6 literal intact.
-  const bare = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+  const bare = stripPort(host);
   if (!bare) return false;
-  return ALLOWED_HOSTS.has(bare) || IPV4_LITERAL.test(bare) || IPV6_LITERAL.test(bare);
+  return ALLOWED_HOSTS.has(bare) || isIpLiteral(bare);
 }
 app.use((req, res, next) => {
   if (isAllowedHost(req.headers.host)) return next();
@@ -3711,10 +3753,18 @@ app.post("/api/session/password", async (req, res) => {
   }
   const current = String(req.body?.currentPassword ?? "");
   const next = String(req.body?.newPassword ?? "");
-  if (!(await verifyPassword(current, user.salt, user.hash))) return res.status(400).json({ error: "That is not your current password." });
+  const { salt, hash } = user;
+  if (!(await verifyPassword(current, salt, hash))) return res.status(400).json({ error: "That is not your current password." });
   if (next.length < 8) return res.status(400).json({ error: "The new password must be at least 8 characters." });
   if (next === current) return res.status(400).json({ error: "The new password is the same as the current one." });
-  Object.assign(user, hashPassword(next));
+  // scrypt just spent real wall-clock time off the event loop. Re-fetch rather than trust
+  // the closed-over `user`: it could have been suspended, or its password already changed
+  // by someone else, while the derivation was in flight.
+  const target = email ? users.get(email) : undefined;
+  if (!target || target.status !== "Active" || target.salt !== salt || target.hash !== hash) {
+    return res.status(409).json({ error: "Your account changed while this request was in flight. Sign in again and retry." });
+  }
+  Object.assign(target, await hashPasswordAsync(next));
   saveUsers();
   res.json({ ok: true, reauthenticate: true });
 });

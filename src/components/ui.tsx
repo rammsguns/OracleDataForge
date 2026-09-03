@@ -2,6 +2,23 @@ import { type ReactNode, useEffect, useRef } from "react";
 import { Loader2, X } from "lucide-react";
 import type { MenuItem } from "../types";
 
+type BtnBaseProps = {
+  children: ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  className?: string;
+};
+
+/**
+ * `toolbar` buttons carry no visible text — their label lives entirely in `title`/
+ * `aria-label` (see the comment on `toolbarBase` below) — so unlike the other variants,
+ * one of the two is required here, not just conventionally expected. TypeScript enforces it:
+ * `variant="toolbar"` without either is now a type error, not a silent accessibility gap.
+ */
+type BtnProps =
+  | (BtnBaseProps & { variant?: "primary" | "ghost" | "outline" | "danger"; title?: string; "aria-label"?: string })
+  | (BtnBaseProps & { variant: "toolbar" } & ({ title: string; "aria-label"?: string } | { title?: string; "aria-label": string }));
+
 export function Btn({
   children,
   onClick,
@@ -10,15 +27,7 @@ export function Btn({
   disabled,
   className = "",
   "aria-label": ariaLabel,
-}: {
-  children: ReactNode;
-  onClick?: () => void;
-  variant?: "primary" | "ghost" | "outline" | "danger" | "toolbar";
-  title?: string;
-  disabled?: boolean;
-  className?: string;
-  "aria-label"?: string;
-}) {
+}: BtnProps) {
   const base =
     "inline-flex items-center gap-1.5 rounded-md px-2.5 h-7 text-[12px] font-medium transition-colors select-none disabled:opacity-40 disabled:pointer-events-none";
   // SQL Developer's code-editor toolbar: square icon-only buttons carrying no chrome of their
