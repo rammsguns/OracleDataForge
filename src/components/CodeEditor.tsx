@@ -371,14 +371,15 @@ const CodeEditor = forwardRef<
                     ? `${matches.length} results`
                     : `${activeIdx + 1} of ${matches.length}`}
           </span>
-          <button aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
+          <button type="button" aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
             <ArrowUp size={12} />
           </button>
-          <button aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
+          <button type="button" aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
             <ArrowDown size={12} />
           </button>
           {!readOnly && (
             <button
+              type="button"
               aria-label="Toggle replace"
               aria-pressed={fr.withReplace}
               title="Replace (Ctrl+H)"
@@ -399,6 +400,7 @@ const CodeEditor = forwardRef<
           ).map(([key, Icon, label]) => (
             <button
               key={key}
+              type="button"
               aria-label={label}
               aria-pressed={fr[key]}
               title={label}
@@ -420,10 +422,10 @@ const CodeEditor = forwardRef<
               aria-label="Replace with"
               className="h-6.5 w-52 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
             />
-            <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
               Replace
             </button>
-            <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
               All
             </button>
           </div>
