@@ -219,6 +219,17 @@ async function verifyPassword(password: string, salt: string, hash: string): Pro
 }
 
 /**
+ * A salt/hash pair with no account behind it, generated once at startup. An unknown or
+ * suspended username short-circuited straight to a 401 with no derivation, while a known
+ * email with a wrong password waited on scrypt first — sub-millisecond versus tens of
+ * milliseconds is enough to enumerate which emails hold accounts before ever guessing a
+ * password. Running the same derivation against this dummy pair for the short-circuit case
+ * costs the same wall-clock time as a real wrong-password check, without needing a real
+ * account to compare against.
+ */
+const DUMMY_CREDENTIAL = hashPassword(randomBytes(24).toString("base64"));
+
+/**
  * Verified credentials, keyed by a SHA-256 of the raw `Authorization` header, so a page load
  * costs one derivation instead of one per request. Only successful verifications are stored,
  * which bounds the map by the number of real accounts; `AUTH_CACHE_MAX` guards the rest.
@@ -241,6 +252,12 @@ function rememberAuth(key: string, email: string | null) {
  * guesses still reach scrypt, and there is no lockout anywhere else. Ten failures inside a
  * minute buy a minute of 429s from that address, during which no derivation runs at all —
  * which is the point, since the cost is the attack.
+ *
+ * Every failure is also logged with the address and the username attempted — there is no
+ * server-side audit trail otherwise (see the "Known gaps" note in security.md), and this is
+ * the one place cheap enough to add without a real logging subsystem. The username in the
+ * log is for the operator's own console, never echoed back to the caller, so logging it
+ * doesn't reopen the enumeration this same change closes at the HTTP layer.
  */
 const AUTH_FAILURE_LIMIT = 10;
 const AUTH_FAILURE_WINDOW_MS = 60_000;
@@ -250,7 +267,8 @@ const authFailures = new Map<string, { count: number; since: number; until: numb
 function authCooldownRemaining(ip: string): number {
   return Math.max(0, (authFailures.get(ip)?.until ?? 0) - Date.now());
 }
-function recordAuthFailure(ip: string) {
+function recordAuthFailure(ip: string, username: string) {
+  console.warn(`Failed sign-in for "${username}" from ${ip || "(no address)"}`);
   const now = Date.now();
   if (authFailures.size >= AUTH_FAILURE_MAX_TRACKED) {
     for (const [addr, e] of authFailures) {
@@ -1492,7 +1510,7 @@ function appendChangeLog(entry: ChangeLogEntry) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const log = readJsonFile<ChangeLogEntry[]>(CHANGELOG_FILE, []);
     log.push(entry);
-    fs.writeFileSync(CHANGELOG_FILE, JSON.stringify(log.slice(-MAX_CHANGELOG), null, 2));
+    fs.writeFileSync(CHANGELOG_FILE, JSON.stringify(log.slice(-MAX_CHANGELOG), null, 2), { mode: 0o600 });
   } catch (e) {
     console.error("Could not persist changelog entry:", e);
   }
@@ -1578,7 +1596,7 @@ async function captureCodeVersion(c: LiveConnection, sql: string): Promise<Versi
   const version = (last?.version ?? 0) + 1;
   vf.versions.push({ version, at: now, action, hash, source });
   fs.mkdirSync(VERSIONS_DIR, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(vf, null, 2));
+  fs.writeFileSync(file, JSON.stringify(vf, null, 2), { mode: 0o600 });
   appendChangeLog({
     at: now, connId: c.id, connName: c.name, connKey: key, engine: c.engine,
     name: change.name, type: change.type, action, version,
@@ -3569,12 +3587,18 @@ app.use((req, res, next) => {
 
   const user = users.get(username.toLowerCase());
   if (!user || user.status !== "Active") {
-    recordAuthFailure(req.ip ?? "");
-    return challenge();
+    // Same derivation cost as a real wrong-password check below, against a fixed dummy pair
+    // rather than a real one — see the comment on DUMMY_CREDENTIAL. Its own result is never
+    // checked; the only thing that matters here is the wall-clock time it consumes.
+    verifyPassword(password, DUMMY_CREDENTIAL.salt, DUMMY_CREDENTIAL.hash).then(() => {
+      recordAuthFailure(req.ip ?? "", username);
+      challenge();
+    }, next);
+    return;
   }
   verifyPassword(password, user.salt, user.hash).then((ok) => {
     if (!ok) {
-      recordAuthFailure(req.ip ?? "");
+      recordAuthFailure(req.ip ?? "", username);
       return challenge();
     }
     rememberAuth(cacheKey, user.email);

@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # CI actions are pinned to commit SHAs (see docs/security-review-2026-09-02.md, finding 9),
+  # which stops a moved tag from silently changing what CI runs — but a pinned SHA never
+  # updates itself. Dependabot opens the PR that bumps the pin instead.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

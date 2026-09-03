@@ -92,6 +92,21 @@ Note that sync providers keep **version history**. Encrypting the file later doe
 the plaintext copies already uploaded. If a password was exposed that way and it matters,
 rotate it on the Oracle side.
 
+### The version store carries the same risk, unencrypted
+
+`data/versions/*.json` holds the full source of every code object created or replaced
+through the worksheet, and `data/changelog.json` records the connection key (host, port,
+service, user) for each change. PL/SQL source routinely embeds connection strings, wallet
+paths, and API keys — the same sync-root exposure above applies to these files as much as it
+does to `connections.json`.
+
+Both are written with mode `0o600`, same caveat as above (meaningful on Linux/macOS, largely
+ignored on Windows). Neither is covered by `DATAFORGE_ENCRYPTION_KEY`: that key encrypts the
+connection registry only. If a saved object's source is sensitive enough to worry about, that
+sensitivity lives in `data/versions/`, unencrypted, for as long as the version history is
+kept. Excluding `data/` from sync (the same fix as above) covers this too — there is no
+separate exclusion needed.
+
 ## Migrating an existing plaintext registry
 
 The server reads a plaintext registry on loopback so an existing install keeps working, and

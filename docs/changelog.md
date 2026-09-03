@@ -51,6 +51,26 @@ Dates are the date the change landed on `main`.
 
 ### Security
 
+- **Fixed the three Low findings from the 2026-09-02 security review.**
+  - An unknown or suspended sign-in used to fail before scrypt ever ran, sub-millisecond,
+    while a known email with a wrong password waited on the derivation first — enough of a
+    gap to enumerate account emails before ever guessing a password. The short-circuit path
+    now runs the same derivation against a fixed dummy credential, so every rejected sign-in
+    costs the same wall-clock time regardless of why it was rejected. Every failure is also
+    logged with the source address and the attempted username — there was no server-side
+    record of failed sign-ins at all before this.
+  - `data/versions/*.json` and `data/changelog.json` — which hold the full source of every
+    compiled code object and the connection details each change was made against — are now
+    written with mode `0o600`, matching `connections.json` and `users.json`. Neither is
+    encrypted by `DATAFORGE_ENCRYPTION_KEY` (that key covers the connection registry only);
+    `credentials.md` now says so explicitly, since the same "keep `data/` out of synced
+    folders" guidance already covers these files too.
+  - CI's two actions are pinned to the commit SHA their `v4` tags currently resolve to,
+    instead of the mutable tag itself, with a new `.github/dependabot.yml` watching for
+    updates so the pins don't just go stale.
+  See [security.md](security.md#authentication),
+  [credentials.md](credentials.md#the-version-store-carries-the-same-risk-unencrypted), and
+  [security-review-2026-09-02.md](security-review-2026-09-02.md) for the fixed writeups.
 - **Fixed the four Medium findings from the 2026-09-02 security review.**
   - `POST /api/connections/test` — the connection tester with no saved connection behind it,
     dialing whatever host and port the caller supplies — now requires Administrator or
