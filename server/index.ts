@@ -252,9 +252,18 @@ function authCooldownRemaining(ip: string): number {
 }
 function recordAuthFailure(ip: string) {
   const now = Date.now();
-  if (authFailures.size >= AUTH_FAILURE_MAX_TRACKED) {
+  if (authFailures.size >= AUTH_FAILURE_MAX_TRACKED && !authFailures.has(ip)) {
     for (const [addr, e] of authFailures) {
       if (e.until <= now && now - e.since > AUTH_FAILURE_WINDOW_MS) authFailures.delete(addr);
+    }
+    // The sweep above only catches entries that have already expired. With enough distinct
+    // addresses still active inside their window, that leaves nothing to reclaim and the map
+    // would grow without bound — so once it's still full, evict the oldest tracked addresses
+    // until it isn't. `Map` preserves insertion order, so the first key is the oldest.
+    while (authFailures.size >= AUTH_FAILURE_MAX_TRACKED) {
+      const oldest = authFailures.keys().next().value;
+      if (oldest === undefined) break;
+      authFailures.delete(oldest);
     }
   }
   const entry = authFailures.get(ip);
@@ -3436,6 +3445,20 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
 const app = express();
 
 /**
+ * `req.ip` reads the raw socket address unless Express is told otherwise — behind the
+ * TLS-terminating reverse proxy this app expects for anything beyond loopback (see
+ * docs/deployment.md), that address is the proxy's own. Every client sharing that proxy
+ * would then share one cooldown bucket in the auth throttle below: a single attacker, or
+ * one user mistyping their password, could 429 everyone else behind it. Trusting
+ * `X-Forwarded-For` unconditionally is its own hole — an untrusted client could forge the
+ * header and pin its failures on someone else's address — so this stays off unless
+ * `DATAFORGE_TRUST_PROXY` says how far to trust it (hop count, or a proxy/CIDR list; see
+ * https://expressjs.com/en/guide/behind-proxies.html for the accepted values).
+ */
+const TRUST_PROXY = process.env.DATAFORGE_TRUST_PROXY ?? "";
+if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
+
+/**
  * Host guard — the first thing every request meets.
  *
  * The same-origin guard further down compares `Origin` against `Host`, and a browser fills
@@ -3572,13 +3595,22 @@ app.use((req, res, next) => {
     recordAuthFailure(req.ip ?? "");
     return challenge();
   }
-  verifyPassword(password, user.salt, user.hash).then((ok) => {
+  const { salt, hash } = user;
+  verifyPassword(password, salt, hash).then((ok) => {
     if (!ok) {
       recordAuthFailure(req.ip ?? "");
       return challenge();
     }
-    rememberAuth(cacheKey, user.email);
-    admitUser(user);
+    // scrypt just spent real wall-clock time off the event loop. Re-fetch rather than
+    // trust the closed-over `user`: the account may have been suspended, or its password
+    // rotated, while the derivation was in flight, and admission must reflect that, not
+    // the credentials that were current when the request arrived.
+    const current = users.get(username.toLowerCase());
+    if (!current || current.status !== "Active" || current.salt !== salt || current.hash !== hash) {
+      return challenge();
+    }
+    rememberAuth(cacheKey, current.email);
+    admitUser(current);
   }, next); // a rejected derivation reaches the error handler instead of hanging the request
 });
 
