@@ -98,7 +98,7 @@ lookup and 404.
 | Health | `GET /api/health` |
 | Session | `GET /api/session` — the role the server authenticated this caller as; `POST /api/session/password` — change your own password (any role) |
 | Users | list, create, update, `:id/status`, delete — Administrator-only |
-| Connections | list, test, test-existing, create, update, delete, disconnect, reconnect |
+| Connections | list, test, test-existing, create, update, delete, disconnect, reconnect; `POST /api/connections/export`, `POST /api/connections/import/preview`, `POST /api/connections/import` — passphrase-encrypted backup and restore of the saved connections (full access only) |
 | Schema | `GET …/schema`, `GET …/schema/group?label=` |
 | Query | `POST …/query`, `POST …/explain` |
 | Compile | `POST …/compile`, `GET …/compile/invalid`, `POST …/compile/invalid` |

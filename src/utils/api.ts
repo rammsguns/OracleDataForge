@@ -23,6 +23,52 @@ export interface StoredConnection {
   readOnly: boolean;
 }
 
+
+/**
+ * A passphrase-encrypted connection export, exactly as it is written to disk. The
+ * connections — Oracle passwords included — live inside `data`, encrypted under a key the
+ * server derives from the user's passphrase with scrypt; nothing readable ever reaches
+ * the browser. See docs/credentials.md for how to decrypt one outside the app.
+ */
+export interface ConnectionExportFile {
+  format: "oracle-dataforge-connections";
+  version: 1;
+  exportedAt: string;
+  count: number;
+  cipher: "aes-256-gcm";
+  kdf: { name: "scrypt"; salt: string; N: number; r: number; p: number; keylen: number };
+  iv: string;
+  tag: string;
+  data: string;
+}
+
+/** One connection inside an uploaded export, as the preview describes it — no password. */
+export interface ImportPreviewEntry {
+  index: number;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  readOnly: boolean;
+  /** set when this entry cannot be imported at all (e.g. no service name) */
+  error?: string;
+  /** set when a saved connection already points at the same server, port, user and service */
+  duplicateOfId?: string;
+  duplicateOfName?: string;
+}
+
+export interface ImportPreview {
+  exportedAt: string;
+  entries: ImportPreviewEntry[];
+}
+
+/** What an import did, by connection name, so the UI can say it rather than guess. */
+export interface ConnectionImportResult {
+  added: string[];
+  replaced: string[];
+  skipped: string[];
+}
 export interface TestResult {
   ok: boolean;
   version?: string;
@@ -652,6 +698,17 @@ export const api = {
   // used to look like a success and the connection vanished from the UI while the
   // backend still held it — and its password
   remove: (id: string) => request<{ ok: boolean }>(`/api/connections/${id}`, undefined, "DELETE"),
+  /** Passphrase-encrypted export of saved connections (passwords included, encrypted
+   *  server-side). `ids` omitted means every saved connection. */
+  exportConnections: (password: string, ids?: string[]) =>
+    request<{ file: ConnectionExportFile; count: number }>("/api/connections/export", { password, ids }),
+  /** Decrypt an uploaded export and describe it — metadata only, nothing is written. */
+  previewConnectionImport: (file: unknown, password: string) =>
+    request<ImportPreview>("/api/connections/import/preview", { file, password }),
+  /** Apply an import. `indexes` picks entries from the file; `mode` decides what happens to
+   *  an entry that points where a saved connection already points. */
+  importConnections: (file: unknown, password: string, indexes: number[], mode: "skip" | "replace") =>
+    request<ConnectionImportResult>("/api/connections/import", { file, password, indexes, mode }),
   /** close the pooled sessions but keep the saved connection */
   disconnect: (id: string) => request<DisconnectResult>(`/api/connections/${id}/disconnect`, {}),
   /** close the pooled sessions and open a fresh one */

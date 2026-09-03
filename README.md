@@ -19,6 +19,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 - DBA advisor and performance monitor
 - Automatic local version history for code objects
 - CSV/JSON import and Oracle-to-Oracle migration assistant
+- Passphrase-encrypted export and import of saved connections (AES-256-GCM, scrypt)
 - Dark/light themes and resizable Explorer
 
 There is no Copilot panel, AI endpoint, provider configuration, model SDK, alternate SQL dialect, or non-Oracle driver in this project.

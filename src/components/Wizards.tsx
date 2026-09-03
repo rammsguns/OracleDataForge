@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, FileSpreadsheet, Loader2, PlugZap, XCircle } from "lucide-react";
+import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, ShieldAlert, XCircle } from "lucide-react";
 import { useStudio } from "../state/store";
-import { api, type ImportRequest, type ImportResult } from "../utils/api";
+import { api, type ImportPreview, type ImportRequest, type ImportResult } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
+import { download } from "../utils/sql";
 import type { Engine } from "../types";
 import { Btn, Field, inputCls, Modal } from "./ui";
 
@@ -572,6 +573,381 @@ export function ConfirmDialog() {
         >
           {c.confirmLabel}
         </Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/** Passphrase floor, mirroring the backend's. Kept in one place so the hint, the disabled
+ *  state and the server's rejection message cannot drift apart. */
+const EXPORT_MIN_PASSPHRASE = 12;
+
+/**
+ * Export saved connections to an encrypted JSON file.
+ *
+ * The Oracle passwords are not in the browser — they never leave the backend — so this
+ * dialog does not build the file. It sends the passphrase and the selection to the server,
+ * which encrypts the connections with a key derived from that passphrase, and downloads
+ * whatever comes back. What the user ends up with is a portable backup of connections that
+ * otherwise only exist inside this machine's `data/connections.json`.
+ */
+export function ExportConnectionsDialog() {
+  const s = useStudio();
+  const exportable = s.connections.filter((c) => c.live);
+  const [selected, setSelected] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(exportable.map((c) => [c.id, true]))
+  );
+  const [pass, setPass] = useState("");
+  const [confirmPass, setConfirmPass] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const close = () => s.setExportConnsOpen(false);
+  const chosen = exportable.filter((c) => selected[c.id]);
+  const tooShort = pass.length < EXPORT_MIN_PASSPHRASE;
+  const mismatch = confirmPass.length > 0 && pass !== confirmPass;
+  const canExport = chosen.length > 0 && !tooShort && pass === confirmPass && !busy;
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const ids = chosen.map((c) => c.id);
+      const { file, count } = await api.exportConnections(pass, ids);
+      const stamp = new Date().toISOString().slice(0, 10);
+      download(`dataforge-connections-${stamp}.json`, JSON.stringify(file, null, 2), "application/json");
+      s.toast("success", `${count} connection(s) exported — the file is only as safe as the passphrase you chose.`);
+      close();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Export connections to an encrypted file" onClose={close} width={620}>
+      {exportable.length === 0 ? (
+        <p className="text-[12.5px] text-mute">There are no saved connections to export yet.</p>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex items-start gap-2.5 border border-warn/40 bg-warn/10 rounded-lg p-3 text-[11.5px] text-soft leading-snug">
+            <ShieldAlert size={15} className="shrink-0 text-warn mt-0.5" />
+            <span>
+              The file contains the <b>Oracle username and password</b> of every connection you pick, encrypted with
+              AES-256-GCM under a key derived from your passphrase. Anyone who gets both the file and the passphrase gets
+              the databases. There is no recovery: lose the passphrase and the file is unreadable.
+            </span>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                Connections ({chosen.length}/{exportable.length})
+              </span>
+              <button
+                className="text-[11px] text-accenthi hover:underline"
+                onClick={() =>
+                  setSelected(Object.fromEntries(exportable.map((c) => [c.id, chosen.length !== exportable.length])))
+                }
+              >
+                {chosen.length === exportable.length ? "Clear all" : "Select all"}
+              </button>
+            </div>
+            <ul className="border border-bdr rounded-lg divide-y divide-bdrsoft max-h-52 overflow-auto">
+              {exportable.map((c) => (
+                <li key={c.id}>
+                  <label className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-panel2">
+                    <input
+                      type="checkbox"
+                      className="accent-[var(--accent)]"
+                      checked={!!selected[c.id]}
+                      onChange={(e) => setSelected((m) => ({ ...m, [c.id]: e.target.checked }))}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-[12.5px] font-medium text-ink truncate">{c.name}</span>
+                      <span className="block text-[11px] text-mute font-mono truncate">
+                        {c.host}:{c.port}
+                        {c.database ? `/${c.database}` : ""} as {c.user}
+                        {c.readOnly ? " · read-only" : ""}
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Passphrase" hint={`At least ${EXPORT_MIN_PASSPHRASE} characters`}>
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={pass}
+                onChange={(e) => setPass(e.target.value)}
+                autoComplete="new-password"
+                autoFocus
+                placeholder="••••••••••••"
+              />
+            </Field>
+            <Field label="Confirm passphrase">
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={confirmPass}
+                onChange={(e) => setConfirmPass(e.target.value)}
+                autoComplete="new-password"
+                placeholder="••••••••••••"
+              />
+            </Field>
+          </div>
+          <label className="flex items-center gap-2 text-[11.5px] text-mute cursor-pointer">
+            <input type="checkbox" className="accent-[var(--accent)]" checked={reveal} onChange={(e) => setReveal(e.target.checked)} />
+            Show passphrase
+          </label>
+
+          {mismatch && (
+            <p className="flex items-center gap-1.5 text-err text-[12px]">
+              <XCircle size={14} /> The two passphrases do not match.
+            </p>
+          )}
+          {error && (
+            <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+              <XCircle size={14} className="shrink-0 mt-0.5" /> {error}
+            </p>
+          )}
+
+          <div className="flex items-center justify-between pt-4 border-t border-bdrsoft">
+            <Btn variant="ghost" onClick={close}>Cancel</Btn>
+            <Btn variant="primary" onClick={run} disabled={!canExport}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <Download size={13} />} Export {chosen.length || ""} connection
+              {chosen.length === 1 ? "" : "s"}
+            </Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/**
+ * Import connections from an encrypted export.
+ *
+ * The browser cannot open the file — the passphrase-derived key never exists here — so the
+ * dialog uploads the envelope and lets the backend decrypt it. Two calls, in the order the
+ * user thinks in: `preview` says what is inside (metadata only, still no passwords), then
+ * `import` writes the entries that were ticked. Nothing lands in the registry until the
+ * second call, so a wrong passphrase or the wrong file costs nothing.
+ */
+export function ImportConnectionsDialog() {
+  const s = useStudio();
+  const [fileName, setFileName] = useState("");
+  const [envelope, setEnvelope] = useState<unknown>(null);
+  const [pass, setPass] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [picked, setPicked] = useState<Record<number, boolean>>({});
+  const [mode, setMode] = useState<"skip" | "replace">("skip");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const close = () => s.setImportConnsOpen(false);
+
+  const readFile = async (f: File | undefined) => {
+    if (!f) return;
+    setError("");
+    setPreview(null);
+    setFileName(f.name);
+    try {
+      const parsed = JSON.parse(await f.text());
+      // named here rather than left to the server so the obvious mistake — picking the wrong
+      // .json — is answered before a passphrase is typed
+      if (!parsed || parsed.format !== "oracle-dataforge-connections") {
+        setEnvelope(null);
+        setError(`${f.name} is not an Oracle DataForge connection export.`);
+        return;
+      }
+      setEnvelope(parsed);
+    } catch {
+      setEnvelope(null);
+      setError(`${f.name} is not valid JSON.`);
+    }
+  };
+
+  const unlock = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const p = await api.previewConnectionImport(envelope, pass);
+      setPreview(p);
+      // everything importable starts ticked; an entry the server rejected cannot be
+      setPicked(Object.fromEntries(p.entries.filter((e) => !e.error).map((e) => [e.index, true])));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chosen = preview?.entries.filter((e) => picked[e.index] && !e.error) ?? [];
+  const duplicates = chosen.filter((e) => e.duplicateOfId).length;
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await api.importConnections(envelope, pass, chosen.map((e) => e.index), mode);
+      await s.refreshConnections();
+      const parts = [
+        r.added.length ? `${r.added.length} added` : "",
+        r.replaced.length ? `${r.replaced.length} replaced` : "",
+        r.skipped.length ? `${r.skipped.length} skipped` : "",
+      ].filter(Boolean);
+      s.toast(
+        r.added.length || r.replaced.length ? "success" : "info",
+        `Import finished — ${parts.join(", ")}. Connect to open a session.`
+      );
+      close();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Import connections from an encrypted file" onClose={close} width={640}>
+      <div className="space-y-4">
+        <Field label="Export file" hint="The dataforge-connections-….json written by Export connections">
+          <input
+            type="file"
+            accept="application/json,.json"
+            className="w-full text-[12px] text-soft file:mr-3 file:h-7 file:px-2.5 file:rounded-md file:border file:border-bdr file:bg-panel2 file:text-soft file:text-[12px] file:cursor-pointer hover:file:border-accent/60"
+            onChange={(e) => void readFile(e.target.files?.[0])}
+          />
+        </Field>
+
+        {envelope != null && !preview && (
+          <>
+            <Field label="Passphrase" hint="The one used when the file was exported">
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={pass}
+                onChange={(e) => setPass(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && pass && !busy && void unlock()}
+                autoComplete="off"
+                autoFocus
+                placeholder="••••••••••••"
+              />
+            </Field>
+            <label className="flex items-center gap-2 text-[11.5px] text-mute cursor-pointer">
+              <input type="checkbox" className="accent-[var(--accent)]" checked={reveal} onChange={(e) => setReveal(e.target.checked)} />
+              Show passphrase
+            </label>
+          </>
+        )}
+
+        {preview && (
+          <>
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                  In {fileName} ({chosen.length}/{preview.entries.length})
+                </span>
+                {preview.exportedAt && (
+                  <span className="text-[11px] text-mute">exported {preview.exportedAt.slice(0, 10)}</span>
+                )}
+              </div>
+              <ul className="border border-bdr rounded-lg divide-y divide-bdrsoft max-h-56 overflow-auto">
+                {preview.entries.map((e) => (
+                  <li key={e.index}>
+                    <label className={`flex items-center gap-2.5 px-3 py-2 ${e.error ? "opacity-60" : "cursor-pointer hover:bg-panel2"}`}>
+                      <input
+                        type="checkbox"
+                        className="accent-[var(--accent)]"
+                        disabled={!!e.error}
+                        checked={!!picked[e.index]}
+                        onChange={(ev) => setPicked((m) => ({ ...m, [e.index]: ev.target.checked }))}
+                      />
+                      <span className="min-w-0">
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-[12.5px] font-medium text-ink truncate">{e.name}</span>
+                          {e.duplicateOfId && (
+                            <span className="text-[10px] font-bold bg-warn/15 text-warn rounded px-1 py-0.5 shrink-0">
+                              ALREADY SAVED
+                            </span>
+                          )}
+                        </span>
+                        <span className="block text-[11px] text-mute font-mono truncate">
+                          {e.host}:{e.port}
+                          {e.database ? `/${e.database}` : ""} as {e.user}
+                          {e.readOnly ? " · read-only" : ""}
+                        </span>
+                        {e.error && <span className="block text-[11px] text-err">Cannot import: {e.error}</span>}
+                        {e.duplicateOfId && e.duplicateOfName !== e.name && (
+                          <span className="block text-[11px] text-mute">saved here as “{e.duplicateOfName}”</span>
+                        )}
+                      </span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {duplicates > 0 && (
+              <div className="border border-bdr rounded-lg p-3 space-y-2">
+                <div className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                  {duplicates} of these already exist here
+                </div>
+                <p className="text-[11px] text-mute leading-snug">
+                  A connection counts as the same one when its server, port, user and service name all match — the same
+                  test the backend uses before it will reuse a stored password.
+                </p>
+                {(["skip", "replace"] as const).map((m) => (
+                  <label key={m} className="flex items-start gap-2.5 text-[12px] cursor-pointer">
+                    <input
+                      type="radio"
+                      name="dupe-mode"
+                      className="mt-0.5 accent-[var(--accent)]"
+                      checked={mode === m}
+                      onChange={() => setMode(m)}
+                    />
+                    <span>
+                      <span className="font-medium text-ink">{m === "skip" ? "Keep what is here" : "Replace with the file"}</span>
+                      <span className="block text-[11px] text-mute">
+                        {m === "skip"
+                          ? "Leave the saved connection and its password untouched."
+                          : "Overwrite the saved name, password and read-only flag; open sessions are closed."}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {error && (
+          <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+            <XCircle size={14} className="shrink-0 mt-0.5" /> {error}
+          </p>
+        )}
+
+        <div className="flex items-center justify-between pt-4 border-t border-bdrsoft">
+          <Btn variant="ghost" onClick={close}>Cancel</Btn>
+          {preview ? (
+            <Btn variant="primary" onClick={run} disabled={busy || chosen.length === 0}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <CheckCircle2 size={13} />} Import {chosen.length || ""}{" "}
+              connection{chosen.length === 1 ? "" : "s"}
+            </Btn>
+          ) : (
+            <Btn variant="primary" onClick={unlock} disabled={busy || envelope == null || !pass}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <KeyRound size={13} />} Unlock file
+            </Btn>
+          )}
+        </div>
       </div>
     </Modal>
   );

@@ -113,6 +113,14 @@ interface Store {
   setWizardOpen: (v: boolean) => void;
   importOpen: boolean;
   setImportOpen: (v: boolean) => void;
+  /** the "export connections to an encrypted file" dialog */
+  exportConnsOpen: boolean;
+  setExportConnsOpen: (v: boolean) => void;
+  /** the "import connections from an encrypted file" dialog */
+  importConnsOpen: boolean;
+  setImportConnsOpen: (v: boolean) => void;
+  /** re-read the backend registry — what an import lands in */
+  refreshConnections: () => Promise<void>;
 
   selectedObject: string | null;
   setSelectedObject: (o: string | null) => void;
@@ -248,6 +256,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [editingConn, setEditingConn] = useState<Connection | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  const [exportConnsOpen, setExportConnsOpen] = useState(false);
+  const [importConnsOpen, setImportConnsOpen] = useState(false);
   const [selectedObject, setSelectedObject] = useState<string | null>(null);
   const [editDataRequest, setEditDataRequest] = useState<string | null>(null);
 
@@ -292,53 +302,51 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     }
   }, [connections]);
 
-  // Reconcile with the backend registry once on load. localStorage paints instantly (no
-  // flash of an empty list) but it is per-browser: a different browser, profile or machine
-  // used to show "No connections yet" while the server still held them. The registry is the
-  // owner of *which* connections exist; localStorage only keeps the per-browser colour.
-  // Nothing here opens a session — everything comes back `idle`, as on any reload.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { connections: stored } = await api.list();
-        if (cancelled) return;
-        setConnections((prev) => {
-          const byId = new Map(prev.map((c) => [c.id, c]));
-          return stored.map((s, i) => {
-            const old = byId.get(s.id);
-            return {
-              id: s.id,
-              name: s.name,
-              engine: s.engine as Connection["engine"],
-              host: s.host,
-              port: s.port,
-              user: s.user,
-              database: s.database,
-              readOnly: s.readOnly,
-              live: true,
-              status: "idle" as const,
-              // keep the colour this browser already showed, so the list doesn't reshuffle
-              color: old?.color ?? CONN_COLORS[i % CONN_COLORS.length],
-            };
-          });
+  // Reconcile with the backend registry. localStorage paints instantly (no flash of an empty
+  // list) but it is per-browser: a different browser, profile or machine used to show "No
+  // connections yet" while the server still held them. The registry is the owner of *which*
+  // connections exist; localStorage only keeps the per-browser colour. Nothing here opens a
+  // session — everything comes back `idle`, as on any reload.
+  //
+  // Called once on mount, and again after an import, which is the one way the registry gains
+  // connections this browser has never seen.
+  const refreshConnections = useCallback(async () => {
+    try {
+      const { connections: stored } = await api.list();
+      setConnections((prev) => {
+        const byId = new Map(prev.map((c) => [c.id, c]));
+        return stored.map((s, i) => {
+          const old = byId.get(s.id);
+          return {
+            id: s.id,
+            name: s.name,
+            engine: s.engine as Connection["engine"],
+            host: s.host,
+            port: s.port,
+            user: s.user,
+            database: s.database,
+            readOnly: s.readOnly,
+            live: true,
+            status: "idle" as const,
+            // keep the colour this browser already showed, so the list doesn't reshuffle
+            color: old?.color ?? CONN_COLORS[i % CONN_COLORS.length],
+          };
         });
-        // Point the active connection at something that exists. It is seeded from
-        // localStorage, so a fresh browser (or one whose connection was deleted elsewhere)
-        // held "" or a dead id — and every `activeConn` lookup then came back undefined,
-        // which the panels used to read as "not live" and answer with sample data.
-        setActiveConnId((cur) => (stored.some((c) => c.id === cur) ? cur : stored[0]?.id ?? ""));
-      } catch {
-        /* backend unreachable — keep whatever localStorage had rather than blanking the list */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // once, on mount: the registry only changes through this app's own create/edit/delete,
-    // which already update `connections` directly
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+      });
+      // Point the active connection at something that exists. It is seeded from
+      // localStorage, so a fresh browser (or one whose connection was deleted elsewhere)
+      // held "" or a dead id — and every `activeConn` lookup then came back undefined,
+      // which the panels used to read as "not live" and answer with sample data.
+      setActiveConnId((cur) => (stored.some((c) => c.id === cur) ? cur : stored[0]?.id ?? ""));
+    } catch {
+      /* backend unreachable — keep whatever localStorage had rather than blanking the list */
+    }
   }, []);
+
+  // on mount: create/edit/delete update `connections` directly, so nothing else has to re-read
+  useEffect(() => {
+    void refreshConnections();
+  }, [refreshConnections]);
 
   // keep query history across page reloads (capped to the most recent HIST_MAX)
   useEffect(() => {
@@ -736,12 +744,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setWizardOpen,
       importOpen,
       setImportOpen,
+      exportConnsOpen,
+      setExportConnsOpen,
+      importConnsOpen,
+      setImportConnsOpen,
+      refreshConnections,
       selectedObject,
       setSelectedObject,
       editDataRequest,
       setEditDataRequest,
     }),
-    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject, editDataRequest]
+    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

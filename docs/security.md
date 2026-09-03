@@ -361,6 +361,24 @@ const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
 Result data is also shaped defensively: LOBs render as `[BLOB]`/`[CLOB]` placeholders rather
 than bytes, and raw buffers are truncated.
 
+The one deliberate exception is the **encrypted connection export**
+(`POST /api/connections/export`), and even it does not break the rule: the browser sends a
+passphrase and receives ciphertext. The server derives a key from that passphrase with scrypt
+and encrypts the selected connections — passwords included — with AES-256-GCM, so what
+reaches the page, and then the user's disk, is never readable plaintext. It is full-access
+only, the passphrase floor is 12 characters, and each export is logged to the server console.
+See [credentials.md](credentials.md#exporting-connections-to-an-encrypted-file).
+
+The **import** (`POST /api/connections/import/preview` and `/import`) runs the same way in
+reverse, and holds the line in both directions. Decryption happens server-side, so the preview
+it sends back describes the file — names, hosts, users — without a single password in it. The
+uploaded envelope is treated as untrusted input: format, version and cipher are checked, the
+scrypt parameters it carries are range-checked before any key is derived (a file must not be
+able to size an allocation here), the payload is bounded and capped at 500 entries, and every
+decrypted entry goes through the same `pickConfig`/`validate` path as a hand-typed connection.
+Both endpoints are full-access only, and an import is logged with what it added, replaced and
+skipped.
+
 ## Caps
 
 Denial-of-service resistance is incidental rather than designed, but the limits are real:

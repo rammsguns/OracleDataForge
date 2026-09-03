@@ -7,6 +7,8 @@ import {
   ChevronRight,
   Database,
   FileCode2,
+  FileLock2,
+  FileUp,
   FolderOpen,
   FunctionSquare,
   GitBranch,
@@ -224,6 +226,11 @@ export default function Sidebar() {
 
   const q = search.trim().toLowerCase();
   const activeConn = s.connections.find((c) => c.id === s.activeConnId);
+  // Exporting connections hands out stored credentials, so it sits behind the same access
+  // boundary the backend enforces on the registry itself — the button is hidden for the
+  // read tiers rather than left to fail with a 403 when clicked.
+  const fullAccess = s.accessRole === "Administrator" || s.accessRole === "Developer";
+  const exportableConns = s.connections.filter((c) => c.live).length;
   const [liveSchemas, setLiveSchemas] = useState<Record<string, LiveSchemaState>>(() => ({ ...schemaCache }));
 
   // mirror into the module cache so the tree survives collapsing the panel. "loading" is
@@ -389,7 +396,7 @@ export default function Sidebar() {
   const canCreateTable = canDesignTable && !activeConn?.readOnly;
   const openTableDesigner = (name: string) => s.openTab("tabledesign", `${name} (Table)`, name);
   // Row editor inside the Data tab — the same bar the backend puts on the row endpoint
-  const canEditRows = canCreateTable && (s.accessRole === "Administrator" || s.accessRole === "Developer");
+  const canEditRows = canCreateTable && fullAccess;
   const openRowEditor = (name: string) => {
     s.setEditDataRequest(name);
     s.openTab("data", name, name);
@@ -549,12 +556,44 @@ export default function Sidebar() {
         >
           {connsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           Connections
+          {fullAccess && (
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="Import connections from an encrypted file"
+              title="Import connections from an encrypted file"
+              className="ml-auto p-0.5 rounded hover:bg-panel3 hover:text-accent"
+              onClick={(e) => {
+                e.stopPropagation();
+                s.setImportConnsOpen(true);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setImportConnsOpen(true))}
+            >
+              <FileUp size={13} />
+            </span>
+          )}
+          {fullAccess && exportableConns > 0 && (
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="Export connections to an encrypted file"
+              title="Export connections to an encrypted file"
+              className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+              onClick={(e) => {
+                e.stopPropagation();
+                s.setExportConnsOpen(true);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setExportConnsOpen(true))}
+            >
+              <FileLock2 size={13} />
+            </span>
+          )}
           <span
             role="button"
             tabIndex={0}
             aria-label="New connection"
             title="New connection"
-            className="ml-auto p-0.5 rounded hover:bg-panel3 hover:text-accent"
+            className={`${fullAccess ? "" : "ml-auto "}p-0.5 rounded hover:bg-panel3 hover:text-accent`}
             onClick={(e) => {
               e.stopPropagation();
               s.setWizardOpen(true);
@@ -566,7 +605,14 @@ export default function Sidebar() {
         </button>
         {connsOpen && s.connections.length === 0 && (
           <p className="px-6 py-2 text-[11.5px] text-mute leading-snug">
-            No connections yet — click <Plus size={11} className="inline -mt-0.5" /> above to create a live Oracle connection.
+            No connections yet — click <Plus size={11} className="inline -mt-0.5" /> above to create a live Oracle connection
+            {fullAccess ? (
+              <>
+                , or <FileUp size={11} className="inline -mt-0.5" /> to import an encrypted export.
+              </>
+            ) : (
+              "."
+            )}
           </p>
         )}
         {connsOpen &&
@@ -616,6 +662,14 @@ export default function Sidebar() {
                         : []),
                       { divider: true },
                       { label: "Edit connection…", action: startEdit },
+                      // opens the dialog with every connection preselected, not just this
+                      // one — picking the subset is the dialog's job
+                      ...(fullAccess && c.live
+                        ? [
+                            { label: "Export connections…", action: () => s.setExportConnsOpen(true) },
+                            { label: "Import connections…", action: () => s.setImportConnsOpen(true) },
+                          ]
+                        : []),
                       { divider: true },
                       { label: "Remove connection…", danger: true, action: askRemove },
                     ],
