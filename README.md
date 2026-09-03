@@ -19,6 +19,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 - DBA advisor and performance monitor
 - Automatic local version history for code objects
 - CSV/JSON import and Oracle-to-Oracle migration assistant
+- Passphrase-encrypted export and import of saved connections (AES-256-GCM, scrypt)
 - Dark/light themes and resizable Explorer
 
 There is no Copilot panel, AI endpoint, provider configuration, model SDK, alternate SQL dialect, or non-Oracle driver in this project.
@@ -91,9 +92,14 @@ The application is deliberately a lightweight core IDE, without the source repos
 
 ```bash
 npm run typecheck
+npm test
 npm run build
 curl http://127.0.0.1:3001/api/health
 ```
+
+`npm test` runs the connection-export crypto tests (Node's built-in test runner, no framework,
+no network or database needed). It is the only automated suite in the project; everything else
+is checked by hand.
 
 The health response is JSON with `ok: true` and the number of saved Oracle connections.
 

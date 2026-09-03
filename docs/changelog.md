@@ -10,6 +10,36 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- **Export saved connections to a passphrase-encrypted JSON file.** The lock icon beside
+  **Connections** in the Explorer (and **Export connections…** in a connection's context menu)
+  picks any subset of the saved connections, asks for a passphrase twice, and downloads
+  `dataforge-connections-<date>.json`. Until now the only copy of a connection's credentials
+  was `data/connections.json`, encrypted with a key that lives in this machine's environment —
+  useless on any other machine, and nothing to hand to a colleague setting up the same
+  databases. The export is the portable form. The browser has no passwords to encrypt, so it
+  does not build the file: it sends the passphrase, and the server derives a key with scrypt
+  (N=2^15, r=8) and returns AES-256-GCM ciphertext, so nothing readable ever reaches the page.
+  Full access only, a 12-character minimum on the passphrase — an export file is attacked
+  offline, unlike an account password — and every export is logged to the server console.
+- **Import connections from an encrypted export.** The other half of the same feature: pick the
+  file, type its passphrase, and **Unlock file** shows what is inside — names, servers, users,
+  read-only flags, and nothing else, because the decryption happens on the backend and
+  passwords do not travel to the browser even in a preview. Nothing is written until you press
+  Import, so the wrong file or a mistyped passphrase costs a click. An entry pointing at a
+  server, port, user and service you already have saved is marked **ALREADY SAVED** and is
+  skipped by default; choosing *Replace with the file* overwrites that connection in place,
+  keeping its id so open tabs stay pointed at it. The uploaded file is treated as untrusted
+  input throughout — the scrypt parameters it carries are range-checked before a key is
+  derived, the payload is bounded and capped, and every entry is validated exactly like one
+  typed into the connection wizard. [credentials.md](credentials.md#exporting-connections-to-an-encrypted-file)
+  documents the format, the import rules, and how to decrypt a file by hand with Node.
+- **The project's first automated tests**, covering that export/import crypto: `npm test`,
+  21 cases on Node's built-in test runner with no new dependency and nothing to stand up.
+  They check the round trip (unicode passwords included), that a wrong passphrase or a single
+  flipped bit fails instead of returning something plausible, that no plaintext survives in a
+  written file, and that a hostile file cannot choose this process's scrypt parameters. To
+  make them possible the envelope moved to `server/connectionExport.ts` — the backend is now
+  one file plus one small pure module, rather than strictly one file.
 - **A permanent find strip in the PL/SQL editor, in SQL Developer's shape.** The object editor's
   search is now always on screen above the code rather than a popover only Ctrl+F could
   summon, and it carries the options SQL Developer offers: the **3 of 12** position of the

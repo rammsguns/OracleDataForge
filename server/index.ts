@@ -5,6 +5,11 @@ import path from "node:path";
 import { isIPv4, isIPv6 } from "node:net";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import {
+  decryptExport,
+  encryptExport,
+  EXPORT_MIN_PASSPHRASE,
+} from "./connectionExport.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -4038,6 +4043,185 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
     saveRegistry();
   }
   res.json({ ok: true });
+});
+
+/* ---------------- Portable, passphrase-encrypted export of saved connections ----------
+ * `data/connections.json` is encrypted with DATAFORGE_ENCRYPTION_KEY — a key that lives in
+ * this server's environment, which makes that file a backup of the registry only for as
+ * long as the machine holding the key survives. This endpoint is the portable form: the
+ * caller supplies a passphrase, the server derives a key from it and re-encrypts the chosen
+ * connections — Oracle passwords included — under that passphrase alone.
+ *
+ * The result is a credential file whose only protection is what the user typed, so:
+ *  - full access only, like every other route that reads or mutates the registry;
+ *  - the passphrase floor is higher than the one for workspace accounts. An account
+ *    password is guessed online against a server that rate-limits and logs; an export file
+ *    is guessed offline, at whatever rate the attacker's hardware allows, forever;
+ *  - scrypt runs at a deliberately expensive cost so each of those guesses has to pay.
+ *
+ * The password is never sent to the browser in the clear on the way out either: the plaintext
+ * exists only inside `encryptExport` — connectionExport.ts, where the envelope format lives
+ * and where its tests are — and what leaves here is ciphertext.
+ */
+/** One connection as it appears inside the encrypted payload — the stored config minus the
+ *  server-assigned id, which is a registry sequence number and means nothing elsewhere. */
+type ExportedConnection = ConnConfig;
+
+/**
+ * Export saved connections as one passphrase-encrypted JSON file.
+ * Body: `{ password, ids? }` — `ids` omitted means every saved connection.
+ */
+app.post("/api/connections/export", requireFullAccess, async (req, res) => {
+  const passphrase = String(req.body?.password ?? "");
+  if (passphrase.length < EXPORT_MIN_PASSPHRASE) {
+    return res.status(400).json({ error: `The export passphrase must be at least ${EXPORT_MIN_PASSPHRASE} characters.` });
+  }
+
+  const ids: string[] | null = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+  const chosen = ids ? ids.map((id) => registry.get(id)) : [...registry.values()];
+  if (chosen.some((c) => !c)) {
+    return res.status(404).json({ error: "Unknown connection (backend may have restarted — reload the page)" });
+  }
+  if (!chosen.length) return res.status(400).json({ error: "Select at least one connection to export." });
+
+  const payload: ExportedConnection[] = (chosen as LiveConnection[]).map(
+    ({ name, engine, host, port, user, password, database, readOnly }) => ({ name, engine, host, port, user, password, database, readOnly })
+  );
+
+  const file = await encryptExport(payload, passphrase);
+  // Credentials leaving the machine is worth a line in the operator's console — the same
+  // reasoning as the failed-sign-in log above, and for the same lack of an audit trail.
+  console.log(
+    `Exported ${payload.length} saved connection(s) with passwords, passphrase-encrypted — requested by ${
+      (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
+    }`
+  );
+  res.json({ file, count: payload.length });
+});
+
+/* ---------------- Importing an encrypted export back ---------------------------------
+ * The other half of the export: hand back the file and its passphrase and the connections
+ * inside it become saved connections again — on this machine or on another one.
+ *
+ * Two endpoints rather than one, because an import writes credentials into the registry and
+ * the user should see what is about to land before it does. `/import/preview` decrypts and
+ * describes the file (metadata only — no passwords go back to the browser, the same rule as
+ * everywhere else); `/import` decrypts again and applies the entries the user picked. The
+ * passphrase is therefore sent twice, which costs one extra scrypt derivation and keeps the
+ * server free of any half-finished import state.
+ *
+ * Everything about the envelope is caller-supplied and therefore untrusted; `decryptExport`
+ * in connectionExport.ts is where that is dealt with, and where the tests live.
+ */
+/** Open an uploaded envelope and shape every entry the way a hand-typed connection is
+ *  shaped — so an entry from a later export carrying extra fields lands as the fields this
+ *  build understands rather than going into the registry unexamined. */
+async function decryptExportFile(raw: unknown, passphrase: string): Promise<ExportedConnection[]> {
+  return (await decryptExport(raw, passphrase)).map((e) => pickConfig(e));
+}
+
+/** What the browser is told about one entry in an uploaded file — deliberately no password. */
+interface ImportPreviewEntry {
+  index: number;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  readOnly: boolean;
+  /** why this entry cannot be imported, when it cannot */
+  error?: string;
+  /** the saved connection this entry points at the same place as */
+  duplicateOfId?: string;
+  duplicateOfName?: string;
+}
+
+function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
+  return entries.map((cfg, index) => {
+    const existing = [...registry.values()].find((c) => sameEndpoint(cfg, c));
+    return {
+      index,
+      name: cfg.name,
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user,
+      database: cfg.database,
+      readOnly: cfg.readOnly,
+      error: validate(cfg) ?? undefined,
+      duplicateOfId: existing?.id,
+      duplicateOfName: existing?.name,
+    };
+  });
+}
+
+/** Decrypt an uploaded export and describe what is in it. Writes nothing. */
+app.post("/api/connections/import/preview", requireFullAccess, async (req, res) => {
+  try {
+    const entries = await decryptExportFile(req.body?.file, String(req.body?.password ?? ""));
+    res.json({ exportedAt: String(req.body?.file?.exportedAt ?? ""), entries: describeImport(entries) });
+  } catch (e) {
+    res.status(400).json({ error: errMsg(e) });
+  }
+});
+
+/**
+ * Apply an import. `indexes` selects entries from the file (all of them when omitted), and
+ * `mode` decides what happens to an entry pointing at the same engine/host/port/user/service
+ * as a saved connection — the same identity the stored-password replay rule uses:
+ *
+ *   skip    (default) leave the saved connection alone
+ *   replace overwrite it in place, keeping its id so tabs and history keep their target
+ *
+ * An entry pointing somewhere new is always added.
+ */
+app.post("/api/connections/import", requireFullAccess, async (req, res) => {
+  const mode = req.body?.mode === "replace" ? "replace" : "skip";
+  let entries: ExportedConnection[];
+  try {
+    entries = await decryptExportFile(req.body?.file, String(req.body?.password ?? ""));
+  } catch (e) {
+    return res.status(400).json({ error: errMsg(e) });
+  }
+
+  const wanted: number[] = Array.isArray(req.body?.indexes)
+    ? [...new Set<number>(req.body.indexes.map(Number))]
+    : entries.map((_e, i) => i);
+  if (wanted.some((i) => !Number.isInteger(i) || i < 0 || i >= entries.length)) {
+    return res.status(400).json({ error: "The selection does not match the file." });
+  }
+  if (!wanted.length) return res.status(400).json({ error: "Select at least one connection to import." });
+
+  const chosen = wanted.map((i) => entries[i]);
+  const invalid = chosen.map((cfg) => validate(cfg)).find(Boolean);
+  if (invalid) return res.status(400).json({ error: `The file contains a connection this app cannot use: ${invalid}` });
+
+  const added: string[] = [];
+  const replaced: string[] = [];
+  const skipped: string[] = [];
+  for (const cfg of chosen) {
+    const existing = [...registry.values()].find((c) => sameEndpoint(cfg, c));
+    if (existing) {
+      if (mode === "skip") {
+        skipped.push(existing.name);
+        continue;
+      }
+      // the pooled sessions belong to the credentials being overwritten
+      await closePools(existing);
+      registry.set(existing.id, { ...cfg, id: existing.id });
+      replaced.push(cfg.name);
+    } else {
+      const id = `live${seq++}`;
+      registry.set(id, { ...cfg, id });
+      added.push(cfg.name);
+    }
+  }
+  if (added.length || replaced.length) saveRegistry();
+  console.log(
+    `Imported connections from an encrypted export — ${added.length} added, ${replaced.length} replaced, ${skipped.length} skipped — requested by ${
+      (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
+    }`
+  );
+  res.json({ added, replaced, skipped });
 });
 
 /**

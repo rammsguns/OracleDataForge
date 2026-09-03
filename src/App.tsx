@@ -5,7 +5,7 @@ import Sidebar from "./components/Sidebar";
 import Workspace from "./components/Workspace";
 import Toasts from "./components/Toasts";
 import { TitleBar, StatusBar } from "./components/Chrome";
-import { ConfirmDialog, ConnectionWizard, ImportWizard } from "./components/Wizards";
+import { ConfirmDialog, ConnectionWizard, ExportConnectionsDialog, ImportConnectionsDialog, ImportWizard } from "./components/Wizards";
 import { download } from "./utils/sql";
 
 const SIDEBAR_MIN = 200;
@@ -167,6 +167,8 @@ function Shell() {
       <Toasts />
       {s.wizardOpen && <ConnectionWizard />}
       {s.importOpen && <ImportWizard />}
+      {s.exportConnsOpen && <ExportConnectionsDialog />}
+      {s.importConnsOpen && <ImportConnectionsDialog />}
       {/* last: the confirm dialog shares z-50 with the wizards, so it has to come after
           them in DOM order or an import/connection modal would paint over its own prompt */}
       <ConfirmDialog />

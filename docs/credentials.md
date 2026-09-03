@@ -107,6 +107,124 @@ sensitivity lives in `data/versions/`, unencrypted, for as long as the version h
 kept. Excluding `data/` from sync (the same fix as above) covers this too — there is no
 separate exclusion needed.
 
+## Exporting connections to an encrypted file
+
+`data/connections.json` is only a backup of the registry for as long as the machine holding
+`DATAFORGE_ENCRYPTION_KEY` survives — the file alone, copied elsewhere, decrypts to nothing.
+The **export** is the portable form. In the Explorer, the lock icon beside **Connections**
+(or **Export connections…** in a connection's context menu) asks for a passphrase and
+downloads `dataforge-connections-<date>.json`.
+
+What that file holds is the **Oracle username and password** of every connection you picked,
+encrypted under that passphrase and nothing else. Treat it exactly as you would treat the
+passwords themselves.
+
+- The browser never assembles it. Passwords do not live there, so the encryption happens
+  server-side and the browser only receives, and saves, ciphertext.
+- **Full access only** (Administrator or Developer), the same bar as every other route that
+  reads or writes the registry.
+- The passphrase must be **at least 12 characters** — a higher floor than a workspace account
+  password, because an account password is guessed online against a server that rate-limits
+  and logs, while an export file is guessed offline, as fast as the attacker's hardware
+  allows, for as long as they care to keep trying.
+- **There is no recovery.** Lose the passphrase and the file is unreadable; the connections
+  themselves are still in the app, so re-export rather than go looking for a way in.
+- Each export is logged to the server console (`Exported N saved connection(s) …`), since
+  credentials leaving the machine is worth a line in the operator's log.
+
+### The file format
+
+A single JSON object. `data` is the encrypted array of connections; everything else is what a
+reader needs to derive the same key:
+
+```json
+{
+  "format": "oracle-dataforge-connections",
+  "version": 1,
+  "exportedAt": "2026-09-03T21:16:17.424Z",
+  "count": 2,
+  "cipher": "aes-256-gcm",
+  "kdf": { "name": "scrypt", "salt": "…base64…", "N": 32768, "r": 8, "p": 1, "keylen": 32 },
+  "iv": "…base64…",
+  "tag": "…base64…",
+  "data": "…base64 ciphertext…"
+}
+```
+
+The scrypt parameters are deliberately expensive (N=2^15, r=8 → roughly 32 MB and ~100 ms per
+guess) so that offline guessing has to pay for every attempt. The GCM tag authenticates the
+ciphertext: a wrong passphrase, or an edited file, fails to decrypt rather than returning
+plausible-looking rubbish.
+
+## Importing an export back
+
+**Import connections…** (the ⬆ icon beside **Connections**, or the same entry in a connection's
+context menu) is the way back in: pick the file, type its passphrase, and the connections
+inside it become saved connections here. It is full-access only, like the export.
+
+The browser cannot open the file — the passphrase-derived key never exists there — so the
+envelope is uploaded and the backend decrypts it. That happens in two steps, and **nothing is
+written by the first one**:
+
+1. **Unlock file** decrypts and lists what is inside: name, server, port, user, service and
+   read-only flag for every entry. Passwords stay on the server even here — the preview is
+   metadata, the same rule `GET /api/connections` follows.
+2. **Import** writes the entries you ticked into the registry, which persists them to
+   `data/connections.json` under `DATAFORGE_ENCRYPTION_KEY` (or in clear text, if no key is
+   configured — the plaintext default above applies to imported credentials exactly as it does
+   to typed ones).
+
+### Connections you already have
+
+An entry is treated as one you already have when its **engine, host, port, user and service
+name** all match a saved connection — the same identity test that governs whether a stored
+password may be replayed. The preview marks those **ALREADY SAVED**, and offers a choice:
+
+| | |
+| --- | --- |
+| **Keep what is here** (default) | The saved connection and its password are left alone. |
+| **Replace with the file** | The saved entry is overwritten in place — name, password and read-only flag come from the file. Its id is kept, so open tabs still point at it, and its pooled sessions are closed first. |
+
+Entries pointing somewhere new are always added. Nothing is ever deleted by an import.
+
+### The file is untrusted input
+
+An uploaded envelope is attacker-shaped data even when it arrives from a colleague, so the
+backend checks it before it acts on it: the format, version and cipher must be the ones this
+build knows; the scrypt parameters are read from the file (an export made with different ones
+still has to open) but **range-checked** first, since a file claiming `N` of 2^30 would
+otherwise size an allocation on this server; salt, IV, tag and payload are bounded; a file is
+capped at 500 connections; and every decrypted entry goes through the same field-by-field
+`pickConfig`/`validate` path as a connection typed into the wizard, so an entry with a bogus
+port or a missing service name is rejected rather than saved.
+
+A wrong passphrase and an altered file both fail the GCM authentication tag, so the error says
+both — that is the honest answer, not a vague one.
+
+The envelope code lives in `server/connectionExport.ts`, apart from the rest of the backend so
+it can be tested directly: `npm test` covers the round trip, the rejection paths above, and
+the fact that no plaintext survives anywhere in a written file.
+
+### Reading one by hand
+
+The import above is the easy path; the file is also readable without this app, which is what
+makes it a real backup. Decrypt it with Node:
+
+```bash
+node -e '
+const fs=require("fs"),c=require("crypto");
+const f=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+const k=c.scryptSync(process.argv[2],Buffer.from(f.kdf.salt,"base64"),f.kdf.keylen,
+  {N:f.kdf.N,r:f.kdf.r,p:f.kdf.p,maxmem:128*f.kdf.N*f.kdf.r*2});
+const d=c.createDecipheriv(f.cipher,k,Buffer.from(f.iv,"base64"));
+d.setAuthTag(Buffer.from(f.tag,"base64"));
+console.log(Buffer.concat([d.update(Buffer.from(f.data,"base64")),d.final()]).toString());
+' dataforge-connections-2026-09-03.json 'your passphrase'
+```
+
+Note `maxmem`: at these parameters scrypt needs more than Node's 32 MB default and throws
+without it. That is by design — the cost is the point.
+
 ## Migrating an existing plaintext registry
 
 The server reads a plaintext registry on loopback so an existing install keeps working, and
