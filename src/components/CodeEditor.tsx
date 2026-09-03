@@ -220,14 +220,24 @@ const CodeEditor = forwardRef<
   const doFind = (dir: 1 | -1) => {
     const ta = taRef.current;
     if (!ta || !matches.length) return;
-    const i =
-      dir === 1
-        ? matches.findIndex((m) => m.start >= ta.selectionEnd)
-        : (() => {
-            for (let k = matches.length - 1; k >= 0; k--) if (matches[k].end <= ta.selectionStart) return k;
-            return -1;
-          })();
-    const next = i >= 0 ? i : dir === 1 ? 0 : matches.length - 1; // wrap
+    let next: number;
+    if (activeIdx >= 0 && activeIdx < matches.length) {
+      // Already sitting on a hit — step by index rather than searching by position. A
+      // position search gets stuck on a zero-width match (e.g. from a lookahead like
+      // `(?=a)`): selecting one leaves selectionStart === selectionEnd === its own start,
+      // so ">= selectionEnd" / "<= selectionStart" finds that same match again instead of
+      // advancing, and "next" never moves.
+      next = (activeIdx + dir + matches.length) % matches.length;
+    } else {
+      const i =
+        dir === 1
+          ? matches.findIndex((m) => m.start >= ta.selectionEnd)
+          : (() => {
+              for (let k = matches.length - 1; k >= 0; k--) if (matches[k].end <= ta.selectionStart) return k;
+              return -1;
+            })();
+      next = i >= 0 ? i : dir === 1 ? 0 : matches.length - 1; // wrap
+    }
     setActiveIdx(next);
     selectRange(matches[next].start, matches[next].end);
   };
