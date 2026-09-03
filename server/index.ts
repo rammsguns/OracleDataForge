@@ -2,6 +2,7 @@ import express from "express";
 import compression from "compression";
 import fs from "node:fs";
 import path from "node:path";
+import { isIPv4, isIPv6 } from "node:net";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import oracledb from "oracledb";
@@ -182,6 +183,16 @@ function hashPassword(password: string, salt: Buffer = randomBytes(16)) {
   return { salt: salt.toString("base64"), hash: scryptSync(password, salt, 64).toString("base64") };
 }
 const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, keylen: number) => Promise<Buffer>;
+
+/**
+ * `hashPassword`'s async twin, off the event loop for the same reason `verifyPassword` is:
+ * `POST /api/session/password` calls this on every request from any authenticated account,
+ * so a synchronous derivation there is a self-service event-loop DoS, not just a slow path.
+ */
+async function hashPasswordAsync(password: string, salt: Buffer = randomBytes(16)) {
+  const hash = await scryptAsync(password, salt, 64);
+  return { salt: salt.toString("base64"), hash: hash.toString("base64") };
+}
 
 /**
  * Deliberately expensive, so it must not run on the event loop. HTTP Basic replays the
@@ -3455,11 +3466,16 @@ if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST
  * It runs ahead of the auth middleware so it also covers the unauthenticated bootstrap
  * state, which is exactly where the damage would be greatest.
  */
-// Each octet 0-255, not just 1-3 digits: an out-of-range host like "999.999.999.999" is not
-// a real IP literal and must not be waved through as one.
-const OCTET = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
-const IPV4_LITERAL = new RegExp(`^${OCTET}(\\.${OCTET}){3}$`);
-const IPV6_LITERAL = /^\[[0-9a-f:.]+\]$/;
+/**
+ * Real validation rather than a hand-rolled pattern: `net.isIP` is what Node itself uses to
+ * decide whether a string is an address, so it can't be fooled by something merely
+ * IP-*shaped* — a loose bracketed-hex-and-colons regex previously treated non-addresses like
+ * `[dead]` as a "literal IP" and let them through as one.
+ */
+function isIpLiteral(bare: string): boolean {
+  if (bare.startsWith("[") && bare.endsWith("]")) return isIPv6(bare.slice(1, -1));
+  return isIPv4(bare);
+}
 
 /**
  * Strips a trailing `:<port>`, keeping a bracketed IPv6 literal intact — `null` for anything
@@ -3490,7 +3506,7 @@ function isAllowedHost(header: string | undefined): boolean {
   if (ALLOWED_HOSTS.has(host)) return true;
   const bare = stripPort(host);
   if (!bare) return false;
-  return ALLOWED_HOSTS.has(bare) || IPV4_LITERAL.test(bare) || IPV6_LITERAL.test(bare);
+  return ALLOWED_HOSTS.has(bare) || isIpLiteral(bare);
 }
 app.use((req, res, next) => {
   if (isAllowedHost(req.headers.host)) return next();
@@ -3710,7 +3726,7 @@ app.post("/api/session/password", async (req, res) => {
   if (!target || target.status !== "Active" || target.salt !== salt || target.hash !== hash) {
     return res.status(409).json({ error: "Your account changed while this request was in flight. Sign in again and retry." });
   }
-  Object.assign(target, hashPassword(next));
+  Object.assign(target, await hashPasswordAsync(next));
   saveUsers();
   res.json({ ok: true, reauthenticate: true });
 });
