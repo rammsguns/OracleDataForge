@@ -1,11 +1,88 @@
 import { Keyboard, Moon, PanelLeft, ShieldCheck, Sun } from "lucide-react";
 import { useState } from "react";
 import { schemaOf, useStudio } from "../state/store";
-import { Modal } from "./ui";
+import { api } from "../utils/api";
+import { Btn, Field, Modal, inputCls } from "./ui";
+
+/**
+ * Change your own password — the one account action that is not Administrator-only, so a
+ * Developer, Analyst or Viewer is not stuck asking someone else to rotate their credential.
+ *
+ * Authentication is HTTP Basic: there is no server session to re-issue, so once the stored
+ * password changes the browser keeps replaying the old one and every request 401s. The
+ * dialog ends by saying so instead of leaving the app to fail on its next call.
+ */
+function ChangePassword({ onClose }: { onClose: () => void }) {
+  const s = useStudio();
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [repeat, setRepeat] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    setError(null);
+    if (next.length < 8) return setError("The new password must be at least 8 characters.");
+    if (next !== repeat) return setError("The two new-password entries do not match.");
+    setBusy(true);
+    try {
+      await api.changeOwnPassword(current, next);
+      setDone(true);
+      s.toast("success", "Password changed — sign in again with the new one");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <div className="text-[12.5px] text-soft space-y-2">
+        <p className="text-ok font-semibold">Your password has been changed.</p>
+        <p>
+          This app signs in over HTTP Basic, so your browser is still sending the old password and the next
+          request it makes will fail. Close this window and sign in again with the new one — a private window
+          is the quickest way to get a fresh prompt.
+        </p>
+        <div className="pt-1">
+          <Btn variant="primary" onClick={onClose}>
+            Done
+          </Btn>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <Field label="Current password">
+        <input type="password" className={inputCls} value={current} onChange={(e) => setCurrent(e.target.value)} autoComplete="current-password" />
+      </Field>
+      <Field label="New password" hint="At least 8 characters.">
+        <input type="password" className={inputCls} value={next} onChange={(e) => setNext(e.target.value)} autoComplete="new-password" />
+      </Field>
+      <Field label="Repeat new password">
+        <input type="password" className={inputCls} value={repeat} onChange={(e) => setRepeat(e.target.value)} autoComplete="new-password" />
+      </Field>
+      {error && <div className="text-[12px] text-err">{error}</div>}
+      <div className="flex justify-end gap-2 pt-1">
+        <Btn variant="outline" onClick={onClose} disabled={busy}>
+          Cancel
+        </Btn>
+        <Btn variant="primary" onClick={() => void submit()} disabled={busy || !current || !next}>
+          {busy ? "Changing…" : "Change password"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
 
 export function TitleBar() {
   const s = useStudio();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   const conn = s.connections.find((c) => c.id === s.activeConnId);
 
   return (
@@ -24,6 +101,7 @@ export function TitleBar() {
       </div>
 
       <button
+        type="button"
         onClick={s.toggleSidebar}
         className={`p-1.5 rounded-md transition-colors ${s.sidebarOpen ? "text-accenthi bg-accentdim" : "text-mute hover:text-soft hover:bg-panel3"}`}
         title="Toggle explorer (Ctrl+B)"
@@ -43,14 +121,17 @@ export function TitleBar() {
       )}
 
       <div className="ml-auto flex items-center gap-1">
-        <div
-          className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute"
-          title={s.session?.name ? `Signed in as ${s.session.name}` : "Server-enforced access role for this session"}
+        <button
+          type="button"
+          onClick={() => setAccountOpen(true)}
+          className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute hover:text-soft hover:border-accent/60 hover:bg-accentdim transition-colors"
+          title={s.session?.name ? `Signed in as ${s.session.name} — open account settings` : "Server-enforced access role for this session"}
         >
           <ShieldCheck size={13} className="text-accenthi" />
           <span className="text-soft font-medium">{s.accessRole}</span>
-        </div>
+        </button>
         <button
+          type="button"
           onClick={() => setShortcutsOpen(true)}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"
           title="Keyboard shortcuts (Ctrl+/)"
@@ -59,6 +140,7 @@ export function TitleBar() {
           <Keyboard size={15} />
         </button>
         <button
+          type="button"
           onClick={s.toggleTheme}
           className="p-1.5 rounded-md text-mute hover:text-soft hover:bg-panel3 transition-colors"
           title={`Switch to ${s.theme === "dark" ? "light" : "dark"} mode`}
@@ -67,6 +149,38 @@ export function TitleBar() {
           {s.theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
         </button>
       </div>
+
+      {accountOpen && (
+        <Modal title="Account" onClose={() => setAccountOpen(false)} width={440}>
+          <div className="mb-4 text-[12.5px] text-soft space-y-0.5">
+            <div>
+              <span className="text-mute">Signed in as</span> <span className="font-medium text-ink">{s.session?.name ?? "—"}</span>
+            </div>
+            {s.session?.email && <div className="font-mono text-[12px] text-mute">{s.session.email}</div>}
+            <div>
+              <span className="text-mute">Role</span> <span className="font-medium text-ink">{s.accessRole}</span>
+            </div>
+          </div>
+          {/* three states, and they are not interchangeable: no session at all means the server
+              never authenticated this browser (the role chip is showing its Viewer fallback,
+              not a real role), while a session with no email is the break-glass token or a
+              workspace that has no accounts yet — neither has a stored password to rotate */}
+          {!s.session ? (
+            <div className="text-[12.5px] text-mute">
+              This browser is not signed in — the server did not authenticate it, so the role above is a
+              fallback rather than a role you hold. Reload the page and sign in, then reopen this dialog.
+            </div>
+          ) : s.session.email ? (
+            <ChangePassword onClose={() => setAccountOpen(false)} />
+          ) : (
+            <div className="text-[12.5px] text-mute">
+              {s.session.accountsConfigured
+                ? "You are signed in with the break-glass token, which has no stored account. Sign in as a workspace account to change its password."
+                : "This workspace has no accounts yet, so there is no password to change. Create one in Administration first."}
+            </div>
+          )}
+        </Modal>
+      )}
 
       {shortcutsOpen && (
         <Modal title="Keyboard shortcuts" onClose={() => setShortcutsOpen(false)} width={420}>

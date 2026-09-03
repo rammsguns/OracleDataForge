@@ -2,7 +2,9 @@ import express from "express";
 import compression from "compression";
 import fs from "node:fs";
 import path from "node:path";
-import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { isIPv4, isIPv6 } from "node:net";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -27,6 +29,21 @@ const CREDENTIALS_KEY = (() => {
   if (key.length !== 32) throw new Error("DATAFORGE_ENCRYPTION_KEY must be a base64-encoded 32-byte key.");
   return key;
 })();
+
+/**
+ * The names this server answers to, checked against every request's `Host` header.
+ *
+ * Loopback and the configured `HOST` are always in. Reaching the server by a DNS name —
+ * behind a reverse proxy, or through an internal hostname — needs that name listed here,
+ * comma-separated. An entry may carry a port to pin it; without one, any port matches, so
+ * a TLS terminator on 443 and the Vite dev proxy both work unconfigured.
+ */
+const ALLOWED_HOSTS = new Set(
+  ["localhost", "127.0.0.1", "::1", "[::1]", HOST.toLowerCase()]
+    .concat(HOST.includes(":") ? [`[${HOST.toLowerCase()}]`] : [])
+    .concat((process.env.DATAFORGE_ALLOWED_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()))
+    .filter(Boolean)
+);
 
 if (!IS_LOOPBACK && !AUTH_TOKEN) throw new Error("DATAFORGE_AUTH_TOKEN is required when HOST is not loopback.");
 if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required when HOST is not loopback.");
@@ -165,10 +182,90 @@ const users = new Map<string, StoredUser>(); // keyed by lowercase email
 function hashPassword(password: string, salt: Buffer = randomBytes(16)) {
   return { salt: salt.toString("base64"), hash: scryptSync(password, salt, 64).toString("base64") };
 }
-function verifyPassword(password: string, salt: string, hash: string): boolean {
-  const candidate = scryptSync(password, Buffer.from(salt, "base64"), 64);
+const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, keylen: number) => Promise<Buffer>;
+
+/**
+ * `hashPassword`'s async twin, off the event loop for the same reason `verifyPassword` is:
+ * `POST /api/session/password` calls this on every request from any authenticated account,
+ * so a synchronous derivation there is a self-service event-loop DoS, not just a slow path.
+ */
+async function hashPasswordAsync(password: string, salt: Buffer = randomBytes(16)) {
+  const hash = await scryptAsync(password, salt, 64);
+  return { salt: salt.toString("base64"), hash: hash.toString("base64") };
+}
+
+/**
+ * Deliberately expensive, so it must not run on the event loop. HTTP Basic replays the
+ * credential on *every* request — each API call and each static asset — and the derivation
+ * runs for a wrong password just as long as for a right one. Synchronously that blocked the
+ * process for tens of milliseconds at a time and handed anyone who knew one account email a
+ * denial of service; on the thread pool a burst no longer stalls unrelated requests.
+ */
+async function verifyPassword(password: string, salt: string, hash: string): Promise<boolean> {
+  const candidate = await scryptAsync(password, Buffer.from(salt, "base64"), 64);
   const stored = Buffer.from(hash, "base64");
   return candidate.length === stored.length && timingSafeEqual(candidate, stored);
+}
+
+/**
+ * Verified credentials, keyed by a SHA-256 of the raw `Authorization` header, so a page load
+ * costs one derivation instead of one per request. Only successful verifications are stored,
+ * which bounds the map by the number of real accounts; `AUTH_CACHE_MAX` guards the rest.
+ *
+ * Entries are cheap to throw away, and `saveUsers` throws all of them away: a password
+ * change, a suspension or a deletion takes effect on the very next request rather than
+ * whenever the TTL happens to lapse.
+ */
+const AUTH_CACHE_TTL_MS = 5 * 60_000;
+const AUTH_CACHE_MAX = 500;
+/** `email: null` marks the break-glass token, which has no stored account. */
+const authCache = new Map<string, { email: string | null; expires: number }>();
+function rememberAuth(key: string, email: string | null) {
+  if (authCache.size >= AUTH_CACHE_MAX) authCache.clear();
+  authCache.set(key, { email, expires: Date.now() + AUTH_CACHE_TTL_MS });
+}
+
+/**
+ * Per-address failure counter. The cache above only helps credentials that are *correct*;
+ * guesses still reach scrypt, and there is no lockout anywhere else. Ten failures inside a
+ * minute buy a minute of 429s from that address, during which no derivation runs at all —
+ * which is the point, since the cost is the attack.
+ */
+const AUTH_FAILURE_LIMIT = 10;
+const AUTH_FAILURE_WINDOW_MS = 60_000;
+const AUTH_COOLDOWN_MS = 60_000;
+const AUTH_FAILURE_MAX_TRACKED = 1000;
+const authFailures = new Map<string, { count: number; since: number; until: number }>();
+function authCooldownRemaining(ip: string): number {
+  return Math.max(0, (authFailures.get(ip)?.until ?? 0) - Date.now());
+}
+function recordAuthFailure(ip: string) {
+  const now = Date.now();
+  if (authFailures.size >= AUTH_FAILURE_MAX_TRACKED && !authFailures.has(ip)) {
+    for (const [addr, e] of authFailures) {
+      if (e.until <= now && now - e.since > AUTH_FAILURE_WINDOW_MS) authFailures.delete(addr);
+    }
+    // The sweep above only catches entries that have already expired. With enough distinct
+    // addresses still active inside their window, that leaves nothing to reclaim and the map
+    // would grow without bound — so once it's still full, evict the oldest tracked addresses
+    // until it isn't. `Map` preserves insertion order, so the first key is the oldest.
+    while (authFailures.size >= AUTH_FAILURE_MAX_TRACKED) {
+      const oldest = authFailures.keys().next().value;
+      if (oldest === undefined) break;
+      authFailures.delete(oldest);
+    }
+  }
+  const entry = authFailures.get(ip);
+  if (!entry || now - entry.since > AUTH_FAILURE_WINDOW_MS) {
+    authFailures.set(ip, { count: 1, since: now, until: 0 });
+    return;
+  }
+  entry.count += 1;
+  if (entry.count >= AUTH_FAILURE_LIMIT) {
+    entry.until = now + AUTH_COOLDOWN_MS;
+    entry.count = 0;
+    entry.since = now;
+  }
 }
 
 function loadUsers() {
@@ -180,6 +277,7 @@ function loadUsers() {
   }
 }
 function saveUsers() {
+  authCache.clear(); // a changed, suspended or deleted account must not ride a cached verification
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(USERS_FILE, JSON.stringify([...users.values()], null, 2), { mode: 0o600 });
@@ -3336,6 +3434,88 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
 const app = express();
 
 /**
+ * `req.ip` reads the raw socket address unless Express is told otherwise — behind the
+ * TLS-terminating reverse proxy this app expects for anything beyond loopback (see
+ * docs/deployment.md), that address is the proxy's own. Every client sharing that proxy
+ * would then share one cooldown bucket in the auth throttle below: a single attacker, or
+ * one user mistyping their password, could 429 everyone else behind it. Trusting
+ * `X-Forwarded-For` unconditionally is its own hole — an untrusted client could forge the
+ * header and pin its failures on someone else's address — so this stays off unless
+ * `DATAFORGE_TRUST_PROXY` says how far to trust it (hop count, or a proxy/CIDR list; see
+ * https://expressjs.com/en/guide/behind-proxies.html for the accepted values).
+ */
+const TRUST_PROXY = process.env.DATAFORGE_TRUST_PROXY ?? "";
+if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
+
+/**
+ * Host guard — the first thing every request meets.
+ *
+ * The same-origin guard further down compares `Origin` against `Host`, and a browser fills
+ * both in from the URL the page was loaded from, so they always agree with each other. That
+ * makes the check self-satisfying under DNS rebinding: a page served from
+ * `attacker.example:3001`, whose DNS record is flipped to 127.0.0.1 once it has loaded, sends
+ * `Origin: http://attacker.example:3001` and `Host: attacker.example:3001`, matches itself,
+ * and reaches the API. On the default install — no token, no accounts — that is the whole
+ * API: the connection list, arbitrary SQL, and `POST /api/users` to plant an Administrator.
+ *
+ * Pinning the names this server answers to closes it. The attacker controls DNS, not which
+ * names appear in this allowlist. Literal IP addresses are accepted unconditionally because
+ * rebinding needs a *name* to re-point — a browser resolves nothing for `192.168.1.5` — so a
+ * LAN install reached by address keeps working with no extra configuration.
+ *
+ * It runs ahead of the auth middleware so it also covers the unauthenticated bootstrap
+ * state, which is exactly where the damage would be greatest.
+ */
+/**
+ * Real validation rather than a hand-rolled pattern: `net.isIP` is what Node itself uses to
+ * decide whether a string is an address, so it can't be fooled by something merely
+ * IP-*shaped* — a loose bracketed-hex-and-colons regex previously treated non-addresses like
+ * `[dead]` as a "literal IP" and let them through as one.
+ */
+function isIpLiteral(bare: string): boolean {
+  if (bare.startsWith("[") && bare.endsWith("]")) return isIPv6(bare.slice(1, -1));
+  return isIPv4(bare);
+}
+
+/**
+ * Strips a trailing `:<port>`, keeping a bracketed IPv6 literal intact — `null` for anything
+ * that isn't a well-formed authority. A bracketed host must end at its `]`, followed by
+ * nothing or exactly `:<port>`; trailing junk like `[::1]attacker.com` used to be truncated
+ * at the first `]` and silently accepted as `[::1]`, letting a Host this guard never actually
+ * validated ride through on another literal's name. A bare host is held to the same rule: a
+ * name followed by anything other than `:<port>` — `localhost:evil`, `127.0.0.1:3001:evil` —
+ * used to truncate at the first `:` and be accepted as the bare name instead of rejected.
+ */
+function stripPort(host: string): string | null {
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    if (end < 0) return null; // unterminated bracket
+    const rest = host.slice(end + 1);
+    if (rest !== "" && !/^:\d+$/.test(rest)) return null;
+    return host.slice(0, end + 1);
+  }
+  const colon = host.indexOf(":");
+  if (colon < 0) return host;
+  const rest = host.slice(colon);
+  if (!/^:\d+$/.test(rest)) return null;
+  return host.slice(0, colon);
+}
+function isAllowedHost(header: string | undefined): boolean {
+  if (!header) return false; // HTTP/1.1 requires Host; a request without one names nothing
+  const host = header.toLowerCase();
+  if (ALLOWED_HOSTS.has(host)) return true;
+  const bare = stripPort(host);
+  if (!bare) return false;
+  return ALLOWED_HOSTS.has(bare) || isIpLiteral(bare);
+}
+app.use((req, res, next) => {
+  if (isAllowedHost(req.headers.host)) return next();
+  return res.status(403).json({
+    error: "This server does not answer to that host name. Add it to DATAFORGE_ALLOWED_HOSTS if it is legitimate.",
+  });
+});
+
+/**
  * gzip the responses that are worth it. The built SPA is a single ~950 kB bundle that the
  * backend serves itself in production, and result payloads are JSON — both compress by
  * roughly 4-5x, which is the difference between a snappy first load and a visible one over
@@ -3359,35 +3539,99 @@ app.use(compression());
  * With no token and no accounts configured, the server stays exactly as open as before:
  * no prompt, full access, role "Administrator" for everyone. Browser requests retain the
  * header for same-origin API calls, so no application credential is stored in JS.
+ *
+ * Because Basic replays that credential on every request, a verified result is cached for a
+ * few minutes (`authCache`) and the derivation itself runs off the event loop; repeated
+ * failures from one address meet a cooldown before reaching scrypt at all. See
+ * `verifyPassword` for why that matters.
  */
 app.use((req, res, next) => {
   if (!AUTH_TOKEN && users.size === 0) {
     res.locals.role = "Administrator" as Role;
     return next();
   }
-  const encoded = req.headers.authorization?.match(/^Basic\s+(.+)$/i)?.[1];
+  const header = req.headers.authorization ?? "";
+  const encoded = header.match(/^Basic\s+(.+)$/i)?.[1];
   const decoded = encoded ? Buffer.from(encoded, "base64").toString("utf8") : "";
   const sep = decoded.indexOf(":");
   const username = sep >= 0 ? decoded.slice(0, sep) : "";
   const password = sep >= 0 ? decoded.slice(sep + 1) : "";
 
-  if (AUTH_TOKEN && username === "dataforge") {
-    const valid = password.length === AUTH_TOKEN.length && timingSafeEqual(Buffer.from(password), Buffer.from(AUTH_TOKEN));
-    if (valid) {
-      res.locals.role = "Administrator" as Role;
-      res.locals.userName = "dataforge (break-glass token)";
-      return next();
-    }
-  }
-  const user = users.get(username.toLowerCase());
-  if (user && user.status === "Active" && verifyPassword(password, user.salt, user.hash)) {
+  const admitToken = () => {
+    res.locals.role = "Administrator" as Role;
+    res.locals.userName = "dataforge (break-glass token)";
+    next();
+  };
+  const admitUser = (user: StoredUser) => {
     res.locals.role = user.role;
     res.locals.userEmail = user.email;
     res.locals.userName = user.name;
-    return next();
+    next();
+  };
+  const challenge = () => {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Oracle DataForge", charset="UTF-8"');
+    res.status(401).json({ error: "Authentication required." });
+  };
+
+  // A request carrying no credential is the *first half* of the Basic handshake, not a
+  // guess: the browser asks once with nothing, gets the challenge, and retries with the
+  // password. A page load opens several of those at once, so counting them would let an
+  // ordinary first visit trip the cooldown before anyone could type anything. Only a
+  // credential that was presented and rejected counts against the limit.
+  if (!encoded) return challenge();
+
+  // A credential verified earlier skips the derivation, but never the status check: an
+  // account suspended between requests stops here even if its entry is still warm.
+  const cacheKey = encoded ? createHash("sha256").update(header).digest("base64") : "";
+  if (cacheKey) {
+    const hit = authCache.get(cacheKey);
+    if (hit && hit.expires > Date.now()) {
+      if (hit.email === null) return admitToken();
+      const cached = users.get(hit.email);
+      if (cached && cached.status === "Active") return admitUser(cached);
+    }
+    if (hit) authCache.delete(cacheKey);
   }
-  res.setHeader("WWW-Authenticate", 'Basic realm="Oracle DataForge", charset="UTF-8"');
-  return res.status(401).json({ error: "Authentication required." });
+
+  const cooldown = authCooldownRemaining(req.ip ?? "");
+  if (cooldown > 0) {
+    res.setHeader("Retry-After", String(Math.ceil(cooldown / 1000)));
+    return res.status(429).json({ error: "Too many failed sign-in attempts. Try again shortly." });
+  }
+
+  if (AUTH_TOKEN && username === "dataforge") {
+    // Compared as UTF-8 bytes rather than JavaScript string length: timingSafeEqual throws
+    // on a length mismatch, so a multi-byte token used to surface as a 500, not a 401.
+    const supplied = Buffer.from(password, "utf8");
+    const expected = Buffer.from(AUTH_TOKEN, "utf8");
+    if (supplied.length === expected.length && timingSafeEqual(supplied, expected)) {
+      rememberAuth(cacheKey, null);
+      return admitToken();
+    }
+  }
+
+  const user = users.get(username.toLowerCase());
+  if (!user || user.status !== "Active") {
+    recordAuthFailure(req.ip ?? "");
+    return challenge();
+  }
+  const { salt, hash } = user;
+  verifyPassword(password, salt, hash).then((ok) => {
+    if (!ok) {
+      recordAuthFailure(req.ip ?? "");
+      return challenge();
+    }
+    // scrypt just spent real wall-clock time off the event loop. Re-fetch rather than
+    // trust the closed-over `user`: the account may have been suspended, or its password
+    // rotated, while the derivation was in flight, and admission must reflect that, not
+    // the credentials that were current when the request arrived.
+    const current = users.get(username.toLowerCase());
+    if (!current || current.status !== "Active" || current.salt !== salt || current.hash !== hash) {
+      return challenge();
+    }
+    rememberAuth(cacheKey, current.email);
+    admitUser(current);
+  }, next); // a rejected derivation reaches the error handler instead of hanging the request
 });
 
 /** Administrator/Developer only — everything that changes Oracle data, DDL, the connection
@@ -3448,6 +3692,43 @@ app.get("/api/session", (_req, res) => {
     name: (res.locals.userName as string | undefined) ?? null,
     accountsConfigured: users.size > 0,
   });
+});
+
+/**
+ * Change the signed-in account's own password. Deliberately not Administrator-gated: it only
+ * ever touches the account the request authenticated as, and the current password has to be
+ * presented again, so a session someone walked away from cannot be used to lock its owner out.
+ *
+ * Basic auth has no server-side session to re-issue, so the browser goes on sending the old
+ * credential and every later request 401s — the caller is told to sign in again, and the UI
+ * says so rather than leaving the app looking broken.
+ */
+app.post("/api/session/password", async (req, res) => {
+  const email = res.locals.userEmail as string | undefined;
+  const user = email ? users.get(email) : undefined;
+  if (!user) {
+    return res.status(400).json({
+      error: users.size === 0
+        ? "This workspace has no accounts yet, so there is no password to change. Create one in Administration first."
+        : "You are signed in with the break-glass token, which has no stored account. Sign in as a workspace account to change its password.",
+    });
+  }
+  const current = String(req.body?.currentPassword ?? "");
+  const next = String(req.body?.newPassword ?? "");
+  const { salt, hash } = user;
+  if (!(await verifyPassword(current, salt, hash))) return res.status(400).json({ error: "That is not your current password." });
+  if (next.length < 8) return res.status(400).json({ error: "The new password must be at least 8 characters." });
+  if (next === current) return res.status(400).json({ error: "The new password is the same as the current one." });
+  // scrypt just spent real wall-clock time off the event loop. Re-fetch rather than trust
+  // the closed-over `user`: it could have been suspended, or its password already changed
+  // by someone else, while the derivation was in flight.
+  const target = email ? users.get(email) : undefined;
+  if (!target || target.status !== "Active" || target.salt !== salt || target.hash !== hash) {
+    return res.status(409).json({ error: "Your account changed while this request was in flight. Sign in again and retry." });
+  }
+  Object.assign(target, await hashPasswordAsync(next));
+  saveUsers();
+  res.json({ ok: true, reauthenticate: true });
 });
 
 type CreateUserBody = { name?: unknown; email?: unknown; role?: unknown; mfa?: unknown; password?: unknown };

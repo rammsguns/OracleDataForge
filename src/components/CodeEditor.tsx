@@ -6,8 +6,9 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
-import { ArrowDown, ArrowUp, Replace, X } from "lucide-react";
+import { ArrowDown, ArrowUp, CaseSensitive, Highlighter, Regex, Replace, Search, WholeWord } from "lucide-react";
 import { tokenize } from "../utils/sql";
 import { useHighlightWindow } from "../utils/highlightWindow";
 
@@ -28,6 +29,8 @@ export interface CodeEditorHandle {
   /** Move the caret to a 1-based line/column, select to end of line and scroll it into view. */
   goTo: (line: number, col: number) => void;
   focus: () => void;
+  /** Open the find bar and focus its input — the toolbar Find button, and Ctrl+F from outside. */
+  openFind: (withReplace?: boolean) => void;
 }
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -54,15 +57,116 @@ const CodeEditor = forwardRef<
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const findRef = useRef<HTMLInputElement>(null);
-  const [fr, setFr] = useState({ open: false, withReplace: false, q: "", r: "" });
+  const [fr, setFr] = useState({
+    withReplace: false,
+    q: "",
+    r: "",
+    /** SQL Developer's Aa / "" / .* / highlight toggles */
+    matchCase: false,
+    wholeWord: false,
+    regex: false,
+    highlightAll: true,
+  });
+  /** Which match the caret is sitting on, so the bar can say "3 of 12" rather than just "12". */
+  const [activeIdx, setActiveIdx] = useState(-1);
 
   const lines = value.split("\n");
   const tokens = useMemo(() => tokenize(value), [value]);
   const { windowed, syncWindow } = useHighlightWindow(value, tokens, taRef, LINE_H);
-  const matchCount = useMemo(() => {
-    if (!fr.open || !fr.q) return 0;
-    return (value.toLowerCase().match(new RegExp(escapeRe(fr.q.toLowerCase()), "g")) ?? []).length;
-  }, [value, fr.open, fr.q]);
+  /**
+   * The search as one regular expression, so find, replace and the highlight layer can never
+   * disagree about what counts as a hit — they used to: replace-all was hard-coded to `gi`
+   * and ignored the search options entirely.
+   *
+   * A word boundary here is not \b: Oracle identifiers carry $ and # (`v$session`,
+   * `dbms_output#`), and \b would happily match inside one.
+   */
+  const search = useMemo((): { re: RegExp | null; error: boolean } => {
+    if (!fr.q) return { re: null, error: false };
+    try {
+      const body = fr.regex ? fr.q : escapeRe(fr.q);
+      // built by concatenation: \w inside a template literal collapses to a literal w
+      const src = fr.wholeWord ? "(?<![\\w$#])(?:" + body + ")(?![\\w$#])" : body;
+      return { re: new RegExp(src, fr.matchCase ? "g" : "gi"), error: false };
+    } catch {
+      return { re: null, error: true }; // half-typed regex — say so instead of finding nothing
+    }
+  }, [fr.q, fr.regex, fr.wholeWord, fr.matchCase]);
+
+  /** Every hit, in document order. Also what the highlight layer paints. */
+  const matches = useMemo(() => {
+    const re = search.re;
+    if (!re) return [] as { start: number; end: number }[];
+    const out: { start: number; end: number }[] = [];
+    re.lastIndex = 0;
+    for (let m = re.exec(value); m; m = re.exec(value)) {
+      out.push({ start: m.index, end: m.index + m[0].length });
+      if (m[0] === "") re.lastIndex++; // a pattern like `a*` matches empty — do not spin
+      if (out.length > 5000) break; // a runaway pattern must not take the editor down with it
+    }
+    return out;
+  }, [search, value]);
+
+  // the old position is meaningless once the query or the text changes
+  useEffect(() => setActiveIdx(-1), [search, value]);
+
+  const hits = fr.highlightAll ? matches : [];
+  const MATCH_CLS = "bg-warn/25 rounded-[2px]";
+  const ACTIVE_CLS = "bg-accent/45 rounded-[2px]";
+
+  /**
+   * Render the coloured token spans, cutting any token a hit runs through so the match can
+   * carry its own background. Splitting here rather than stacking a second overlay keeps one
+   * set of glyphs under the textarea — two layers would drift apart the moment either scrolls.
+   *
+   * `base` is the character offset of the first token, which is non-zero on a big source
+   * where only a window around the viewport is coloured.
+   */
+  const renderTokens = (toks: typeof tokens, base: number): ReactNode[] => {
+    const out: ReactNode[] = [];
+    let off = base;
+    let mi = 0;
+    toks.forEach((t, i) => {
+      const a = off;
+      const b = off + t.text.length;
+      off = b;
+      while (mi < hits.length && hits[mi].end <= a) mi++;
+      if (mi >= hits.length || hits[mi].start >= b) {
+        out.push(
+          <span key={i} className={CLS[t.cls]}>
+            {t.text}
+          </span>
+        );
+        return;
+      }
+      const parts: ReactNode[] = [];
+      let cursor = a;
+      let k = 0;
+      let j = mi;
+      while (cursor < b) {
+        const m = j < hits.length ? hits[j] : null;
+        if (!m || m.start >= b) {
+          parts.push(<span key={k++}>{value.slice(cursor, b)}</span>);
+          break;
+        }
+        if (m.start > cursor) parts.push(<span key={k++}>{value.slice(cursor, m.start)}</span>);
+        const end = Math.min(m.end, b);
+        parts.push(
+          <span key={k++} className={j === activeIdx ? ACTIVE_CLS : MATCH_CLS}>
+            {value.slice(Math.max(cursor, m.start), end)}
+          </span>
+        );
+        cursor = end;
+        if (m.end <= b) j++; // a hit running past this token stays current for the next one
+      }
+      out.push(
+        <span key={i} className={CLS[t.cls]}>
+          {parts}
+        </span>
+      );
+    });
+    return out;
+  };
 
   const syncScroll = () => {
     const ta = taRef.current;
@@ -106,40 +210,71 @@ const CodeEditor = forwardRef<
       selectRange(from, lineStart + lineText.length);
     },
     focus: () => taRef.current?.focus(),
+    openFind(withReplace = false) {
+      setFr((f) => ({ ...f, withReplace: withReplace && !readOnly }));
+      requestAnimationFrame(() => findRef.current?.select());
+    },
   }));
 
+  /** Step to the next/previous hit from wherever the caret is, wrapping at either end. */
   const doFind = (dir: 1 | -1) => {
-    const q = fr.q.toLowerCase();
     const ta = taRef.current;
-    if (!q || !ta) return;
-    const hay = value.toLowerCase();
-    let idx: number;
-    if (dir === 1) {
-      idx = hay.indexOf(q, ta.selectionEnd);
-      if (idx < 0) idx = hay.indexOf(q); // wrap
+    if (!ta || !matches.length) return;
+    let next: number;
+    if (activeIdx >= 0 && activeIdx < matches.length) {
+      // Already sitting on a hit — step by index rather than searching by position. A
+      // position search gets stuck on a zero-width match (e.g. from a lookahead like
+      // `(?=a)`): selecting one leaves selectionStart === selectionEnd === its own start,
+      // so ">= selectionEnd" / "<= selectionStart" finds that same match again instead of
+      // advancing, and "next" never moves.
+      next = (activeIdx + dir + matches.length) % matches.length;
     } else {
-      idx = hay.lastIndexOf(q, Math.max(0, ta.selectionStart - 1));
-      if (idx < 0) idx = hay.lastIndexOf(q); // wrap
+      const i =
+        dir === 1
+          ? matches.findIndex((m) => m.start >= ta.selectionEnd)
+          : (() => {
+              for (let k = matches.length - 1; k >= 0; k--) if (matches[k].end <= ta.selectionStart) return k;
+              return -1;
+            })();
+      next = i >= 0 ? i : dir === 1 ? 0 : matches.length - 1; // wrap
     }
-    if (idx >= 0) selectRange(idx, idx + q.length);
+    setActiveIdx(next);
+    selectRange(matches[next].start, matches[next].end);
+  };
+
+  /** Re-derive which hit the caret is on whenever the selection moves outside of `doFind`
+   *  (a click, an arrow key) so "3 of 12" keeps describing where the caret actually is. */
+  const syncActiveFromCaret = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const { selectionStart: s } = ta;
+    // Exclusive end bound: a caret sitting right after a hit (e.g. having arrowed past it)
+    // is not "on" it. `s === m.start` is kept alongside so a zero-width match (an empty
+    // regex hit, where start === end) still counts as active for a caret placed on it.
+    setActiveIdx(matches.findIndex((m) => s >= m.start && (s < m.end || s === m.start)));
   };
 
   const doReplace = () => {
     const ta = taRef.current;
-    if (!ta || !fr.q || readOnly) return;
+    if (!ta || !matches.length || readOnly) return;
     const { selectionStart: s, selectionEnd: e } = ta;
-    if (value.slice(s, e).toLowerCase() === fr.q.toLowerCase()) {
-      onChange(value.slice(0, s) + fr.r + value.slice(e));
-      requestAnimationFrame(() => {
-        ta.setSelectionRange(s + fr.r.length, s + fr.r.length);
-        doFind(1);
-      });
-    } else doFind(1);
+    // replace only when the selection *is* a hit; otherwise this click just moves to one
+    const hit = matches.find((m) => m.start === s && m.end === e);
+    if (!hit) return doFind(1);
+    onChange(value.slice(0, hit.start) + fr.r + value.slice(hit.end));
+    requestAnimationFrame(() => {
+      const caret = hit.start + fr.r.length;
+      ta.setSelectionRange(caret, caret);
+      doFind(1);
+    });
   };
 
   const doReplaceAll = () => {
-    if (!fr.q || readOnly) return;
-    onChange(value.replace(new RegExp(escapeRe(fr.q), "gi"), fr.r));
+    const re = search.re;
+    if (!re || readOnly) return;
+    re.lastIndex = 0;
+    // in regex mode $1 &c. in the replacement are the user's to use, exactly as SQL Developer
+    onChange(value.replace(re, fr.r));
   };
 
   const insertAt = (text: string, s: number, e: number, caret: number) => {
@@ -153,17 +288,13 @@ const CodeEditor = forwardRef<
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "h")) {
       e.preventDefault();
-      setFr((f) => ({ ...f, open: true, withReplace: e.key === "h" && !readOnly }));
+      setFr((f) => ({ ...f, withReplace: e.key === "h" && !readOnly }));
       requestAnimationFrame(() => findRef.current?.focus());
       return;
     }
     if (e.key === "F3") {
       e.preventDefault();
       doFind(e.shiftKey ? -1 : 1);
-      return;
-    }
-    if (e.key === "Escape" && fr.open) {
-      setFr((f) => ({ ...f, open: false }));
       return;
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === "Enter" || e.key === "s")) {
@@ -204,7 +335,104 @@ const CodeEditor = forwardRef<
   };
 
   return (
-    <div className="relative h-full flex bg-panel2 font-mono text-[13px] overflow-hidden">
+    <div className="h-full flex flex-col min-h-0 bg-panel2 font-mono text-[13px] overflow-hidden">
+      {/* Find & replace strip. Always on screen, the way SQL Developer keeps its search
+          visible, rather than a popover that only a keyboard shortcut could summon. */}
+      <div className="shrink-0 flex flex-col gap-1 px-2 py-1.5 border-b border-bdrsoft bg-panel font-sans">
+        <div className="flex items-center gap-1 flex-wrap">
+          <Search size={13} className="text-mute shrink-0" aria-hidden />
+          <input
+            ref={findRef}
+            value={fr.q}
+            onChange={(e) => setFr((f) => ({ ...f, q: e.target.value }))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                doFind(e.shiftKey ? -1 : 1);
+              }
+              // the strip does not close, so Escape just hands typing back to the code
+              if (e.key === "Escape") taRef.current?.focus();
+            }}
+            placeholder="Find…"
+            aria-label="Find text"
+            className="h-6.5 w-52 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
+          />
+          <span
+            className={`text-[10px] w-16 text-center tabular-nums ${search.error ? "text-err" : "text-mute"}`}
+            aria-live="polite"
+          >
+            {!fr.q
+              ? ""
+              : search.error
+                ? "bad regex"
+                : !matches.length
+                  ? "no results"
+                  : activeIdx < 0
+                    ? `${matches.length} results`
+                    : `${activeIdx + 1} of ${matches.length}`}
+          </span>
+          <button type="button" aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
+            <ArrowUp size={12} />
+          </button>
+          <button type="button" aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
+            <ArrowDown size={12} />
+          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              aria-label="Toggle replace"
+              aria-pressed={fr.withReplace}
+              title="Replace (Ctrl+H)"
+              className={`p-1 rounded hover:bg-panel3 ${fr.withReplace ? "bg-accentdim text-accenthi" : "text-mute hover:text-ink"}`}
+              onClick={() => setFr((f) => ({ ...f, withReplace: !f.withReplace }))}
+            >
+              <Replace size={12} />
+            </button>
+          )}
+          <span aria-hidden className="w-px h-4 bg-bdr mx-0.5" />
+          {(
+            [
+              ["matchCase", CaseSensitive, "Match case"],
+              ["wholeWord", WholeWord, "Whole word only"],
+              ["regex", Regex, "Use a regular expression"],
+              ["highlightAll", Highlighter, "Highlight every match"],
+            ] as const
+          ).map(([key, Icon, label]) => (
+            <button
+              key={key}
+              type="button"
+              aria-label={label}
+              aria-pressed={fr[key]}
+              title={label}
+              className={`p-1 rounded hover:bg-panel3 ${fr[key] ? "bg-accentdim text-accenthi" : "text-mute hover:text-ink"}`}
+              onClick={() => setFr((f) => ({ ...f, [key]: !f[key] }))}
+            >
+              <Icon size={12} />
+            </button>
+          ))}
+        </div>
+        {fr.withReplace && !readOnly && (
+          <div className="flex items-center gap-1">
+            <Replace size={13} className="text-mute shrink-0" aria-hidden />
+            <input
+              value={fr.r}
+              onChange={(e) => setFr((f) => ({ ...f, r: e.target.value }))}
+              onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), doReplace())}
+              placeholder="Replace with…"
+              aria-label="Replace with"
+              className="h-6.5 w-52 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
+            />
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
+              Replace
+            </button>
+            <button type="button" className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
+              All
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="relative flex-1 min-h-0 flex">
       {/* gutter */}
       <div
         ref={gutterRef}
@@ -232,19 +460,11 @@ const CodeEditor = forwardRef<
             {windowed ? (
               <>
                 {windowed.head}
-                {windowed.mid.map((t, i) => (
-                  <span key={i} className={CLS[t.cls]}>
-                    {t.text}
-                  </span>
-                ))}
+                {renderTokens(windowed.mid, windowed.head.length)}
                 {windowed.tail}
               </>
             ) : (
-              tokens.map((t, i) => (
-                <span key={i} className={CLS[t.cls]}>
-                  {t.text}
-                </span>
-              ))
+              renderTokens(tokens, 0)
             )}
             {"\n"}
           </code>
@@ -256,70 +476,14 @@ const CodeEditor = forwardRef<
           readOnly={readOnly}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onSelect={syncActiveFromCaret}
           onScroll={syncScroll}
           spellCheck={false}
           aria-label={ariaLabel ?? "Code editor"}
           className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-auto"
           style={sharedStyle}
         />
-
-        {/* find & replace bar */}
-        {fr.open && (
-          <div className="absolute top-1.5 right-3 z-20 flex flex-col gap-1 bg-panel border border-bdr rounded-lg shadow-xl p-1.5 df-fade font-sans">
-            <div className="flex items-center gap-1">
-              <input
-                ref={findRef}
-                value={fr.q}
-                onChange={(e) => setFr((f) => ({ ...f, q: e.target.value }))}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") { e.preventDefault(); doFind(e.shiftKey ? -1 : 1); }
-                  if (e.key === "Escape") { setFr((f) => ({ ...f, open: false })); taRef.current?.focus(); }
-                }}
-                placeholder="Find…"
-                aria-label="Find text"
-                className="h-6.5 w-40 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
-              />
-              <span className="text-[10px] text-mute w-10 text-center tabular-nums">{fr.q ? matchCount : ""}</span>
-              <button aria-label="Find previous (Shift+Enter)" title="Find previous" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(-1)}>
-                <ArrowUp size={12} />
-              </button>
-              <button aria-label="Find next (Enter)" title="Find next" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => doFind(1)}>
-                <ArrowDown size={12} />
-              </button>
-              {!readOnly && (
-                <button
-                  aria-label="Toggle replace"
-                  title="Replace (Ctrl+H)"
-                  className={`p-1 rounded hover:bg-panel3 ${fr.withReplace ? "text-accenthi" : "text-mute hover:text-ink"}`}
-                  onClick={() => setFr((f) => ({ ...f, withReplace: !f.withReplace }))}
-                >
-                  <Replace size={12} />
-                </button>
-              )}
-              <button aria-label="Close find bar" title="Close (Esc)" className="p-1 rounded text-mute hover:text-ink hover:bg-panel3" onClick={() => { setFr((f) => ({ ...f, open: false })); taRef.current?.focus(); }}>
-                <X size={12} />
-              </button>
-            </div>
-            {fr.withReplace && !readOnly && (
-              <div className="flex items-center gap-1">
-                <input
-                  value={fr.r}
-                  onChange={(e) => setFr((f) => ({ ...f, r: e.target.value }))}
-                  onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), doReplace())}
-                  placeholder="Replace with…"
-                  aria-label="Replace with"
-                  className="h-6.5 w-40 px-2 rounded bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
-                />
-                <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplace}>
-                  Replace
-                </button>
-                <button className="px-1.5 py-0.5 rounded text-[11px] text-soft hover:text-ink hover:bg-panel3" onClick={doReplaceAll}>
-                  All
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );
