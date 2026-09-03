@@ -110,7 +110,7 @@ lookup and 404.
 | Analysis | `dba`, `perf`, `deps`, `erd` |
 | Versions | `versions`, `versions/object`, `changelog` |
 | Jobs | `GET …/job-runs/:logId/output` |
-| GitHub sync | `POST /api/github/sync` — writes compiled PL/SQL to a configured repository |
+| GitHub sync | `POST /api/github/sync` — writes compiled PL/SQL to the repository pinned by `GITHUB_REPOSITORY` |
 
 `src/utils/api.ts` mirrors this one-to-one.
 
@@ -217,11 +217,13 @@ at 1000 entries.
   credential on every request, a verified result is cached briefly and the scrypt derivation
   runs off the event loop, with a per-address cooldown on repeated failures.
 - **Four roles enforced server-side** (Administrator, Developer, Analyst, Viewer) — see
-  [security.md](security.md#workspace-roles) for exactly what each can call.
+  [security.md](security.md#workspace-roles) for exactly what each can call, including the
+  per-route metadata gating beyond `/query` and `/explain`.
 - **A same-origin guard** rejects requests carrying a foreign `Origin`, allowing only this
   host and the dev origins. It replaced a wildcard CORS setup.
 - **Non-loopback binding throws at startup** unless both the auth token and encryption key are
-  present.
+  present. The same posture applies to GitHub sync: the server refuses to start with
+  `GITHUB_TOKEN` set and `GITHUB_REPOSITORY` unset.
 
 Details in [security.md](security.md).
 

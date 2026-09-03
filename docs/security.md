@@ -139,6 +139,36 @@ another account or used to take over an unattended session.
 > them. Analyst's ceiling is therefore the literal shape of that generated query; anything else,
 > including a harmless `SELECT COUNT(*)`, is refused.
 
+### Beyond `/query`: what the read tiers can browse
+
+The role check above governs SQL text. Every other `GET` route under
+`/api/connections/:id/*` needed its own gate, since none of it goes through
+`roleQueryDenial` — a role restricted to one preview statement in the worksheet was, until
+recently, unrestricted on the routes that list schema objects, read object source, or serve
+DBA dashboards.
+
+| Route | Analyst | Viewer | Administrator, Developer |
+| --- | --- | --- | --- |
+| `/schema`, `/schema/group`, `GET …/table/rows` | ✅ | ✅ | ✅ |
+| `/source`, `/routine`, `/table`, `/table/stats`, `/table/storage`, `/table/advisor`, `/deps`, `/erd`, `/compile/invalid` | ❌ | ✅ | ✅ |
+| `/dba`, `/perf`, `/versions`, `/versions/object`, `/changelog`, `/job-runs/:logId/output` | ❌ | ❌ | ✅ |
+
+The boundary is drawn at the same place `roleQueryDenial` already draws it: Viewer's
+worksheet access is *broader* than Analyst's, since arbitrary read-only SQL already reaches
+object source and dependent objects through `SELECT`, so gating these metadata routes at
+"not Analyst" tracks a limit that was already in force at the SQL layer rather than inventing
+a new one. The bottom tier — v$/DBA-view dashboards, scheduler job output, and the locally
+stored source-version history — stays Administrator/Developer regardless of role, since none
+of it is reachable through the worksheet's read-only classifier the same way.
+
+`POST /api/connections/test` — the one connection-test endpoint with no saved connection
+behind it, dialing whatever host and port the caller supplies — is Administrator/Developer
+only, since a read-tier role has no legitimate reason to probe a connection that doesn't
+exist yet. `POST /:id/test`, `/disconnect` and `/reconnect` stay open to every role: opening
+a session is how Analyst and Viewer reach anything at all, not a data or registry mutation,
+and gating them the same way broke basic browsing for those roles once already (see the
+changelog entry for that reversal).
+
 **Accounts** live in `data/users.json` — name, email (the Basic-auth username), role, an `mfa`
 flag, and a password hashed with `scrypt` (salted, not reversible; no plaintext password is
 ever stored, unlike the AES-256-GCM-*encrypted* Oracle credentials in `connections.json`, which
@@ -341,6 +371,28 @@ because recompiling something like `SYS.STANDARD` can leave the instance unusabl
 reachable from the worksheet, where the statement is explicit and passes through the write
 guard.
 
+## GitHub sync
+
+`POST /api/github/sync` writes compiled PL/SQL source to a repository using a server-side
+`GITHUB_TOKEN`, so the token — not the caller — decides what it can reach. Left unchecked,
+`repositoryUrl` and `branch` in the request body would be the only thing selecting the
+target: any Developer or Administrator could point a sync at any repository the token can
+reach, under a commit message that looks like a routine compile.
+
+`GITHUB_REPOSITORY` (`owner/repo`) pins that target. **The server refuses to start with
+`GITHUB_TOKEN` set and `GITHUB_REPOSITORY` unset** — the same "no half-configured exposed
+state" posture as the non-loopback `HOST` guards above. A sync whose parsed
+`repositoryUrl` doesn't match, compared case-insensitively, gets **403** before any GitHub
+call is made. An optional `GITHUB_BRANCH` pins the branch the same way; unset, any
+syntactically valid branch is accepted, so a workflow that syncs into feature branches keeps
+working.
+
+The client's repository/branch/path setting (`localStorage`, no server round trip until sync
+time) is unchanged by this — it still decides *what the UI displays and sends*, but no longer
+what the server *trusts*. A mismatch surfaces as the existing best-effort sync-failure toast
+("Compiled, but GitHub was not updated: …"), not a broken compile: the Oracle compile is
+authoritative and already committed before the sync call is even attempted.
+
 ## Known gaps, collected
 
 For anyone assessing this honestly, in rough order of practical significance:
@@ -356,9 +408,11 @@ For anyone assessing this honestly, in rough order of practical significance:
    guards cover the cross-site vector, but nothing else does. Rate limiting exists only on
    failed authentication; every other endpoint is uncapped.
 5. **Dev origins are allowed unconditionally**, including in production builds.
-6. **`POST /api/connections/test` dials an arbitrary caller-supplied host and port.** That is
-   what a database client does, but on a LAN deployment any token-holder gains outbound
-   connect and port-probe capability from the server.
+6. **`POST /api/connections/test` dials an arbitrary caller-supplied host and port**, which is
+   what a database client does — but on a LAN deployment, an Administrator or Developer still
+   gains outbound connect and port-probe capability from the server. Restricted to those two
+   roles (see [Beyond `/query`](#beyond-query-what-the-read-tiers-can-browse)); not a gap for
+   Analyst or Viewer, who are refused outright.
 7. **Workspace accounts have no MFA, no session expiry, and no audit trail.** The `mfa` flag is
    stored, not enforced; Basic auth credentials are valid indefinitely once set; and the
    Admin panel's "Recent activity" list is local to one browser, not a server-side log.
