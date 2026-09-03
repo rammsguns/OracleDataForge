@@ -5,6 +5,11 @@ import path from "node:path";
 import { isIPv4, isIPv6 } from "node:net";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import {
+  decryptExport,
+  encryptExport,
+  EXPORT_MIN_PASSPHRASE,
+} from "./connectionExport.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -4055,40 +4060,12 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
  *  - scrypt runs at a deliberately expensive cost so each of those guesses has to pay.
  *
  * The password is never sent to the browser in the clear on the way out either: the plaintext
- * exists only inside this handler, and what leaves is ciphertext.
+ * exists only inside `encryptExport` — connectionExport.ts, where the envelope format lives
+ * and where its tests are — and what leaves here is ciphertext.
  */
-const EXPORT_FORMAT = "oracle-dataforge-connections";
-const EXPORT_MIN_PASSPHRASE = 12;
-/** N=2^15, r=8 → ~32 MB and roughly 100 ms per guess. `maxmem` has to be raised with it:
- *  Node's 32 MB default sits just under the 128*N*r this needs, and scrypt throws rather
- *  than quietly running weaker parameters. */
-const EXPORT_KDF = { name: "scrypt", N: 32768, r: 8, p: 1, keylen: 32 } as const;
-const EXPORT_MAXMEM = 128 * EXPORT_KDF.N * EXPORT_KDF.r * 2;
-
-/** promisify(scrypt) with the options argument — the alias above is fixed at Node's defaults. */
-const scryptWithParams = promisify(scrypt) as unknown as (
-  password: string,
-  salt: Buffer,
-  keylen: number,
-  options: { N: number; r: number; p: number; maxmem: number }
-) => Promise<Buffer>;
-
 /** One connection as it appears inside the encrypted payload — the stored config minus the
  *  server-assigned id, which is a registry sequence number and means nothing elsewhere. */
 type ExportedConnection = ConnConfig;
-
-interface ConnectionExportFile {
-  format: typeof EXPORT_FORMAT;
-  version: 1;
-  exportedAt: string;
-  /** count of connections inside `data` — metadata, so the file can be identified unopened */
-  count: number;
-  cipher: "aes-256-gcm";
-  kdf: { name: "scrypt"; salt: string; N: number; r: number; p: number; keylen: number };
-  iv: string;
-  tag: string;
-  data: string;
-}
 
 /**
  * Export saved connections as one passphrase-encrypted JSON file.
@@ -4111,36 +4088,15 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
     ({ name, engine, host, port, user, password, database, readOnly }) => ({ name, engine, host, port, user, password, database, readOnly })
   );
 
-  const salt = randomBytes(16);
-  const key = await scryptWithParams(passphrase, salt, EXPORT_KDF.keylen, {
-    N: EXPORT_KDF.N, r: EXPORT_KDF.r, p: EXPORT_KDF.p, maxmem: EXPORT_MAXMEM,
-  });
-  try {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", key, iv);
-    const data = Buffer.concat([cipher.update(JSON.stringify(payload), "utf8"), cipher.final()]);
-    const file: ConnectionExportFile = {
-      format: EXPORT_FORMAT,
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      count: payload.length,
-      cipher: "aes-256-gcm",
-      kdf: { name: "scrypt", salt: salt.toString("base64"), N: EXPORT_KDF.N, r: EXPORT_KDF.r, p: EXPORT_KDF.p, keylen: EXPORT_KDF.keylen },
-      iv: iv.toString("base64"),
-      tag: cipher.getAuthTag().toString("base64"),
-      data: data.toString("base64"),
-    };
-    // Credentials leaving the machine is worth a line in the operator's console — the same
-    // reasoning as the failed-sign-in log above, and for the same lack of an audit trail.
-    console.log(
-      `Exported ${payload.length} saved connection(s) with passwords, passphrase-encrypted — requested by ${
-        (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
-      }`
-    );
-    res.json({ file, count: payload.length });
-  } finally {
-    key.fill(0); // the derived key has no reason to linger in the heap afterwards
-  }
+  const file = await encryptExport(payload, passphrase);
+  // Credentials leaving the machine is worth a line in the operator's console — the same
+  // reasoning as the failed-sign-in log above, and for the same lack of an audit trail.
+  console.log(
+    `Exported ${payload.length} saved connection(s) with passwords, passphrase-encrypted — requested by ${
+      (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
+    }`
+  );
+  res.json({ file, count: payload.length });
 });
 
 /* ---------------- Importing an encrypted export back ---------------------------------
@@ -4154,75 +4110,14 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
  * passphrase is therefore sent twice, which costs one extra scrypt derivation and keeps the
  * server free of any half-finished import state.
  *
- * Everything about the envelope is caller-supplied and therefore untrusted. The KDF
- * parameters especially: they have to be read from the file for an export made with different
- * ones to stay readable, but a file claiming N=2^30 would otherwise have this process
- * allocate gigabytes on demand. They are range-checked before anything is derived.
+ * Everything about the envelope is caller-supplied and therefore untrusted; `decryptExport`
+ * in connectionExport.ts is where that is dealt with, and where the tests live.
  */
-const IMPORT_MAX_ENTRIES = 500;
-/** scrypt cost bounds accepted from a file: wide enough for a re-tuned export, narrow enough
- *  that no file can dictate a multi-gigabyte allocation here. Exports today use N=2^15. */
-const IMPORT_KDF_LIMITS = { minN: 1 << 12, maxN: 1 << 20, maxR: 16, maxP: 4 } as const;
-
-/** base64 field of a bounded size, or null — every one of these comes from the uploaded file */
-const importB64 = (v: unknown, maxBytes: number): Buffer | null => {
-  if (typeof v !== "string" || !v || v.length > maxBytes * 2) return null;
-  const buf = Buffer.from(v, "base64");
-  return buf.length && buf.length <= maxBytes ? buf : null;
-};
-
-/** Decrypt an uploaded export file, or throw a message meant for the person who uploaded it. */
-async function decryptExportFile(raw: any, passphrase: string): Promise<ExportedConnection[]> {
-  if (!raw || typeof raw !== "object" || raw.format !== EXPORT_FORMAT) {
-    throw new Error("That file is not an Oracle DataForge connection export.");
-  }
-  if (raw.version !== 1) throw new Error(`This export is version ${String(raw.version)}, which this build cannot read.`);
-  if (raw.cipher !== "aes-256-gcm") throw new Error(`Unsupported cipher "${String(raw.cipher)}" in the export file.`);
-
-  const kdf = raw.kdf;
-  if (!kdf || kdf.name !== "scrypt") throw new Error("Unsupported key derivation in the export file.");
-  const { N, r, p, keylen } = kdf;
-  const powerOfTwo = Number.isInteger(N) && N > 1 && (N & (N - 1)) === 0;
-  const sane =
-    powerOfTwo && N >= IMPORT_KDF_LIMITS.minN && N <= IMPORT_KDF_LIMITS.maxN &&
-    Number.isInteger(r) && r >= 1 && r <= IMPORT_KDF_LIMITS.maxR &&
-    Number.isInteger(p) && p >= 1 && p <= IMPORT_KDF_LIMITS.maxP &&
-    keylen === 32;
-  if (!sane) throw new Error("The export file asks for key-derivation parameters outside the supported range.");
-
-  const salt = importB64(kdf.salt, 64);
-  const iv = importB64(raw.iv, 16);
-  const tag = importB64(raw.tag, 16);
-  const data = importB64(raw.data, 8 * 1024 * 1024);
-  if (!salt || !iv || !tag || !data) throw new Error("The export file is missing or has a malformed salt, IV, tag or payload.");
-
-  const key = await scryptWithParams(passphrase, salt, keylen, { N, r, p, maxmem: 128 * N * r * 2 });
-  let plain: string;
-  try {
-    const decipher = createDecipheriv("aes-256-gcm", key, iv);
-    decipher.setAuthTag(tag);
-    plain = Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
-  } catch {
-    // GCM cannot tell the two apart, and saying so is more honest than guessing: a wrong
-    // passphrase and an edited file both fail the same authentication tag.
-    throw new Error("Wrong passphrase, or the file has been altered since it was exported.");
-  } finally {
-    key.fill(0);
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(plain);
-  } catch {
-    throw new Error("The export decrypted, but its contents are not readable.");
-  }
-  if (!Array.isArray(parsed)) throw new Error("The export decrypted, but its contents are not a list of connections.");
-  if (parsed.length > IMPORT_MAX_ENTRIES) {
-    throw new Error(`That export holds ${parsed.length} connections, more than the ${IMPORT_MAX_ENTRIES} this import accepts.`);
-  }
-  // through pickConfig, so an entry from a later export carrying extra fields lands as the
-  // fields this build understands rather than going into the registry unexamined
-  return parsed.map((e) => pickConfig(e));
+/** Open an uploaded envelope and shape every entry the way a hand-typed connection is
+ *  shaped — so an entry from a later export carrying extra fields lands as the fields this
+ *  build understands rather than going into the registry unexamined. */
+async function decryptExportFile(raw: unknown, passphrase: string): Promise<ExportedConnection[]> {
+  return (await decryptExport(raw, passphrase)).map((e) => pickConfig(e));
 }
 
 /** What the browser is told about one entry in an uploaded file — deliberately no password. */

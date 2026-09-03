@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "test": "node --import tsx --test server/connectionExport.test.ts",
     "dev:server": "node --env-file-if-exists=.env.local --import tsx server/index.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.server.json",
     "build": "tsc -b && vite build",

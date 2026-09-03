@@ -201,6 +201,10 @@ port or a missing service name is rejected rather than saved.
 A wrong passphrase and an altered file both fail the GCM authentication tag, so the error says
 both — that is the honest answer, not a vague one.
 
+The envelope code lives in `server/connectionExport.ts`, apart from the rest of the backend so
+it can be tested directly: `npm test` covers the round trip, the rejection paths above, and
+the fact that no plaintext survives anywhere in a written file.
+
 ### Reading one by hand
 
 The import above is the easy path; the file is also readable without this app, which is what

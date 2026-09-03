@@ -92,9 +92,14 @@ The application is deliberately a lightweight core IDE, without the source repos
 
 ```bash
 npm run typecheck
+npm test
 npm run build
 curl http://127.0.0.1:3001/api/health
 ```
+
+`npm test` runs the connection-export crypto tests (Node's built-in test runner, no framework,
+no network or database needed). It is the only automated suite in the project; everything else
+is checked by hand.
 
 The health response is JSON with `ok: true` and the number of saved Oracle connections.
 

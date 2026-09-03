@@ -33,6 +33,13 @@ Dates are the date the change landed on `main`.
   derived, the payload is bounded and capped, and every entry is validated exactly like one
   typed into the connection wizard. [credentials.md](credentials.md#exporting-connections-to-an-encrypted-file)
   documents the format, the import rules, and how to decrypt a file by hand with Node.
+- **The project's first automated tests**, covering that export/import crypto: `npm test`,
+  21 cases on Node's built-in test runner with no new dependency and nothing to stand up.
+  They check the round trip (unicode passwords included), that a wrong passphrase or a single
+  flipped bit fails instead of returning something plausible, that no plaintext survives in a
+  written file, and that a hostile file cannot choose this process's scrypt parameters. To
+  make them possible the envelope moved to `server/connectionExport.ts` — the backend is now
+  one file plus one small pure module, rather than strictly one file.
 - **A permanent find strip in the PL/SQL editor, in SQL Developer's shape.** The object editor's
   search is now always on screen above the code rather than a popover only Ctrl+F could
   summon, and it carries the options SQL Developer offers: the **3 of 12** position of the

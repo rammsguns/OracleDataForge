@@ -1,23 +1,29 @@
 # Architecture
 
 Oracle DataForge is a two-process application: a React single-page frontend and an Express
-backend that owns every Oracle session. About 16,900 lines of TypeScript across `src/` and
+backend that owns every Oracle session. About 20,300 lines of TypeScript across `src/` and
 `server/`.
 
-The shape is deliberately flat. There is no router, no state-management library, no ORM, no
-service layer, and no test suite. The backend is a **single file**.
+The shape is deliberately flat. There is no router, no state-management library, no ORM and
+no service layer. The backend is **one file plus one module**: `server/index.ts` holds every
+route, and `server/connectionExport.ts` holds the encrypted-export envelope on its own —
+the one piece of backend logic that is pure enough to test without a server around it, and
+valuable enough to be worth testing. It is also the only thing the test suite covers; the
+rest of the backend is still verified by hand.
 
 ## Layout
 
 ```text
-index.html            SPA entry; mounts #root, loads src/main.tsx
-vite.config.ts        dev server, /api proxy, watch-ignore rules
-tsconfig.json         app config (src/)
-tsconfig.server.json  server config (server/)
-server/index.ts       the entire backend — 4,727 lines
-src/                  the entire frontend
-data/                 runtime state, gitignored
-dist/                 built SPA, served by the backend in production
+index.html                       SPA entry; mounts #root, loads src/main.tsx
+vite.config.ts                   dev server, /api proxy, watch-ignore rules
+tsconfig.json                    app config (src/)
+tsconfig.server.json             server config (server/)
+server/index.ts                  the backend: routes, registry, guards — 6,017 lines
+server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
+server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
+src/                             the entire frontend
+data/                            runtime state, gitignored
+dist/                            built SPA, served by the backend in production
 ```
 
 ## The two processes
