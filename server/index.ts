@@ -3460,12 +3460,29 @@ if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST
 const OCTET = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
 const IPV4_LITERAL = new RegExp(`^${OCTET}(\\.${OCTET}){3}$`);
 const IPV6_LITERAL = /^\[[0-9a-f:.]+\]$/;
+
+/**
+ * Strips a trailing `:<port>`, keeping a bracketed IPv6 literal intact — `null` for anything
+ * that isn't a well-formed authority. A bracketed host must end at its `]`, followed by
+ * nothing or exactly `:<port>`; trailing junk like `[::1]attacker.com` used to be truncated
+ * at the first `]` and silently accepted as `[::1]`, letting a Host this guard never actually
+ * validated ride through on another literal's name.
+ */
+function stripPort(host: string): string | null {
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    if (end < 0) return null; // unterminated bracket
+    const rest = host.slice(end + 1);
+    if (rest !== "" && !/^:\d+$/.test(rest)) return null;
+    return host.slice(0, end + 1);
+  }
+  return host.split(":")[0];
+}
 function isAllowedHost(header: string | undefined): boolean {
   if (!header) return false; // HTTP/1.1 requires Host; a request without one names nothing
   const host = header.toLowerCase();
   if (ALLOWED_HOSTS.has(host)) return true;
-  // Strip the port, keeping a bracketed IPv6 literal intact.
-  const bare = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+  const bare = stripPort(host);
   if (!bare) return false;
   return ALLOWED_HOSTS.has(bare) || IPV4_LITERAL.test(bare) || IPV6_LITERAL.test(bare);
 }
