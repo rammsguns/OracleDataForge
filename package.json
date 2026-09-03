@@ -40,5 +40,8 @@
     "esbuild@0.25.12": true,
     "esbuild@0.28.1": true,
     "oracledb@7.0.1": true
+  },
+  "overrides": {
+    "qs": "6.16.0"
   }
 }

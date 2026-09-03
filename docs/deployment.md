@@ -135,6 +135,9 @@ Node's `--env-file-if-exists`, so it is read automatically when present and igno
 | `DATAFORGE_ENCRYPTION_KEY` | unset | Required when `HOST` is not loopback. Base64, 32 bytes. |
 | `DATAFORGE_ALLOWED_HOSTS` | unset | Extra host names the server answers to, comma-separated. Only needed to reach it by DNS name. |
 | `DATAFORGE_TRUST_PROXY` | unset | How far to trust `X-Forwarded-For`. Only set behind a reverse proxy. |
+| `GITHUB_TOKEN` | unset | Optional. Enables `POST /api/github/sync`. |
+| `GITHUB_REPOSITORY` | unset | Required when `GITHUB_TOKEN` is set — `owner/repo`. Pins which repository the token may write to; the server refuses to start without it if the token is present. |
+| `GITHUB_BRANCH` | unset | Optional. Also pins the branch a sync may target. |
 
 `.env.local` is gitignored. Keep the two secrets out of source control and stable across
 restarts — changing the encryption key makes an existing registry unreadable.

@@ -51,6 +51,38 @@ Dates are the date the change landed on `main`.
 
 ### Security
 
+- **Fixed the four Medium findings from the 2026-09-02 security review.**
+  - `POST /api/connections/test` — the connection tester with no saved connection behind it,
+    dialing whatever host and port the caller supplies — now requires Administrator or
+    Developer. `POST /:id/test`, `/disconnect` and `/reconnect` stay open to every role on
+    purpose: gating them was tried once (PR #11) and reverted the same day because it broke
+    basic browsing for Analyst and Viewer, who need to open a session before any read can
+    happen. That reasoning still stands, so only the one route without that justification
+    changed.
+  - Every `GET /api/connections/:id/*` route that wasn't already covered by `/query`'s SQL
+    classifier now has its own role gate. Analyst is limited to `/schema`, `/schema/group`
+    and `GET .../table/rows`, matching the ceiling its denial message already promised.
+    Viewer additionally reaches object source, dependencies, ERD, table/routine design and
+    stats. Everything touching v$ views, scheduled-job output, or the local source-version
+    store — `/dba`, `/perf`, `/versions`, `/versions/object`, `/changelog`,
+    `/job-runs/:logId/output` — stays Administrator/Developer only.
+  - `POST /api/github/sync` now requires a `GITHUB_REPOSITORY` (`owner/repo`) whenever
+    `GITHUB_TOKEN` is set — the server refuses to start otherwise — and refuses any sync
+    whose repository (or, if `GITHUB_BRANCH` is also set, branch) doesn't match, with 403
+    before any GitHub API call. Previously the request body's `repositoryUrl` was the only
+    thing selecting the target, so any Developer or Administrator could point a sync at any
+    repository the token could reach. The client's repository setting is unchanged — it's a
+    display value now, and a mismatch surfaces through the existing best-effort sync-failure
+    toast rather than breaking the compile it rode in on.
+  - The three moderate `qs` advisories (reachable through Express's query-string parsing on
+    routes like `/schema/group`, `/deps`, `/source`) are resolved via an npm `overrides` entry
+    pinning `qs` to `6.16.0` — the version npm's own advisory data names as fixed for both.
+    `npm audit fix` was a no-op here: `qs@6.15.3` was already the newest version Express
+    4.22.2's dependency range permitted, and reaching `6.16.0` needed either the override or a
+    breaking major-version bump to Express, which was out of scope for a dependency patch.
+  See [security.md](security.md#beyond-query-what-the-read-tiers-can-browse),
+  [security.md](security.md#github-sync), and
+  [security-review-2026-09-02.md](security-review-2026-09-02.md) for the fixed writeups.
 - **A host guard closes a DNS-rebinding hole in the same-origin check.** The origin guard
   compared `Origin` against `Host`, and a browser fills both in from the same URL — so they
   always agreed, including for a page the operator never meant to trust. A site that

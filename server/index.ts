@@ -22,6 +22,28 @@ const IS_LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhos
 const AUTH_TOKEN = process.env.DATAFORGE_AUTH_TOKEN ?? "";
 /** Fine-grained token with Contents: Read and write permission for the configured repository. Never sent to the browser. */
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
+/**
+ * The one repository GITHUB_TOKEN may write to, "owner/repo" — required whenever the token
+ * is set. Without this, any Developer or Administrator could point a sync at any repository
+ * the token can reach, since `repositoryUrl` in the request body is otherwise just user
+ * input. The client's repository field becomes a display value once this is set: the server
+ * refuses any sync whose target doesn't match, rather than trusting what the request claims.
+ */
+const GITHUB_REPOSITORY = (() => {
+  const raw = (process.env.GITHUB_REPOSITORY ?? "").trim();
+  if (!raw) return null;
+  const match = raw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if (!match) throw new Error('GITHUB_REPOSITORY must be "owner/repo", e.g. rammsguns/PLSQL.');
+  return { owner: match[1], repo: match[2] };
+})();
+/** Optional: also pin the branch. Unset allows any syntactically valid branch, so a
+ *  workflow that syncs into feature branches keeps working without extra configuration. */
+const GITHUB_BRANCH = (process.env.GITHUB_BRANCH ?? "").trim() || null;
+if (GITHUB_TOKEN && !GITHUB_REPOSITORY) {
+  throw new Error(
+    "GITHUB_REPOSITORY is required when GITHUB_TOKEN is set, as \"owner/repo\" — it pins which repository the token may write to."
+  );
+}
 const CREDENTIALS_KEY = (() => {
   const encoded = process.env.DATAFORGE_ENCRYPTION_KEY;
   if (!encoded) return null;
@@ -3649,6 +3671,22 @@ function requireAdministrator(req: express.Request, res: express.Response, next:
 }
 
 /**
+ * Schema-metadata routes beyond the Data Browser's table view: object source, dependency
+ * graphs, ERD, table/routine designs and their stats, storage and advisor detail, and the
+ * invalid-object list. Everyone but Analyst may read them.
+ *
+ * Analyst's ceiling is the exact single-table preview statement (`roleQueryDenial`), which
+ * is *narrower* than what Viewer's arbitrary-SELECT access already reaches — Viewer can
+ * already `SELECT` a package's dependent objects or its stored source through the worksheet,
+ * so gating these routes at "not Analyst" rather than "Viewer and above spelled out" tracks
+ * the SQL-level boundary already in force, not a new one.
+ */
+function requireSchemaMetadataAccess(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (res.locals.role !== "Analyst") return next();
+  return res.status(403).json({ error: "Analyst access is limited to browsing table data." });
+}
+
+/**
  * Same-origin guard — the API has no authentication, so the browser's origin is the
  * only thing standing between it and any web page the user happens to have open.
  * `cors()` (wildcard `Access-Control-Allow-Origin: *`) actively removed that barrier:
@@ -3840,8 +3878,20 @@ app.post("/api/github/sync", requireFullAccess, async (req, res) => {
   const source = String(body.source ?? "");
   if (!repo || !object || !type || !branch || !source) return res.status(400).json({ error: "Repository URL, branch, object, type, and source are required." });
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || source.length > 4 * 1024 * 1024) return res.status(400).json({ error: "The branch or source content is invalid." });
+  // GITHUB_REPOSITORY is guaranteed non-null here — startup throws if GITHUB_TOKEN is set
+  // without it. The request's repositoryUrl is still parsed above (so a malformed value
+  // gets the normal 400), but it no longer decides where the write goes: the pinned
+  // owner/repo does, compared case-insensitively since GitHub's own routing is.
+  if (repo.owner.toLowerCase() !== GITHUB_REPOSITORY!.owner.toLowerCase() || repo.repo.toLowerCase() !== GITHUB_REPOSITORY!.repo.toLowerCase()) {
+    return res.status(403).json({
+      error: `This server only syncs to ${GITHUB_REPOSITORY!.owner}/${GITHUB_REPOSITORY!.repo}. Update the repository setting to match, or ask an operator to change GITHUB_REPOSITORY.`,
+    });
+  }
+  if (GITHUB_BRANCH && branch !== GITHUB_BRANCH) {
+    return res.status(403).json({ error: `This server only syncs to the "${GITHUB_BRANCH}" branch.` });
+  }
   const filePath = gitHubSourcePath(directory, object, type);
-  const apiPath = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/contents/${filePath.split("/").map(encodeURIComponent).join("/")}`;
+  const apiPath = `https://api.github.com/repos/${encodeURIComponent(GITHUB_REPOSITORY!.owner)}/${encodeURIComponent(GITHUB_REPOSITORY!.repo)}/contents/${filePath.split("/").map(encodeURIComponent).join("/")}`;
   const headers = { Accept: "application/vnd.github+json", Authorization: `Bearer ${GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Oracle-DataForge" };
   try {
     const existing = await fetch(`${apiPath}?ref=${encodeURIComponent(branch)}`, { headers });
@@ -3886,7 +3936,15 @@ app.get("/api/connections", (_req, res) => {
   res.json({ connections });
 });
 
-app.post("/api/connections/test", async (req, res) => {
+/**
+ * Dials whatever host and port the caller supplies, saved connection or not — the one probe
+ * endpoint with no existing registry entry behind it, so it is also the one a read-tier role
+ * has no legitimate reason to call: there is no connection to test *before* it exists. Full
+ * access only. `/:id/test`, `/disconnect` and `/reconnect` stay open to every role on
+ * purpose (see the comment above `sameEndpoint`, and PR #11): opening a session is how
+ * Analyst and Viewer reach anything at all, not a registry or data mutation.
+ */
+app.post("/api/connections/test", requireFullAccess, async (req, res) => {
   res.json(await runTest(pickConfig(req.body)));
 });
 
@@ -4009,7 +4067,7 @@ app.get("/api/connections/:id/schema/group", async (req, res) => {
   }
 });
 
-app.get("/api/connections/:id/dba", async (req, res) => {
+app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The DBA Performance Advisor is Oracle-only." });
@@ -4020,7 +4078,7 @@ app.get("/api/connections/:id/dba", async (req, res) => {
   }
 });
 
-app.get("/api/connections/:id/perf", async (req, res) => {
+app.get("/api/connections/:id/perf", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
@@ -4030,7 +4088,7 @@ app.get("/api/connections/:id/perf", async (req, res) => {
   }
 });
 
-app.get("/api/connections/:id/deps", async (req, res) => {
+app.get("/api/connections/:id/deps", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
@@ -4043,7 +4101,7 @@ app.get("/api/connections/:id/deps", async (req, res) => {
 });
 
 /** ER diagram model from the Oracle catalog: tables, columns, PK/FK flags, FK edges. */
-app.get("/api/connections/:id/erd", async (req, res) => {
+app.get("/api/connections/:id/erd", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
@@ -4555,7 +4613,7 @@ function readCompileScope(src: Record<string, unknown>): { ref: CompileScopeRef 
 
 /** Preflight: what would be compiled, and what cannot be. A read — never blocked, so the
  *  UI can disable its button with the real reason instead of guessing. */
-app.get("/api/connections/:id/compile/invalid", async (req, res) => {
+app.get("/api/connections/:id/compile/invalid", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const parsed = readCompileScope(req.query as Record<string, unknown>);
@@ -4667,7 +4725,7 @@ app.post("/api/connections/:id/compile/invalid", requireFullAccess, async (req, 
 });
 
 /** Real source/DDL of one object, for the Object Editor: ?name= */
-app.get("/api/connections/:id/source", async (req, res) => {
+app.get("/api/connections/:id/source", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
@@ -5228,7 +5286,7 @@ async function oraRoutineRunBlock(
 }
 
 /** Signature of a runnable routine (Oracle): ?name= — packages list their members. */
-app.get("/api/connections/:id/routine", async (req, res) => {
+app.get("/api/connections/:id/routine", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The routine runner currently supports Oracle connections only." });
@@ -5335,7 +5393,7 @@ app.post("/api/connections/:id/routine/run", requireFullAccess, async (req, res)
 });
 
 /** Live table metadata for the Table Designer: ?name= (Oracle only). */
-app.get("/api/connections/:id/table", async (req, res) => {
+app.get("/api/connections/:id/table", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
@@ -5459,7 +5517,7 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
 });
 
 /** Table + column + index statistics for the Statistics tab: ?name= (Oracle only). */
-app.get("/api/connections/:id/table/stats", async (req, res) => {
+app.get("/api/connections/:id/table/stats", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
@@ -5505,7 +5563,7 @@ app.post("/api/connections/:id/table/stats", requireFullAccess, async (req, res)
 });
 
 /** Table + index segment sizes, storage attributes, and available tablespaces: ?name= (Oracle only). */
-app.get("/api/connections/:id/table/storage", async (req, res) => {
+app.get("/api/connections/:id/table/storage", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
@@ -5565,7 +5623,7 @@ app.post("/api/connections/:id/table/storage", requireFullAccess, async (req, re
 });
 
 /** Read-only optimization findings for one table: ?name= (Oracle only). */
-app.get("/api/connections/:id/table/advisor", async (req, res) => {
+app.get("/api/connections/:id/table/advisor", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
@@ -5610,14 +5668,14 @@ app.post("/api/connections/:id/table/maintenance", requireFullAccess, async (req
 });
 
 /** Versioned code objects for this connection (summaries). */
-app.get("/api/connections/:id/versions", (req, res) => {
+app.get("/api/connections/:id/versions", requireFullAccess, (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   res.json(listVersionedObjects(c));
 });
 
 /** Full version history (with sources) for one object: ?name=&type= */
-app.get("/api/connections/:id/versions/object", (req, res) => {
+app.get("/api/connections/:id/versions/object", requireFullAccess, (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
@@ -5629,7 +5687,7 @@ app.get("/api/connections/:id/versions/object", (req, res) => {
 });
 
 /** Change log for this connection (newest first). */
-app.get("/api/connections/:id/changelog", (req, res) => {
+app.get("/api/connections/:id/changelog", requireFullAccess, (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const key = connKey(c);
@@ -5638,7 +5696,7 @@ app.get("/api/connections/:id/changelog", (req, res) => {
 });
 
 /** Full captured output for one DBMS_SCHEDULER run. Read-only by design. */
-app.get("/api/connections/:id/job-runs/:logId/output", async (req, res) => {
+app.get("/api/connections/:id/job-runs/:logId/output", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const logId = Number(req.params.logId);
