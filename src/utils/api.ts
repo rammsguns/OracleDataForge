@@ -629,6 +629,10 @@ export const api = {
   githubSync: (req: GitHubSyncRequest) => request<GitHubSyncResult>("/api/github/sync", req),
   /** The role the server will actually enforce for this browser — see SessionInfo. */
   session: () => request<SessionInfo>("/api/session"),
+  /** Change your own password. Any signed-in account may call it; Basic auth means the
+   *  browser keeps sending the old credential afterwards, so the caller must sign in again. */
+  changeOwnPassword: (currentPassword: string, newPassword: string) =>
+    request<{ ok: boolean; reauthenticate: boolean }>("/api/session/password", { currentPassword, newPassword }),
   users: () => request<{ users: WorkspaceUser[] }>("/api/users"),
   createUser: (input: WorkspaceUserInput) => request<{ user: WorkspaceUser }>("/api/users", input),
   updateUser: (id: string, input: WorkspaceUserInput & { status: "Active" | "Suspended" }) =>

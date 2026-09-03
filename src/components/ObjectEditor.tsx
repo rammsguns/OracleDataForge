@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, CircleAlert, FileCode2, Hammer, Lightbulb, Loader2, PenLine, Play } from "lucide-react";
+import { CheckCircle2, CircleAlert, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, Search } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, type ObjectSource } from "../utils/api";
 import CodeEditor, { type CodeEditorHandle } from "./CodeEditor";
 import { editKey, getEdits, setEdits } from "../utils/editBuffers";
 import { hintForError } from "../utils/plsqlHints";
-import { Btn, Badge, Spinner } from "./ui";
+import { Btn, Badge, Spinner, ToolbarSep } from "./ui";
 
 /** Oracle code types editable + compilable in place (BODY variants are reached via the SPEC/BODY toggle). */
 const EDITABLE = new Set(["PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE", "VIEW"]);
@@ -264,6 +264,62 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
     <div className="h-full flex flex-col min-h-0 df-fade">
       {/* toolbar */}
       <div className="flex items-center gap-2.5 px-4 py-2 border-b border-bdrsoft flex-wrap shrink-0">
+        {/* SQL Developer's editor toolbar: flat icon-only buttons leading the row, grouped by
+            a hairline. The action name lives in each title, which Btn reuses as the accessible
+            name — an icon-only button must never be added here without one. */}
+        <div className="flex items-center gap-0.5">
+          {/* the find bar answers Ctrl+F, but only once the editor has focus — give it a
+              visible way in, the way SQL Developer keeps its search strip on screen */}
+          <Btn variant="toolbar" onClick={() => editorRef.current?.openFind()} title="Find in this source (Ctrl+F)">
+            <Search size={15} />
+          </Btn>
+          <ToolbarSep />
+          {canWrite && !systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
+            <>
+              <Btn
+                variant="toolbar"
+                onClick={() => s.openTab("run", `${object} (Run)`, object)}
+                title={`Run ${object} with parameter values`}
+              >
+                <Play size={15} className="text-ok" />
+              </Btn>
+              {editable && <ToolbarSep />}
+            </>
+          )}
+          {editable && hasParts && hasBody && (
+            <Btn variant="toolbar" onClick={() => compile(["spec", "body"])} disabled={compiling} title="Compile specification, then body">
+              {compiling ? <Loader2 size={15} className="df-spin" /> : <Package size={15} />}
+            </Btn>
+          )}
+          {editable && (
+            <Btn
+              variant="toolbar"
+              onClick={() => compile([showingBody ? "body" : "spec"])}
+              disabled={compiling || !loaded}
+              title={
+                compiling
+                  ? "Compiling…"
+                  : `Save & compile the ${showingBody ? "body" : hasParts ? "specification" : "source"} (Ctrl+Enter)`
+              }
+            >
+              {compiling ? <Loader2 size={15} className="df-spin" /> : <Hammer size={15} className="text-accenthi" />}
+            </Btn>
+          )}
+          {!editable && loaded && text && (
+            <Btn
+              variant="toolbar"
+              title="Load this source into a worksheet to edit and run it"
+              onClick={() => {
+                s.setSql(text);
+                s.openTab("worksheet", "Worksheet 1");
+                s.toast("info", `${effType ?? "Object"} ${object} loaded — edit and run it (code objects are auto-versioned)`);
+              }}
+            >
+              <PenLine size={15} />
+            </Btn>
+          )}
+        </div>
+        <ToolbarSep />
         <FileCode2 size={16} className="text-accent" />
         <h2 className="font-mono font-semibold text-[14px]">{object}</h2>
         <Badge tone="accent">{effType ?? "…"}</Badge>
@@ -292,44 +348,6 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             })}
           </div>
         )}
-        <div className="ml-auto flex gap-1.5">
-          {canWrite && !systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
-            <Btn
-              variant="outline"
-              onClick={() => s.openTab("run", `${object} (Run)`, object)}
-              title={`Run ${object} with parameter values`}
-            >
-              <Play size={12} /> Run / Test
-            </Btn>
-          )}
-          {editable && hasParts && hasBody && (
-            <Btn variant="outline" onClick={() => compile(["spec", "body"])} disabled={compiling} title="Compile specification, then body">
-              {compiling ? <Loader2 size={12} className="df-spin" /> : <Hammer size={12} />} Compile All
-            </Btn>
-          )}
-          {editable && (
-            <Btn
-              variant="primary"
-              onClick={() => compile([showingBody ? "body" : "spec"])}
-              disabled={compiling || !loaded}
-              title={`Save & compile the ${showingBody ? "body" : hasParts ? "specification" : "source"} (Ctrl+Enter)`}
-            >
-              {compiling ? <Loader2 size={12} className="df-spin" /> : <Hammer size={12} />} {compiling ? "Compiling…" : "Compile"}
-            </Btn>
-          )}
-          {!editable && loaded && text && (
-            <Btn
-              variant="primary"
-              onClick={() => {
-                s.setSql(text);
-                s.openTab("worksheet", "Worksheet 1");
-                s.toast("info", `${effType ?? "Object"} ${object} loaded — edit and run it (code objects are auto-versioned)`);
-              }}
-            >
-              <PenLine size={12} /> Edit in worksheet
-            </Btn>
-          )}
-        </div>
       </div>
 
       {/* editor */}

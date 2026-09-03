@@ -13,7 +13,7 @@ export function Btn({
 }: {
   children: ReactNode;
   onClick?: () => void;
-  variant?: "primary" | "ghost" | "outline" | "danger";
+  variant?: "primary" | "ghost" | "outline" | "danger" | "toolbar";
   title?: string;
   disabled?: boolean;
   className?: string;
@@ -21,16 +21,22 @@ export function Btn({
 }) {
   const base =
     "inline-flex items-center gap-1.5 rounded-md px-2.5 h-7 text-[12px] font-medium transition-colors select-none disabled:opacity-40 disabled:pointer-events-none";
+  // SQL Developer's code-editor toolbar: square icon-only buttons carrying no chrome of their
+  // own until pointed at, so a row of them reads as one strip rather than a row of pills. The
+  // label lives in `title`, which also becomes the aria-label below — never omit it here.
+  const toolbarBase =
+    "inline-flex items-center justify-center rounded w-7 h-7 shrink-0 border border-transparent text-soft transition-colors select-none hover:bg-accentdim hover:text-accenthi hover:border-accent/40 disabled:opacity-40 disabled:pointer-events-none";
   const styles = {
     primary: "bg-accent text-white hover:bg-accenthi shadow-sm",
     ghost: "text-soft hover:text-ink hover:bg-panel3",
     outline: "border border-bdr text-soft hover:text-ink hover:border-accent/60 hover:bg-accentdim",
     danger: "bg-err/10 text-err border border-err/30 hover:bg-err/20",
+    toolbar: "",
   };
   return (
     <button
       type="button"
-      className={`${base} ${styles[variant]} ${className}`}
+      className={`${variant === "toolbar" ? toolbarBase : `${base} ${styles[variant]}`} ${className}`}
       onClick={onClick}
       title={title}
       aria-label={ariaLabel ?? title}
@@ -39,6 +45,11 @@ export function Btn({
       {children}
     </button>
   );
+}
+
+/** Hairline rule between groups of toolbar buttons, as SQL Developer separates its. */
+export function ToolbarSep() {
+  return <span aria-hidden className="w-px h-5 bg-bdr mx-0.5 shrink-0" />;
 }
 
 export function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "neutral" | "ok" | "warn" | "err" | "accent" }) {
