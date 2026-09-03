@@ -3455,7 +3455,10 @@ if (TRUST_PROXY) app.set("trust proxy", /^\d+$/.test(TRUST_PROXY) ? Number(TRUST
  * It runs ahead of the auth middleware so it also covers the unauthenticated bootstrap
  * state, which is exactly where the damage would be greatest.
  */
-const IPV4_LITERAL = /^\d{1,3}(\.\d{1,3}){3}$/;
+// Each octet 0-255, not just 1-3 digits: an out-of-range host like "999.999.999.999" is not
+// a real IP literal and must not be waved through as one.
+const OCTET = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
+const IPV4_LITERAL = new RegExp(`^${OCTET}(\\.${OCTET}){3}$`);
 const IPV6_LITERAL = /^\[[0-9a-f:.]+\]$/;
 function isAllowedHost(header: string | undefined): boolean {
   if (!header) return false; // HTTP/1.1 requires Host; a request without one names nothing
@@ -3673,10 +3676,18 @@ app.post("/api/session/password", async (req, res) => {
   }
   const current = String(req.body?.currentPassword ?? "");
   const next = String(req.body?.newPassword ?? "");
-  if (!(await verifyPassword(current, user.salt, user.hash))) return res.status(400).json({ error: "That is not your current password." });
+  const { salt, hash } = user;
+  if (!(await verifyPassword(current, salt, hash))) return res.status(400).json({ error: "That is not your current password." });
   if (next.length < 8) return res.status(400).json({ error: "The new password must be at least 8 characters." });
   if (next === current) return res.status(400).json({ error: "The new password is the same as the current one." });
-  Object.assign(user, hashPassword(next));
+  // scrypt just spent real wall-clock time off the event loop. Re-fetch rather than trust
+  // the closed-over `user`: it could have been suspended, or its password already changed
+  // by someone else, while the derivation was in flight.
+  const target = email ? users.get(email) : undefined;
+  if (!target || target.status !== "Active" || target.salt !== salt || target.hash !== hash) {
+    return res.status(409).json({ error: "Your account changed while this request was in flight. Sign in again and retry." });
+  }
+  Object.assign(target, hashPassword(next));
   saveUsers();
   res.json({ ok: true, reauthenticate: true });
 });
