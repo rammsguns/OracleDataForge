@@ -136,7 +136,17 @@ The driver is `oracledb` 7 in **Thin mode** — pure JavaScript, no Instant Clie
 `connectTimeout: 8`). The pool handle lives inside the registry entry, so pools are
 process-wide and per-connection. Every call site closes its connection in a `finally`.
 
-**`SYS` bypasses the pool entirely** and gets a standalone `SYSDBA` connection per use.
+**Role.** A connection carries the administrative privilege its sessions open with —
+SQL Developer's *Role* dropdown, and the same list: `default`, `SYSDBA`, `SYSOPER`,
+`SYSBACKUP`, `SYSDG`, `SYSKM`, `SYSASM`. Anything but `default` is passed to the driver as
+`privilege`. `SYS` is given `SYSDBA` even at `default`, because Oracle rejects any other
+privilege for it (ORA-28009); that fallback is also what keeps connections saved before the
+field existed working. The role describes the session rather than the destination, so it is
+deliberately *not* part of the endpoint identity that guards a stored password
+([credentials.md](credentials.md)) — changing it does not require retyping the password.
+
+**Privileged connections bypass the pool entirely** and get a standalone connection per use:
+`createPool` takes no `privilege`, so the session has to be opened directly.
 
 **Two ways to reach a database**, carried on the connection's `authMode`. A `basic`
 connection dials the `host:port/service` connect string. A `wallet` connection connects

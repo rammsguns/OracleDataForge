@@ -95,6 +95,18 @@ if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY 
  */
 type AuthMode = "basic" | "wallet";
 
+/**
+ * The administrative privilege a connection opens its sessions with — SQL Developer's "Role"
+ * dropdown, spelled the same way. `default` is an ordinary session; the others are the
+ * privileges Oracle authenticates through the password file rather than the data dictionary,
+ * and are the only way some accounts can connect at all (SYS, an RMAN backup account, an ASM
+ * instance). It describes the session, not the destination, so it is deliberately not part of
+ * the endpoint identity that guards a stored password.
+ */
+type ConnectionRole = "default" | "SYSDBA" | "SYSOPER" | "SYSBACKUP" | "SYSDG" | "SYSKM" | "SYSASM";
+
+const CONNECTION_ROLES: ConnectionRole[] = ["default", "SYSDBA", "SYSOPER", "SYSBACKUP", "SYSDG", "SYSKM", "SYSASM"];
+
 interface ConnConfig {
   name: string;
   engine: "oracle";
@@ -106,6 +118,8 @@ interface ConnConfig {
   database: string;
   readOnly: boolean; // when true, only read statements are allowed through this connection
   authMode: AuthMode;
+  /** the privilege every session on this connection is opened with; `default` for an ordinary one */
+  role: ConnectionRole;
   /** wallet mode: which uploaded wallet under `data/wallets/` this connection uses */
   walletId?: string;
   /** wallet mode: the password the wallet's PEM key is encrypted with. A credential, so it
@@ -158,10 +172,17 @@ function loadRegistry() {
     const stored = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as StoredConnection[] | EncryptedRegistry;
     if (Array.isArray(stored) && !IS_LOOPBACK) throw new Error("Plaintext connection storage is not allowed for LAN access. Configure DATAFORGE_ENCRYPTION_KEY and migrate the file.");
     const arr = Array.isArray(stored) ? stored : decryptRegistry(stored);
-    // `authMode` postdates the first registry format, and an entry saved before it is a
-    // host/port connection — spelled out here rather than left undefined, so the identity
-    // checks that compare it (and therefore the stored-password rule) still match.
-    for (const c of arr) if (c.engine === "oracle") registry.set(c.id, { ...c, authMode: c.authMode === "wallet" ? "wallet" : "basic" });
+    // `authMode` and `role` postdate the first registry format. An entry saved before them is
+    // a host/port connection with no privilege — spelled out here rather than left undefined,
+    // so the identity checks that compare them (and therefore the stored-password rule) still
+    // match, and so `effectiveRole` sees a value of the type it is declared to hold.
+    for (const c of arr)
+      if (c.engine === "oracle")
+        registry.set(c.id, {
+          ...c,
+          authMode: c.authMode === "wallet" ? "wallet" : "basic",
+          role: CONNECTION_ROLES.includes(c.role) ? c.role : "default",
+        });
     seq = arr.reduce((m, c) => Math.max(m, Number(c.id.replace(/\D/g, "")) || 0), 0) + 1;
     if (arr.length) console.log(`Restored ${arr.length} saved connection(s) from ${DATA_FILE}`);
   } catch {
@@ -504,6 +525,10 @@ async function closePools(c: LiveConnection): Promise<boolean> {
 function pickConfig(body: any): ConnConfig {
   const authMode: AuthMode = body?.authMode === "wallet" ? "wallet" : "basic";
   const walletId = String(body?.walletId ?? "");
+  // Uppercased before the whitelist check so a hand-written export (or a connection saved
+  // by a future client) spelling it "sysdba" still lands on the privilege it means.
+  const asked = String(body?.role ?? "").trim().toUpperCase();
+  const role = CONNECTION_ROLES.find((r) => r.toUpperCase() === asked) ?? "default";
   return {
     name: String(body?.name ?? "").slice(0, 120),
     engine: "oracle",
@@ -516,6 +541,7 @@ function pickConfig(body: any): ConnConfig {
     // saying anything about writes is treated as the safest thing it could be
     readOnly: body?.readOnly !== false,
     authMode,
+    role,
     // The wallet fields are dropped outright in basic mode, so switching a connection back
     // to host/port cannot leave a stale wallet behind for `pruneWallets` to keep alive.
     ...(authMode === "wallet"
@@ -893,6 +919,31 @@ function oraWalletOptions(c: ConnConfig): oracledb.ConnectionAttributes {
 /** SYS can only connect AS SYSDBA (ORA-28009) — apply the privilege automatically, like SQL Developer does. */
 const isSysUser = (user: string) => user.trim().toLowerCase() === "sys";
 
+const ORA_PRIVILEGE: Record<Exclude<ConnectionRole, "default">, number> = {
+  SYSDBA: oracledb.SYSDBA,
+  SYSOPER: oracledb.SYSOPER,
+  SYSBACKUP: oracledb.SYSBACKUP,
+  SYSDG: oracledb.SYSDG,
+  SYSKM: oracledb.SYSKM,
+  SYSASM: oracledb.SYSASM,
+};
+
+/**
+ * The role a connection actually connects with. An explicit choice wins; otherwise SYS still
+ * gets SYSDBA on its own, which is both what SQL Developer does and what keeps connections
+ * saved before this field existed (they read back as `default`) working unchanged.
+ */
+function effectiveRole(c: ConnConfig): ConnectionRole {
+  if (c.role && c.role !== "default") return c.role;
+  return isSysUser(c.user) ? "SYSDBA" : "default";
+}
+
+/** The node-oracledb privilege for a connection's role, or undefined for an ordinary session. */
+function oraPrivilege(c: ConnConfig): number | undefined {
+  const role = effectiveRole(c);
+  return role === "default" ? undefined : ORA_PRIVILEGE[role];
+}
+
 async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
   if (!c.oraPool) {
     c.oraPool = await oracledb.createPool({
@@ -904,13 +955,17 @@ async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
   return c.oraPool;
 }
 
-/** SYS sessions bypass the pool: each query gets a standalone SYSDBA connection. */
+/**
+ * Privileged sessions bypass the pool: `createPool` takes no `privilege`, so a connection
+ * that has to be AS SYSDBA (or SYSOPER, SYSBACKUP…) is opened standalone for each query.
+ */
 async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
-  if (isSysUser(c.user)) {
+  const privilege = oraPrivilege(c);
+  if (privilege !== undefined) {
     return oracledb.getConnection({
       user: c.user, password: c.password, connectString: oraConnectString(c),
       ...oraWalletOptions(c),
-      privilege: oracledb.SYSDBA, connectTimeout: 8,
+      privilege, connectTimeout: 8,
     });
   }
   const pool = await getOraPool(c);
@@ -918,15 +973,18 @@ async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
 }
 
 async function oraTest(cfg: ConnConfig): Promise<string> {
+  const role = effectiveRole(cfg);
+  const privilege = oraPrivilege(cfg);
   const conn = await oracledb.getConnection({
     user: cfg.user, password: cfg.password, connectString: oraConnectString(cfg), connectTimeout: 8,
     ...oraWalletOptions(cfg),
-    ...(isSysUser(cfg.user) ? { privilege: oracledb.SYSDBA } : {}),
+    ...(privilege !== undefined ? { privilege } : {}),
   });
   await conn.execute("SELECT 1 FROM dual");
   const v = conn.oracleServerVersionString;
   await conn.close();
-  return `Oracle Database ${v}${isSysUser(cfg.user) ? " (as SYSDBA)" : ""}`;
+  // Naming the role back is how the user sees that SYS picked up SYSDBA without being asked.
+  return `Oracle Database ${v}${role === "default" ? "" : ` (as ${role})`}`;
 }
 
 /**
@@ -4367,10 +4425,10 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
   if (!chosen.length) return res.status(400).json({ error: "Select at least one connection to export." });
 
   const payload: ExportedConnection[] = (chosen as LiveConnection[]).map(
-    ({ name, engine, host, port, user, password, database, readOnly, authMode, walletId, walletPassword }) => {
+    ({ name, engine, host, port, user, password, database, readOnly, role, authMode, walletId, walletPassword }) => {
       const wallet = authMode === "wallet" && walletId ? readWallet(walletId) : null;
       return {
-        name, engine, host, port, user, password, database, readOnly, authMode,
+        name, engine, host, port, user, password, database, readOnly, role, authMode,
         ...(authMode === "wallet" ? { walletId, walletPassword, ...(wallet ? { wallet } : {}) } : {}),
       };
     }
@@ -4466,6 +4524,8 @@ interface ImportPreviewEntry {
   user: string;
   database: string;
   readOnly: boolean;
+  /** the privilege the entry connects with, so an `AS SYSDBA` import is visible before it lands */
+  role: ConnectionRole;
   /** `wallet` entries restore the Oracle Cloud wallet that came inside the file with them */
   authMode: AuthMode;
   /** why this entry cannot be imported, when it cannot */
@@ -4486,6 +4546,7 @@ function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
       user: cfg.user,
       database: cfg.database,
       readOnly: cfg.readOnly,
+      role: cfg.role,
       authMode: cfg.authMode,
       error: validateImport(cfg) ?? undefined,
       duplicateOfId: existing?.id,

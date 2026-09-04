@@ -326,6 +326,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
             user: s.user,
             database: s.database,
             readOnly: s.readOnly,
+            role: s.role,
             authMode: s.authMode,
             walletId: s.walletId,
             live: true,

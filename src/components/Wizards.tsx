@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, Server, ShieldAlert, XCircle } from "lucide-react";
 import { useStudio } from "../state/store";
-import { api, type AuthMode, type ImportPreview, type ImportRequest, type ImportResult, type WalletService } from "../utils/api";
+import { api, CONNECTION_ROLES, type AuthMode, type ConnectionRole, type ImportPreview, type ImportRequest, type ImportResult, type WalletService } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
 import { download } from "../utils/sql";
 import type { Engine } from "../types";
@@ -18,6 +18,9 @@ export function ConnectionWizard() {
   const [port, setPort] = useState(editing?.port ?? 1521);
   const [user, setUser] = useState(editing && editing.user !== "—" ? editing.user : "");
   const [password, setPassword] = useState("");
+  // SQL Developer's "Role": the privilege sessions open with. Not a credential — it changes
+  // what the same username is allowed to do once it is in.
+  const [role, setRole] = useState<ConnectionRole>(editing?.role ?? "default");
   // In wallet mode this holds the tnsnames.ora alias instead of a typed service name.
   const [database, setDatabase] = useState(editing?.database ?? "");
   // new connections start read-only: writing to a database you just pointed at should be
@@ -41,6 +44,9 @@ export function ConnectionWizard() {
   const [walletError, setWalletError] = useState("");
   const wallet = authMode === "wallet";
   const service = services.find((x) => x.alias === database);
+  // The backend gives SYS SYSDBA whether or not it was asked for (SYS cannot connect any
+  // other way), so the summary names the role the session will really open with.
+  const effectiveRole = role === "default" && user.trim().toLowerCase() === "sys" ? "SYSDBA" : role;
 
   // Editing a wallet connection: the alias list lives in the wallet on the server, so it is
   // read back rather than remembered in the browser. A wallet deleted underneath the
@@ -111,6 +117,7 @@ export function ConnectionWizard() {
     password,
     database: database.trim(),
     readOnly,
+    role,
     authMode,
     ...(wallet ? { walletId, walletPassword } : {}),
   });
@@ -144,6 +151,7 @@ export function ConnectionWizard() {
         user: user.trim() || "—",
         database: database.trim() || undefined,
         readOnly,
+        role,
         authMode,
         walletId: wallet ? walletId : undefined,
       };
@@ -175,6 +183,7 @@ export function ConnectionWizard() {
         live: true,
         database: database.trim(),
         readOnly,
+        role,
         authMode,
         walletId: wallet ? walletId : undefined,
       });
@@ -317,8 +326,8 @@ export function ConnectionWizard() {
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Username" hint="SYS connects automatically AS SYSDBA">
+          <div className="grid grid-cols-[1fr_1fr_118px] gap-3">
+            <Field label="Username">
               <input className={inputCls} value={user} onChange={(e) => setUser(e.target.value)} placeholder="SYSTEM" autoComplete="off" />
             </Field>
             {/* The saved password is only reused for the endpoint it was saved against — the
@@ -327,7 +336,32 @@ export function ConnectionWizard() {
             <Field label="Password" hint={editing?.live ? "Leave blank to keep the saved password — required again if you change the server, port or user" : undefined}>
               <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
             </Field>
+            {/* SQL Developer's Role dropdown, same list and same default. A tested connection
+                is no evidence for a different privilege, so changing it clears the result. */}
+            <Field label="Role">
+              <select
+                className={inputCls}
+                value={role}
+                onChange={(e) => {
+                  setRole(e.target.value as ConnectionRole);
+                  setTesting("idle");
+                  setTestMsg("");
+                }}
+              >
+                {CONNECTION_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+            </Field>
           </div>
+          <p className="text-[11px] text-mute -mt-1.5">
+            <b>Role</b> is the privilege each session is opened with — SYSDBA and SYSOPER are how an administrator
+            connects to a database that is only mounted or still starting, and SYSBACKUP, SYSDG, SYSKM and SYSASM are
+            the narrower equivalents for backup, Data Guard, key management and ASM. Left at{" "}
+            <span className="font-mono">default</span>, SYS still connects AS SYSDBA on its own.
+          </p>
           {wallet ? (
             walletNeedsPassword && (
               <Field
@@ -397,6 +431,11 @@ export function ConnectionWizard() {
               <span className="font-mono">{database}</span>
             </div>
             <div><span className="text-mute w-24 inline-block">User</span> <span className="font-mono">{user || "—"}</span></div>
+            <div>
+              <span className="text-mute w-24 inline-block">Role</span>{" "}
+              <span className="font-mono">{effectiveRole}</span>
+              {effectiveRole !== role && <span className="text-mute text-[11px] ml-1.5">automatic for SYS</span>}
+            </div>
             <div>
               <span className="text-mute w-24 inline-block">Access</span>{" "}
               {readOnly ? (
@@ -875,6 +914,7 @@ export function ExportConnectionsDialog() {
                       <span className="block text-[11px] text-mute font-mono truncate">
                         {c.host}:{c.port}
                         {c.database ? `/${c.database}` : ""} as {c.user}
+                        {c.role && c.role !== "default" ? ` · ${c.role}` : ""}
                         {c.readOnly ? " · read-only" : ""}
                         {/* the wallet travels inside the encrypted file, so the export is
                             usable on a machine that has never seen it */}
@@ -1091,6 +1131,7 @@ export function ImportConnectionsDialog() {
                         <span className="block text-[11px] text-mute font-mono truncate">
                           {e.host}:{e.port}
                           {e.database ? `/${e.database}` : ""} as {e.user}
+                          {e.role && e.role !== "default" ? ` · ${e.role}` : ""}
                           {e.readOnly ? " · read-only" : ""}
                           {e.authMode === "wallet" ? " · restores its wallet" : ""}
                         </span>

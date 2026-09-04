@@ -688,7 +688,7 @@ export default function Sidebar() {
                   }}
                   onKeyDown={(e) => e.key === "Enter" && s.setActiveConnId(c.id)}
                   className="flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 cursor-pointer"
-                  title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
+                  title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.role && c.role !== "default" ? ` AS ${c.role}` : ""}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
                 >
                   <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
                   <Database size={13} className="shrink-0" style={{ color: c.color }} />

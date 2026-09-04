@@ -1,5 +1,8 @@
 export type Engine = "oracle";
 
+/** The administrative privilege a connection connects with. See `CONNECTION_ROLES` in utils/api. */
+export type ConnectionRole = "default" | "SYSDBA" | "SYSOPER" | "SYSBACKUP" | "SYSDG" | "SYSKM" | "SYSASM";
+
 /** Workspace permissions. Authentication can supply this role in a production deployment. */
 export type AccessRole = "Administrator" | "Developer" | "Analyst" | "Viewer";
 
@@ -18,6 +21,8 @@ export interface Connection {
   database?: string;
   /** only read statements allowed (enforced by the backend for live connections) */
   readOnly?: boolean;
+  /** the Oracle privilege sessions are opened with — SQL Developer's "Role" ("default" = none) */
+  role?: ConnectionRole;
   /** "wallet" = mutual TLS to Oracle Cloud through an uploaded wallet, not a typed host */
   authMode?: "basic" | "wallet";
   /** wallet mode: the wallet on the backend this connection reads its endpoint from */
