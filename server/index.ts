@@ -19,6 +19,7 @@ import {
   type WalletFiles,
   type WalletService,
 } from "./oracleWallet.ts";
+import { effectiveRole, normalizeRole, oraPrivilege, type ConnectionRole } from "./connectionRole.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -95,18 +96,6 @@ if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY 
  */
 type AuthMode = "basic" | "wallet";
 
-/**
- * The administrative privilege a connection opens its sessions with — SQL Developer's "Role"
- * dropdown, spelled the same way. `default` is an ordinary session; the others are the
- * privileges Oracle authenticates through the password file rather than the data dictionary,
- * and are the only way some accounts can connect at all (SYS, an RMAN backup account, an ASM
- * instance). It describes the session, not the destination, so it is deliberately not part of
- * the endpoint identity that guards a stored password.
- */
-type ConnectionRole = "default" | "SYSDBA" | "SYSOPER" | "SYSBACKUP" | "SYSDG" | "SYSKM" | "SYSASM";
-
-const CONNECTION_ROLES: ConnectionRole[] = ["default", "SYSDBA", "SYSOPER", "SYSBACKUP", "SYSDG", "SYSKM", "SYSASM"];
-
 interface ConnConfig {
   name: string;
   engine: "oracle";
@@ -175,13 +164,13 @@ function loadRegistry() {
     // `authMode` and `role` postdate the first registry format. An entry saved before them is
     // a host/port connection with no privilege — spelled out here rather than left undefined,
     // so the identity checks that compare them (and therefore the stored-password rule) still
-    // match, and so `effectiveRole` sees a value of the type it is declared to hold.
+    // match, and so every reader sees a value of the type the field is declared to hold.
     for (const c of arr)
       if (c.engine === "oracle")
         registry.set(c.id, {
           ...c,
           authMode: c.authMode === "wallet" ? "wallet" : "basic",
-          role: CONNECTION_ROLES.includes(c.role) ? c.role : "default",
+          role: normalizeRole(c.role),
         });
     seq = arr.reduce((m, c) => Math.max(m, Number(c.id.replace(/\D/g, "")) || 0), 0) + 1;
     if (arr.length) console.log(`Restored ${arr.length} saved connection(s) from ${DATA_FILE}`);
@@ -525,10 +514,7 @@ async function closePools(c: LiveConnection): Promise<boolean> {
 function pickConfig(body: any): ConnConfig {
   const authMode: AuthMode = body?.authMode === "wallet" ? "wallet" : "basic";
   const walletId = String(body?.walletId ?? "");
-  // Uppercased before the whitelist check so a hand-written export (or a connection saved
-  // by a future client) spelling it "sysdba" still lands on the privilege it means.
-  const asked = String(body?.role ?? "").trim().toUpperCase();
-  const role = CONNECTION_ROLES.find((r) => r.toUpperCase() === asked) ?? "default";
+  const role = normalizeRole(body?.role);
   return {
     name: String(body?.name ?? "").slice(0, 120),
     engine: "oracle",
@@ -914,34 +900,6 @@ function oraWalletOptions(c: ConnConfig): oracledb.ConnectionAttributes {
   if (c.authMode !== "wallet" || !c.walletId) return {};
   const dir = walletPath(c.walletId);
   return { configDir: dir, walletLocation: dir, ...(c.walletPassword ? { walletPassword: c.walletPassword } : {}) };
-}
-
-/** SYS can only connect AS SYSDBA (ORA-28009) — apply the privilege automatically, like SQL Developer does. */
-const isSysUser = (user: string) => user.trim().toLowerCase() === "sys";
-
-const ORA_PRIVILEGE: Record<Exclude<ConnectionRole, "default">, number> = {
-  SYSDBA: oracledb.SYSDBA,
-  SYSOPER: oracledb.SYSOPER,
-  SYSBACKUP: oracledb.SYSBACKUP,
-  SYSDG: oracledb.SYSDG,
-  SYSKM: oracledb.SYSKM,
-  SYSASM: oracledb.SYSASM,
-};
-
-/**
- * The role a connection actually connects with. An explicit choice wins; otherwise SYS still
- * gets SYSDBA on its own, which is both what SQL Developer does and what keeps connections
- * saved before this field existed (they read back as `default`) working unchanged.
- */
-function effectiveRole(c: ConnConfig): ConnectionRole {
-  if (c.role && c.role !== "default") return c.role;
-  return isSysUser(c.user) ? "SYSDBA" : "default";
-}
-
-/** The node-oracledb privilege for a connection's role, or undefined for an ordinary session. */
-function oraPrivilege(c: ConnConfig): number | undefined {
-  const role = effectiveRole(c);
-  return role === "default" ? undefined : ORA_PRIVILEGE[role];
 }
 
 async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
