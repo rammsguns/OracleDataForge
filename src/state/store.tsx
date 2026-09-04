@@ -326,6 +326,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
             user: s.user,
             database: s.database,
             readOnly: s.readOnly,
+            authMode: s.authMode,
+            walletId: s.walletId,
             live: true,
             status: "idle" as const,
             // keep the colour this browser already showed, so the list doesn't reshuffle

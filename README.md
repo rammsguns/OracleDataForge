@@ -5,6 +5,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 ## Included Oracle features
 
 - Oracle connection registry, connection testing, reconnect, and disconnect
+- Connections to Oracle Autonomous Database with a downloaded Oracle Cloud wallet (mutual TLS, no Instant Client)
 - Searchable schema explorer backed by Oracle dictionary views
 - SQL worksheet with formatting, autocomplete, error lines, execution history, and saved snippets
 - Read-only-by-default connections and server-enforced confirmation for writes and destructive SQL
@@ -19,7 +20,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 - DBA advisor and performance monitor
 - Automatic local version history for code objects
 - CSV/JSON import and Oracle-to-Oracle migration assistant
-- Passphrase-encrypted export and import of saved connections (AES-256-GCM, scrypt)
+- Passphrase-encrypted export and import of saved connections, wallets included (AES-256-GCM, scrypt)
 - Dark/light themes and resizable Explorer
 
 There is no Copilot panel, AI endpoint, provider configuration, model SDK, alternate SQL dialect, or non-Oracle driver in this project.
@@ -30,7 +31,7 @@ There is no Copilot panel, AI endpoint, provider configuration, model SDK, alter
 - npm
 - A reachable Oracle Database service
 
-The backend uses `node-oracledb` in Thin mode, so Oracle Instant Client is not required for normal username/password connections. Nothing in the dependency tree compiles native code either, so there is no build toolchain, Python, or container runtime to install — Node and npm are the whole prerequisite list.
+The backend uses `node-oracledb` in Thin mode, so Oracle Instant Client is not required — neither for username/password connections nor for Oracle Cloud wallets, which Thin mode reads in their PEM form. Nothing in the dependency tree compiles native code either, so there is no build toolchain, Python, or container runtime to install — Node and npm are the whole prerequisite list.
 
 The application installs and starts without a database; it just has nothing to connect to until one is configured.
 
@@ -58,12 +59,22 @@ Recent npm versions block package install scripts until they are approved. `pack
 npm approve-scripts esbuild oracledb && npm rebuild
 ```
 
-Create a connection with:
+Create a connection either way the wizard offers.
+
+**Host and port** — a database you reach directly:
 
 - Host: Oracle server hostname or IP
 - Port: usually `1521`
 - Username and password
 - Service name: for example `FREEPDB1`
+
+**Oracle Cloud wallet** — an Autonomous Database, over mutual TLS:
+
+- Wallet zip: download it from Oracle Cloud (your Autonomous Database → **Database connection** → **Download wallet**) and upload it unchanged. Give it a wallet password when Oracle asks; an auto-login wallet has no `ewallet.pem` and cannot be used without Oracle Instant Client.
+- Database service: the wizard lists the services in the wallet's `tnsnames.ora` — `_high`, `_medium` and `_low` are the same database at different consumer groups.
+- Username, password, and the wallet password.
+
+The wallet is unpacked on the backend and never reaches the browser; the host, port and service come from the wallet rather than from the form. See [credentials.md](docs/credentials.md#oracle-cloud-wallets) for where the files land and what protects them.
 
 `SYS` connections are opened as `SYSDBA` automatically. New connections start in read-only mode; explicitly disable it when DDL, DML, compilation, imports, or routine execution are required.
 
@@ -82,7 +93,7 @@ The backend serves the built frontend when `dist/` exists and binds to `127.0.0.
 The application is deliberately a lightweight core IDE, without the source repository's tenant, vault, or audit control plane.
 
 - Database credentials never reach browser storage; the browser receives connection metadata only.
-- The backend stores saved credentials in `data/connections.json` so connections survive restarts.
+- The backend stores saved credentials in `data/connections.json` so connections survive restarts, and uploaded Oracle Cloud wallets in `data/wallets/`.
 - With `DATAFORGE_ENCRYPTION_KEY` configured, saved credentials are encrypted with AES-256-GCM. The key is optional on loopback, so **a default local install writes passwords to `data/connections.json` in clear text** — set the key before saving a connection whose password matters. Existing plaintext files must be migrated before LAN startup; keep `data/` private regardless.
 - LAN startup requires HTTP Basic authentication and an encryption key. Put TLS in front of the app before using it beyond a trusted network.
 - Read-only mode and confirmation guards reduce accidental writes; they are not a substitute for Oracle privileges.
@@ -97,9 +108,9 @@ npm run build
 curl http://127.0.0.1:3001/api/health
 ```
 
-`npm test` runs the connection-export crypto tests (Node's built-in test runner, no framework,
-no network or database needed). It is the only automated suite in the project; everything else
-is checked by hand.
+`npm test` runs the connection-export crypto tests and the Oracle Cloud wallet tests (Node's
+built-in test runner, no framework, no network or database needed). They are the only
+automated suites in the project; everything else is checked by hand.
 
 The health response is JSON with `ok: true` and the number of saved Oracle connections.
 

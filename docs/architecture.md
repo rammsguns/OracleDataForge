@@ -5,11 +5,12 @@ backend that owns every Oracle session. About 20,300 lines of TypeScript across 
 `server/`.
 
 The shape is deliberately flat. There is no router, no state-management library, no ORM and
-no service layer. The backend is **one file plus one module**: `server/index.ts` holds every
-route, and `server/connectionExport.ts` holds the encrypted-export envelope on its own —
-the one piece of backend logic that is pure enough to test without a server around it, and
-valuable enough to be worth testing. It is also the only thing the test suite covers; the
-rest of the backend is still verified by hand.
+no service layer. The backend is **one file plus two modules**: `server/index.ts` holds every
+route, while `server/connectionExport.ts` (the encrypted-export envelope) and
+`server/oracleWallet.ts` (reading an Oracle Cloud wallet zip and its `tnsnames.ora`) sit
+apart — the pieces of backend logic pure enough to test without a server around them, and
+the pieces whose input is a file someone uploaded. They are also all the test suite covers;
+the rest of the backend is still verified by hand.
 
 ## Layout
 
@@ -21,6 +22,8 @@ tsconfig.server.json             server config (server/)
 server/index.ts                  the backend: routes, registry, guards — 6,017 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
+server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
+server/oracleWallet.test.ts      its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
 dist/                            built SPA, served by the backend in production
@@ -105,6 +108,7 @@ lookup and 404.
 | Session | `GET /api/session` — the role the server authenticated this caller as; `POST /api/session/password` — change your own password (any role) |
 | Users | list, create, update, `:id/status`, delete — Administrator-only |
 | Connections | list, test, test-existing, create, update, delete, disconnect, reconnect; `POST /api/connections/export`, `POST /api/connections/import/preview`, `POST /api/connections/import` — passphrase-encrypted backup and restore of the saved connections (full access only) |
+| Wallets | `POST /api/wallets` — unpack an uploaded Oracle Cloud wallet zip and list the services in it; `GET /api/wallets/:id` — the services of one already stored (both full access only) |
 | Schema | `GET …/schema`, `GET …/schema/group?label=` |
 | Query | `POST …/query`, `POST …/explain` |
 | Compile | `POST …/compile`, `GET …/compile/invalid`, `POST …/compile/invalid` |
@@ -133,6 +137,16 @@ The driver is `oracledb` 7 in **Thin mode** — pure JavaScript, no Instant Clie
 process-wide and per-connection. Every call site closes its connection in a `finally`.
 
 **`SYS` bypasses the pool entirely** and gets a standalone `SYSDBA` connection per use.
+
+**Two ways to reach a database**, carried on the connection's `authMode`. A `basic`
+connection dials the `host:port/service` connect string. A `wallet` connection connects
+through an Oracle Cloud wallet instead: `database` holds a `tnsnames.ora` alias rather than a
+service name, and the driver is handed `configDir` (so the alias resolves) and
+`walletLocation` / `walletPassword` (so mutual TLS completes), all pointing at
+`data/wallets/<id>/`. Thin mode reads the PEM wallet, which is why the uploaded zip's
+`cwallet.sso` and `ewallet.p12` are discarded and its `ewallet.pem` is required. The host and
+port stored on a wallet connection are what its alias resolved to when it was saved — they
+are what the UI shows and what duplicate detection compares, never what is dialled.
 
 **The registry** is an in-memory `Map` persisted to `data/connections.json`, in one of two
 formats: a plain array, or an AES-256-GCM envelope. Plaintext is refused outright when `HOST`
