@@ -464,6 +464,97 @@ export interface CompileBatchResult {
   note?: string;
 }
 
+/**
+ * One kind of object a copy can move, as `server/objectCopy.ts` defines it.
+ *
+ * One kind per run. The names are the backend's whitelist, but nothing else about a kind is
+ * repeated here: its label, the note saying what it carries, and its counts all arrive on the
+ * plan (`ObjectCopyPlan.breakdown` covers every kind, chosen or not), so the two sides cannot
+ * drift into disagreeing about what a copy contains — and the next kind is a change to the
+ * server alone.
+ */
+export type CopyKind = "tables";
+
+/** What a copy does with an object the target already has. */
+export type CopyExisting = "skip" | "replace";
+
+export interface ObjectCopyKindSummary {
+  kind: CopyKind;
+  label: string;
+  /** what this kind carries with it, and what it leaves behind */
+  note: string;
+  selected: boolean;
+  total: number;
+  /** how many of them the target already has */
+  conflicts: number;
+}
+
+export interface ObjectCopyItem {
+  name: string;
+  existsInTarget: boolean;
+}
+
+export interface ObjectCopyPlan {
+  sourceId: string;
+  sourceName: string;
+  sourceSchema: string;
+  targetId: string;
+  targetName: string;
+  targetSchema: string;
+  /** the kind this plan was costed for — `breakdown` covers all of them regardless */
+  kind: CopyKind;
+  label: string;
+  breakdown: ObjectCopyKindSummary[];
+  items: ObjectCopyItem[];
+  total: number;
+  conflicts: number;
+  cap: number;
+  overCap: boolean;
+  targetReadOnly: boolean;
+  targetSystemSchema: boolean;
+  /** both connections resolve to the same schema on the same database */
+  sameSchema: boolean;
+  checkedAt: string;
+}
+
+export interface ObjectCopyObjectResult {
+  name: string;
+  status: "created" | "replaced" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+  statements: number;
+}
+
+/** One foreign key of a copied table, added once every table in the run existed. */
+export interface ObjectCopyFkResult {
+  table: string;
+  name: string;
+  status: "created" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+}
+
+export interface ObjectCopyResult {
+  sourceName: string;
+  sourceSchema: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  existing: CopyExisting;
+  objects: ObjectCopyObjectResult[];
+  foreignKeys: ObjectCopyFkResult[];
+  created: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  fksCreated: number;
+  fksFailed: number;
+  timedOut: boolean;
+  elapsedMs: number;
+  note?: string;
+}
+
 export interface ObjectSource {
   name: string;
   type: string | null;
@@ -784,6 +875,28 @@ export const api = {
     request<InvalidReport>(`/api/connections/${id}/compile/invalid?${compileScopeQuery(ref)}`),
   compileInvalid: (id: string, ref: CompileScopeRef, confirm = false) =>
     request<CompileBatchResult>(`/api/connections/${id}/compile/invalid`, { ...ref, confirm }),
+  /**
+   * What copying `sourceId`'s objects of one kind into `targetId` would do — a read of both
+   * dictionaries that changes neither. Addressed by the **target**, which is the connection
+   * about to be written to and therefore the one the server's guards are about.
+   */
+  objectCopyPlan: (targetId: string, sourceId: string, kind: CopyKind) =>
+    request<ObjectCopyPlan>(
+      `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
+    ),
+  /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */
+  objectCopy: (
+    targetId: string,
+    req: {
+      sourceId: string;
+      kind: CopyKind;
+      existing: CopyExisting;
+      /** the objects to copy; omitted (not empty) means every object of the kind */
+      names?: string[];
+      preserveTablespace: boolean;
+    },
+    confirm = false
+  ) => request<ObjectCopyResult>(`/api/connections/${targetId}/objects/copy`, { ...req, confirm }),
   versions: (id: string) => request<{ connKey: string; objects: VersionSummary[] }>(`/api/connections/${id}/versions`),
   versionsOf: (id: string, name: string, type: string) =>
     request<VersionFile>(`/api/connections/${id}/versions/object?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`),

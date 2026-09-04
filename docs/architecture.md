@@ -20,13 +20,15 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 6,017 lines
+server/index.ts                  the backend: routes, registry, guards — 6,918 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
+server/objectCopy.ts             object-copy kinds, name whitelist, transform params, statement prep
+server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
 dist/                            built SPA, served by the backend in production
@@ -175,6 +177,27 @@ reopen a pool for a connection the user set to idle.
 
 **Rows.** `MAX_ROWS` is 1000; the server fetches 1001 to detect truncation and flags it.
 Statements that return no result set produce a synthetic one-column "N row(s) affected".
+
+**Copying objects** is the only operation that holds two connections at once. Both endpoints
+(`GET`/`POST /api/connections/:id/objects/copy`) are addressed by the **target** — the
+connection being written to — so `requireFullAccess`, the read-only refusal, the
+Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
+set of rules; the source arrives as a parameter and is only ever read.
+
+One run copies one kind of object, so what it did is legible from the result rather than
+having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
+statements, and how DDL written for one schema is pointed at another live in
+`server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
+mistake that looks like a success — a qualifier left pointing at the source is a VALID object
+that reads the wrong database. So do the DBMS_METADATA transform parameters, including the two
+the tablespace choice moves together, and the whitelist that intersects the caller's chosen
+names with the source's own listing before any of them reaches `GET_DDL` or a `DROP`.
+`index.ts` keeps the Oracle half: the dictionary query that lists each kind, and the session
+that applies the parameters and runs the statements. The plan surveys every kind and marks the chosen
+one, so the browser renders the catalogue the server gave it rather than a copy that can drift,
+and adding the next kind — indexes — is an entry in `OBJECT_COPY_KINDS` and a listing query
+beside it. Unlike `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of
+independent objects, every one is attempted, and every outcome is reported.
 
 ## The write guard
 

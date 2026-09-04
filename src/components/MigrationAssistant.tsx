@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, Diff, GitCompareArrows, PencilLine, PlusCircle } from "lucide-react";
+import { ArrowRight, CheckCircle2, Copy, Diff, GitCompareArrows, PencilLine, PlusCircle } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { compareTables, type TableComparison } from "../utils/tableCompare";
 import { tokenize } from "../utils/sql";
+import ObjectCopy from "./ObjectCopy";
 import { Btn, Badge, Spinner } from "./ui";
 
 const CLS: Record<string, string> = {
@@ -16,6 +17,17 @@ const MAX_TABLES = 250;
 /** Metadata fetches to run at once — matches the server's poolMax of 4 per connection,
  *  so this never queues more requests than the pool can serve at once. */
 const CONCURRENCY = 4;
+
+/**
+ * The two things you can do between a pair of connections.
+ *
+ * `compare` is the surgical one: what differs between these two schemas, table by table, as a
+ * script you read before it runs. `copy` is the wholesale one: put the source's objects of one
+ * type into the target, whether or not anything of that type is there yet. They share this tab,
+ * and its source and target pickers, because they are the same question at two different sizes
+ * and whoever wants one regularly wants the other.
+ */
+type Mode = "compare" | "copy";
 
 type TableStatus = "new" | "changed" | "same";
 interface TableResult {
@@ -47,6 +59,7 @@ export default function MigrationAssistant() {
   const s = useStudio();
   const oracleConns = useMemo(() => s.connections.filter((c) => c.engine === "oracle"), [s.connections]);
 
+  const [mode, setMode] = useState<Mode>("compare");
   const [sourceId, setSourceId] = useState(() => oracleConns[0]?.id ?? "");
   const [targetId, setTargetId] = useState(() => oracleConns[1]?.id ?? oracleConns[0]?.id ?? "");
   const [phase, setPhase] = useState<"setup" | "comparing" | "results">("setup");
@@ -157,15 +170,39 @@ export default function MigrationAssistant() {
 
   return (
     <div className="h-full overflow-y-auto p-4 df-fade">
-      <div className="flex items-center gap-2 mb-1">
+      <div className="flex items-center gap-2 mb-2">
         <GitCompareArrows size={16} className="text-accent" />
         <h2 className="text-[14px] font-semibold">Schema compare &amp; migration</h2>
       </div>
-      <p className="text-[11.5px] text-mute mb-4">
-        Compares every table in the source schema against the target and builds an ordered script that brings the target in line — Oracle connections, tables only (columns, indexes, constraints, comments).
-      </p>
 
-      {/* source/target picker */}
+      {/* what to do between the two connections */}
+      <div className="inline-flex rounded-md border border-bdr overflow-hidden mb-3" role="tablist" aria-label="Migration mode">
+        {([
+          { id: "compare", label: "Compare tables", icon: <Diff size={12} /> },
+          { id: "copy", label: "Copy objects", icon: <Copy size={12} /> },
+        ] as const).map((m) => (
+          <button
+            key={m.id}
+            role="tab"
+            aria-selected={mode === m.id}
+            onClick={() => setMode(m.id)}
+            className={`flex items-center gap-1.5 px-3 h-7 text-[12px] font-medium transition-colors ${
+              mode === m.id ? "bg-accent text-white" : "text-soft hover:text-ink hover:bg-panel3"
+            }`}
+          >
+            {m.icon}
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "compare" && (
+        <p className="text-[11.5px] text-mute mb-4">
+          Compares every table in the source schema against the target and builds an ordered script that brings the target in line — Oracle connections, tables only (columns, indexes, constraints, comments).
+        </p>
+      )}
+
+      {/* source/target picker — shared by both modes */}
       <div className="flex items-end gap-3 flex-wrap mb-4">
         <label className="block">
           <div className="text-[11px] font-semibold text-soft mb-1 uppercase tracking-wider">Source (reference)</div>
@@ -180,24 +217,34 @@ export default function MigrationAssistant() {
             {oracleConns.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         </label>
-        <Btn variant="primary" onClick={runCompare} className="mb-0.5" disabled={phase === "comparing" || sourceId === targetId} title={sourceId === targetId ? "Pick two different connections" : "Compare schemas"}>
-          <Diff size={13} /> Compare schemas
-        </Btn>
+        {mode === "compare" && (
+          <Btn variant="primary" onClick={runCompare} className="mb-0.5" disabled={phase === "comparing" || sourceId === targetId} title={sourceId === targetId ? "Pick two different connections" : "Compare schemas"}>
+            <Diff size={13} /> Compare schemas
+          </Btn>
+        )}
       </div>
 
-      {error && (
+      {sourceId === targetId && (
+        <div className="border border-warn/40 bg-warn/8 rounded-lg p-3 text-[12.5px] text-ink mb-4">
+          Source and target are the same connection — pick two different ones.
+        </div>
+      )}
+
+      {mode === "copy" && sourceId !== targetId && <ObjectCopy key={`${sourceId}>${targetId}`} sourceId={sourceId} targetId={targetId} />}
+
+      {mode === "compare" && error && (
         <div className="border border-err/40 bg-err/8 rounded-lg p-3 text-[12.5px] text-ink mb-4">
           <span className="text-err font-semibold">Compare failed:</span> {error}
         </div>
       )}
 
-      {phase === "comparing" && (
+      {mode === "compare" && phase === "comparing" && (
         <div className="py-16 flex justify-center">
           <Spinner label={`Comparing tables in ${sourceName} against ${targetName}…`} />
         </div>
       )}
 
-      {phase === "results" && outcome && (
+      {mode === "compare" && phase === "results" && outcome && (
         <div className="df-fade">
           {actionable.length === 0 ? (
             <div className="border border-ok/40 bg-ok/8 rounded-lg p-4 flex items-start gap-2.5">
@@ -276,7 +323,7 @@ export default function MigrationAssistant() {
         </div>
       )}
 
-      {phase === "setup" && !error && (
+      {mode === "compare" && phase === "setup" && !error && (
         <div className="border border-dashed border-bdr rounded-xl p-10 text-center text-mute text-[12.5px]">
           Pick a source and target Oracle connection, then run <b className="text-soft">Compare schemas</b> to see structural differences and generate an ordered migration script.
         </div>
