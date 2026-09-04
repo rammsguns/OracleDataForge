@@ -10,6 +10,23 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- **Choose the connection's role, the way SQL Developer does.** The connection wizard now has a
+  **Role** dropdown beside the username, offering the same list SQL Developer does — `default`,
+  `SYSDBA`, `SYSOPER`, `SYSBACKUP`, `SYSDG`, `SYSKM`, `SYSASM` — and every session the
+  connection opens is opened with that privilege. It is what lets an administrator reach a
+  database that is only mounted, and what lets a backup, Data Guard, key management or ASM
+  account connect at all, without granting any of them the unrestricted `SYSDBA` that used to be
+  the only privilege the app could ask for. `SYS` still gets `SYSDBA` on its own at `default`
+  (Oracle refuses anything else for it), so connections saved before this field existed keep
+  working unchanged, and the wizard's summary names the role the session will really open with.
+  The role is stored, exported and imported with the rest of the connection, shown in the
+  Explorer tooltip and in the export and import lists, and testing the connection reports the
+  role it connected as. Because a privileged session cannot come from a pool, a connection with
+  a role opens a standalone connection per request — the behaviour `SYS` already had, now
+  reached by the same code path for every role. It describes the session rather than the
+  destination, so it is deliberately not part of the endpoint identity guarding a stored
+  password: changing the role does not force the password to be retyped.
+
 - **Connect to Oracle Autonomous Database with an Oracle Cloud wallet.** The connection wizard
   now opens on a choice — **Host and port**, as before, or **Oracle Cloud wallet** — and the
   second one replaces the endpoint fields with the zip Oracle Cloud hands you. Upload it and

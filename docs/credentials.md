@@ -325,8 +325,12 @@ The server, port, user or engine changed — re-enter the password for the new d
 - **Use a distinct low-privilege Oracle account** where the work allows it. Read-only mode and
   the write guards reduce accidents, but they are application-level controls and are not a
   substitute for Oracle privileges.
-- **`SYS` connects as `SYSDBA` automatically.** Be deliberate about saving a `SYS` password at
-  all.
+- **`SYS` connects as `SYSDBA` automatically**, whatever the connection's role says. Be
+  deliberate about saving a `SYS` password at all.
+- **Pick the narrowest role that does the job.** `SYSDBA` is unrestricted and bypasses the
+  schema privileges the account otherwise has; `SYSBACKUP`, `SYSDG`, `SYSKM` and `SYSASM`
+  exist so backup, Data Guard, key management and ASM work does not need it. The role is saved
+  with the connection and travels inside an export like every other field.
 
 ## See also
 

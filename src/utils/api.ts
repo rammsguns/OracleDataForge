@@ -7,6 +7,16 @@
  */
 export type AuthMode = "basic" | "wallet";
 
+/**
+ * The Oracle administrative privilege a connection opens its sessions with — SQL Developer's
+ * "Role" dropdown. `default` is an ordinary session; the rest are password-file privileges,
+ * and are how accounts like SYS or an RMAN backup user connect at all.
+ */
+export type ConnectionRole = "default" | "SYSDBA" | "SYSOPER" | "SYSBACKUP" | "SYSDG" | "SYSKM" | "SYSASM";
+
+/** Every role the connection form offers, in SQL Developer's order. */
+export const CONNECTION_ROLES: ConnectionRole[] = ["default", "SYSDBA", "SYSOPER", "SYSBACKUP", "SYSDG", "SYSKM", "SYSASM"];
+
 export interface LiveConnConfig {
   name: string;
   engine: "oracle";
@@ -16,6 +26,7 @@ export interface LiveConnConfig {
   password: string;
   database: string;
   readOnly?: boolean;
+  role?: ConnectionRole;
   authMode?: AuthMode;
   /** wallet mode: the wallet uploaded through `uploadWallet` */
   walletId?: string;
@@ -33,6 +44,7 @@ export interface StoredConnection {
   user: string;
   database: string;
   readOnly: boolean;
+  role?: ConnectionRole;
   authMode?: AuthMode;
   walletId?: string;
 }
@@ -81,6 +93,8 @@ export interface ImportPreviewEntry {
   user: string;
   database: string;
   readOnly: boolean;
+  /** the privilege it connects with, so an `AS SYSDBA` import is visible before it lands */
+  role?: ConnectionRole;
   /** `wallet` entries bring the Oracle Cloud wallet with them, inside the encrypted file */
   authMode?: AuthMode;
   /** set when this entry cannot be imported at all (e.g. no service name) */
