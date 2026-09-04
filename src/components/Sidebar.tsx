@@ -211,6 +211,9 @@ const schemaCache: Record<string, LiveSchemaState> = {};
 /** the `schemaBump` the cache was filled at (the store starts at 0) */
 let cachedBump = 0;
 
+/** `connBusy` sentinel for an action that spans every connection rather than one */
+const ALL_BUSY = "*";
+
 export default function Sidebar() {
   const s = useStudio();
   const [search, setSearch] = useState("");
@@ -351,6 +354,22 @@ export default function Sidebar() {
     setConnBusy(id);
     void fn(id).finally(() => setConnBusy(null));
   };
+
+  /** connections whose session is open — what "Disconnect all" would close */
+  const openConns = s.connections.filter((c) => c.live && c.status !== "idle");
+  // a bulk action belongs to no single row, so ALL_BUSY marks every one of them busy
+  const disconnectAll = () => {
+    if (connBusy) return;
+    setConnBusy(ALL_BUSY);
+    void s.disconnectAll().finally(() => setConnBusy(null));
+  };
+  const askDisconnectAll = () =>
+    s.askConfirm({
+      title: openConns.length === 1 ? "Disconnect the open connection?" : `Disconnect all ${openConns.length} connections?`,
+      body: "Their pooled sessions are closed and the browsed schemas are dropped. The connections stay saved — reconnect to open them again.",
+      confirmLabel: "Disconnect all",
+      onConfirm: disconnectAll,
+    });
 
   // successful DDL or an edited connection bumps this counter — drop all cached schemas.
   // Compared against the module-level `cachedBump` rather than "> 0": this effect also runs on
@@ -556,51 +575,69 @@ export default function Sidebar() {
         >
           {connsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           Connections
-          {fullAccess && (
+          <span className="ml-auto flex items-center gap-0.5">
+            {fullAccess && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="Import connections from an encrypted file"
+                title="Import connections from an encrypted file"
+                className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  s.setImportConnsOpen(true);
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setImportConnsOpen(true))}
+              >
+                <FileUp size={13} />
+              </span>
+            )}
+            {fullAccess && exportableConns > 0 && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="Export connections to an encrypted file"
+                title="Export connections to an encrypted file"
+                className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  s.setExportConnsOpen(true);
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setExportConnsOpen(true))}
+              >
+                <FileLock2 size={13} />
+              </span>
+            )}
+            {openConns.length > 0 && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label={`Disconnect all ${openConns.length} open connections`}
+                title={`Disconnect all — closes the sessions of ${openConns.length} open connection${openConns.length === 1 ? "" : "s"} (they stay saved)`}
+                className="p-0.5 rounded hover:bg-panel3 hover:text-warn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  askDisconnectAll();
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), askDisconnectAll())}
+              >
+                <Unplug size={13} />
+              </span>
+            )}
             <span
               role="button"
               tabIndex={0}
-              aria-label="Import connections from an encrypted file"
-              title="Import connections from an encrypted file"
-              className="ml-auto p-0.5 rounded hover:bg-panel3 hover:text-accent"
-              onClick={(e) => {
-                e.stopPropagation();
-                s.setImportConnsOpen(true);
-              }}
-              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setImportConnsOpen(true))}
-            >
-              <FileUp size={13} />
-            </span>
-          )}
-          {fullAccess && exportableConns > 0 && (
-            <span
-              role="button"
-              tabIndex={0}
-              aria-label="Export connections to an encrypted file"
-              title="Export connections to an encrypted file"
+              aria-label="New connection"
+              title="New connection"
               className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
               onClick={(e) => {
                 e.stopPropagation();
-                s.setExportConnsOpen(true);
+                s.setWizardOpen(true);
               }}
-              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setExportConnsOpen(true))}
+              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setWizardOpen(true))}
             >
-              <FileLock2 size={13} />
+              <Plus size={13} />
             </span>
-          )}
-          <span
-            role="button"
-            tabIndex={0}
-            aria-label="New connection"
-            title="New connection"
-            className={`${fullAccess ? "" : "ml-auto "}p-0.5 rounded hover:bg-panel3 hover:text-accent`}
-            onClick={(e) => {
-              e.stopPropagation();
-              s.setWizardOpen(true);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setWizardOpen(true))}
-          >
-            <Plus size={13} />
           </span>
         </button>
         {connsOpen && s.connections.length === 0 && (
@@ -622,7 +659,7 @@ export default function Sidebar() {
               s.setWizardOpen(true);
             };
             const offline = c.status === "idle";
-            const busy = connBusy === c.id;
+            const busy = connBusy === c.id || connBusy === ALL_BUSY;
             const doReconnect = () => runConnAction(c.id, s.reconnectConn);
             const doDisconnect = () => runConnAction(c.id, s.disconnectConn);
             const askRemove = () =>
@@ -653,6 +690,9 @@ export default function Sidebar() {
                             ...(offline ? [] : [{ label: "Disconnect", action: doDisconnect }]),
                           ]
                         : [{ label: "Connect", action: () => s.setActiveConnId(c.id) }]),
+                      ...(openConns.length > 0
+                        ? [{ label: `Disconnect all (${openConns.length})`, action: askDisconnectAll }]
+                        : []),
                       // opens the tab; it previews what is broken and asks before compiling
                       ...(c.engine === "oracle" && c.live
                         ? [{
