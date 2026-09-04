@@ -51,6 +51,8 @@ interface Store {
   removeConnection: (id: string) => void;
   /** close the pooled sessions of a live connection (it stays saved) */
   disconnectConn: (id: string) => Promise<void>;
+  /** close the sessions of every connected connection in one pass */
+  disconnectAll: () => Promise<void>;
   /** close and re-open the sessions of a live connection, and make it the active one */
   reconnectConn: (id: string) => Promise<void>;
   /** connection being edited in the wizard, or null when creating a new one */
@@ -657,6 +659,32 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [setConnStatus, toast]
   );
 
+  // One pass over every open connection, with a single summary toast: disconnecting
+  // eight of them one by one would otherwise stack eight toasts on top of each other.
+  const disconnectAll = useCallback(async () => {
+    const open = connectionsRef.current.filter((c) => c.live && c.status !== "idle");
+    if (!open.length) {
+      toast("info", "No connected connections to disconnect");
+      return;
+    }
+    const failures = await Promise.all(
+      open.map(async (c) => {
+        try {
+          await api.disconnect(c.id);
+          setConnStatus(c.id, "idle");
+          return null;
+        } catch (e) {
+          return `"${c.name}": ${(e as Error).message}`;
+        }
+      })
+    );
+    setSchemaBump((b) => b + 1); // drop the cached catalogs of the closed sessions
+    const failed = failures.filter((f): f is string => f !== null);
+    const closed = open.length - failed.length;
+    if (failed.length) toast("error", `Disconnected ${closed} of ${open.length} — ${failed.join("; ")}`);
+    else toast("info", `Disconnected ${closed} connection${closed === 1 ? "" : "s"}`);
+  }, [setConnStatus, toast]);
+
   const reconnectConn = useCallback(
     async (id: string) => {
       const conn = connectionsRef.current.find((c) => c.id === id);
@@ -707,6 +735,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       updateConnection,
       removeConnection,
       disconnectConn,
+      disconnectAll,
       reconnectConn,
       editingConn,
       setEditingConn,
@@ -757,7 +786,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
