@@ -1,5 +1,12 @@
 /** Thin client for the local Oracle DataForge backend. */
 
+/**
+ * How a connection reaches Oracle: `basic` is host/port/service over TCP, `wallet` is an
+ * Oracle Cloud wallet (mutual TLS to Autonomous Database), where the endpoint comes from
+ * the wallet's tnsnames.ora and `database` names the service alias inside it.
+ */
+export type AuthMode = "basic" | "wallet";
+
 export interface LiveConnConfig {
   name: string;
   engine: "oracle";
@@ -9,6 +16,11 @@ export interface LiveConnConfig {
   password: string;
   database: string;
   readOnly?: boolean;
+  authMode?: AuthMode;
+  /** wallet mode: the wallet uploaded through `uploadWallet` */
+  walletId?: string;
+  /** wallet mode: the password its PEM key is encrypted with; blank keeps the saved one */
+  walletPassword?: string;
 }
 
 /** A saved connection as the backend reports it — metadata only, never a password. */
@@ -21,6 +33,24 @@ export interface StoredConnection {
   user: string;
   database: string;
   readOnly: boolean;
+  authMode?: AuthMode;
+  walletId?: string;
+}
+
+/** One service from a wallet's tnsnames.ora — an alias and where it points. */
+export interface WalletService {
+  alias: string;
+  host: string;
+  port: number;
+  serviceName: string;
+}
+
+/** What the backend answers with after unpacking an uploaded wallet zip. */
+export interface WalletInfo {
+  walletId: string;
+  services: WalletService[];
+  /** the PEM inside is encrypted, so connecting needs the wallet password */
+  needsPassword: boolean;
 }
 
 
@@ -51,6 +81,8 @@ export interface ImportPreviewEntry {
   user: string;
   database: string;
   readOnly: boolean;
+  /** `wallet` entries bring the Oracle Cloud wallet with them, inside the encrypted file */
+  authMode?: AuthMode;
   /** set when this entry cannot be imported at all (e.g. no service name) */
   error?: string;
   /** set when a saved connection already points at the same server, port, user and service */
@@ -693,6 +725,11 @@ export const api = {
   /** test an existing connection — empty password means "use the stored one" */
   testExisting: (id: string, cfg: LiveConnConfig) => request<TestResult>(`/api/connections/${id}/test`, cfg),
   create: (cfg: LiveConnConfig) => request<{ id: string }>("/api/connections", cfg),
+  /** Unpack an Oracle Cloud wallet zip on the backend and list the services inside it. The
+   *  wallet files stay server-side; the browser only ever holds the id and the alias list. */
+  uploadWallet: (data: string) => request<WalletInfo>("/api/wallets", { data }),
+  /** The services of an already-uploaded wallet — how editing a wallet connection repopulates. */
+  wallet: (id: string) => request<WalletInfo>(`/api/wallets/${id}`),
   update: (id: string, cfg: LiveConnConfig) => request<{ ok: boolean }>(`/api/connections/${id}`, cfg, "PUT"),
   // through request(), not a bare fetch: fetch resolves on 4xx/5xx, so a failed DELETE
   // used to look like a success and the connection vanished from the UI while the

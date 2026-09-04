@@ -10,6 +10,42 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- **Connect to Oracle Autonomous Database with an Oracle Cloud wallet.** The connection wizard
+  now opens on a choice — **Host and port**, as before, or **Oracle Cloud wallet** — and the
+  second one replaces the endpoint fields with the zip Oracle Cloud hands you. Upload it and
+  the backend unpacks it, reads its `tnsnames.ora`, and offers the services inside as a list;
+  pick one (`_high`, `_medium` or `_low` are the same database at different consumer groups),
+  add the database username and password and the wallet password, and the connection behaves
+  like any other from there. Nothing else in the app had to learn about wallets: the host and
+  port shown in the Explorer are what the alias resolved to, so tabs, history, the migration
+  assistant and duplicate detection all keep working on the same fields they always used.
+  No Oracle Instant Client is involved — node-oracledb's Thin mode reads the PEM wallet
+  directly, which is also why an *auto-login* wallet (`cwallet.sso`, no `ewallet.pem`) is
+  refused at upload with a message that says what to download instead.
+  The wallet never reaches the browser. It is unpacked into `data/wallets/<id>/` (`0700`,
+  files `0600`), keeping only the two files Thin mode reads and discarding the SSO wallet, the
+  PKCS#12 wallet and the Java keystores — an unused copy of a private key is still a key to
+  lose. Wallets are reference-counted, so three connections may share one, and a wallet
+  nothing points at is swept up (after an hour's grace, so a wallet uploaded in one tab
+  survives a registry change made in another) the next time a connection is saved, edited,
+  deleted or imported — including one uploaded into a wizard that was then cancelled. The wallet password
+  is stored and replayed exactly like the database password: encrypted with the registry,
+  never returned by `GET /api/connections`, and reusable only for the endpoint it was saved
+  against — which now counts the wallet itself, since swapping in a different wallet points
+  the same alias at a different database. Connection export carries wallets inline, so an
+  exported wallet connection restores on a machine that has never seen the zip; the import
+  preview marks those entries, and the wallet lands under an id the receiving server issues.
+  [credentials.md](credentials.md#oracle-cloud-wallets) covers storage and the export format,
+  [known_limitations.md](known_limitations.md#oracle-cloud-wallets) what the wallet support
+  does not do.
+- **A zip reader and a `tnsnames.ora` parser, tested.** Both live in `server/oracleWallet.ts`,
+  apart from the rest of the backend for the same reason the export envelope is: their input
+  is a file someone uploaded. `npm test` now runs 22 more cases covering what a bad file does
+  — a non-zip, a truncated one, an encrypted one, a decompression bomb, a wallet with no PEM,
+  a PEM with no key, an entry named `../../../../etc/ewallet.pem` — alongside the parser
+  reading multi-line descriptors and not mistaking the `host=` inside one for an alias. The
+  reader supports stored and deflated entries and refuses everything else outright rather than
+  guessing, which is the whole of what an Oracle-written wallet zip needs.
 - **Export saved connections to a passphrase-encrypted JSON file.** The lock icon beside
   **Connections** in the Explorer (and **Export connections…** in a connection's context menu)
   picks any subset of the saved connections, asks for a passphrase twice, and downloads

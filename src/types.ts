@@ -14,9 +14,14 @@ export interface Connection {
   color: string;
   /** true = real database reached through the local backend (passwords stay server-side) */
   live?: boolean;
+  /** Oracle service name; in wallet mode, the tnsnames.ora alias the connection uses */
   database?: string;
   /** only read statements allowed (enforced by the backend for live connections) */
   readOnly?: boolean;
+  /** "wallet" = mutual TLS to Oracle Cloud through an uploaded wallet, not a typed host */
+  authMode?: "basic" | "wallet";
+  /** wallet mode: the wallet on the backend this connection reads its endpoint from */
+  walletId?: string;
 }
 
 export type ObjectKind =

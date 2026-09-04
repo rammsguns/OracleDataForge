@@ -10,6 +10,15 @@ import {
   encryptExport,
   EXPORT_MIN_PASSPHRASE,
 } from "./connectionExport.ts";
+import {
+  extractWallet,
+  parseTnsNames,
+  walletNeedsPassword,
+  WALLET_KEPT_FILES,
+  WALLET_ZIP_MAX_BYTES,
+  type WalletFiles,
+  type WalletService,
+} from "./oracleWallet.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -75,6 +84,17 @@ const ALLOWED_HOSTS = new Set(
 if (!IS_LOOPBACK && !AUTH_TOKEN) throw new Error("DATAFORGE_AUTH_TOKEN is required when HOST is not loopback.");
 if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required when HOST is not loopback.");
 
+/**
+ * How the network side of a connection is established.
+ *
+ * `basic`  host, port and service name, over plain TCP — a database you run yourself.
+ * `wallet` an Oracle Cloud wallet: mutual TLS to Autonomous Database, where the endpoint
+ *          comes from the `tnsnames.ora` inside the wallet rather than from the form. The
+ *          database username and password are still required — the wallet secures the
+ *          channel, it does not sign anyone in.
+ */
+type AuthMode = "basic" | "wallet";
+
 interface ConnConfig {
   name: string;
   engine: "oracle";
@@ -82,8 +102,15 @@ interface ConnConfig {
   port: number;
   user: string;
   password: string;
-  database: string; // Oracle service name
+  /** Oracle service name; in wallet mode, the tnsnames.ora alias (e.g. `dataforge_high`) */
+  database: string;
   readOnly: boolean; // when true, only read statements are allowed through this connection
+  authMode: AuthMode;
+  /** wallet mode: which uploaded wallet under `data/wallets/` this connection uses */
+  walletId?: string;
+  /** wallet mode: the password the wallet's PEM key is encrypted with. A credential, so it
+   *  is stored and exported exactly like the database password and never sent to a browser. */
+  walletPassword?: string;
 }
 
 interface LiveConnection extends ConnConfig {
@@ -131,7 +158,10 @@ function loadRegistry() {
     const stored = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as StoredConnection[] | EncryptedRegistry;
     if (Array.isArray(stored) && !IS_LOOPBACK) throw new Error("Plaintext connection storage is not allowed for LAN access. Configure DATAFORGE_ENCRYPTION_KEY and migrate the file.");
     const arr = Array.isArray(stored) ? stored : decryptRegistry(stored);
-    for (const c of arr) if (c.engine === "oracle") registry.set(c.id, { ...c });
+    // `authMode` postdates the first registry format, and an entry saved before it is a
+    // host/port connection — spelled out here rather than left undefined, so the identity
+    // checks that compare it (and therefore the stored-password rule) still match.
+    for (const c of arr) if (c.engine === "oracle") registry.set(c.id, { ...c, authMode: c.authMode === "wallet" ? "wallet" : "basic" });
     seq = arr.reduce((m, c) => Math.max(m, Number(c.id.replace(/\D/g, "")) || 0), 0) + 1;
     if (arr.length) console.log(`Restored ${arr.length} saved connection(s) from ${DATA_FILE}`);
   } catch {
@@ -173,6 +203,115 @@ function saveRegistry() {
 }
 
 loadRegistry();
+
+/* ---------------- Oracle Cloud wallets --------------------------------------------------
+ * An Autonomous Database wallet is a zip of files, and node-oracledb wants a directory to
+ * read them from — so an uploaded wallet is unpacked into `data/wallets/<id>/` and the
+ * connection stores only that id. The files themselves never go back to the browser: what a
+ * wallet upload answers with is the list of services inside its tnsnames.ora.
+ *
+ * The PEM in there is a private key, so the directory is created 0700 and the files 0600,
+ * the same treatment `data/connections.json` gets. Note that `DATAFORGE_ENCRYPTION_KEY`
+ * encrypts the *registry*, not this: the wallet's own password (kept in the registry, and
+ * therefore encrypted with everything else) is what stands between these files and use.
+ */
+const WALLET_DIR = path.join(DATA_DIR, "wallets");
+/** `w<n>` — a directory name, so it is never anything a request can influence. */
+let walletSeq = 1;
+
+/** True when `id` is one this server issued — never a path, never caller-shaped. */
+const isWalletId = (id: string) => /^w[0-9]+$/.test(id);
+
+/**
+ * The directory of one wallet. The id is re-checked here rather than only where requests
+ * arrive, so the "never a path" rule holds for every caller — including the registry, whose
+ * entries are read back from a file on disk.
+ */
+function walletPath(id: string): string {
+  if (!isWalletId(id)) throw new Error(`Not a wallet id: ${id}`);
+  return path.join(WALLET_DIR, id);
+}
+
+function nextWalletId(): string {
+  // Survives a restart without extra state: existing directories set the floor.
+  try {
+    for (const name of fs.readdirSync(WALLET_DIR)) {
+      const n = Number(name.replace(/\D/g, ""));
+      if (Number.isFinite(n) && n >= walletSeq) walletSeq = n + 1;
+    }
+  } catch {
+    /* no wallets yet */
+  }
+  return `w${walletSeq++}`;
+}
+
+/** Writes an unpacked wallet and returns the id a connection refers to it by. */
+function storeWallet(files: WalletFiles): string {
+  const id = nextWalletId();
+  const dir = walletPath(id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const name of WALLET_KEPT_FILES) {
+    if (files[name]) fs.writeFileSync(path.join(dir, name), files[name], { mode: 0o600 });
+  }
+  return id;
+}
+
+/** The services in a stored wallet's tnsnames.ora, or null when the wallet is gone. */
+function walletServices(id: string): WalletService[] | null {
+  try {
+    return parseTnsNames(fs.readFileSync(path.join(walletPath(id), "tnsnames.ora"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Reads a stored wallet back, for putting it inside an encrypted connection export. */
+function readWallet(id: string): WalletFiles | null {
+  const files: WalletFiles = {};
+  for (const name of WALLET_KEPT_FILES) {
+    try {
+      files[name] = fs.readFileSync(path.join(walletPath(id), name), "utf8");
+    } catch {
+      return null;
+    }
+  }
+  return files;
+}
+
+/** How long a freshly uploaded wallet is left alone even with nothing pointing at it. */
+const WALLET_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * Deletes wallet directories no saved connection points at any more.
+ *
+ * Called after every registry change rather than at the moment a connection is deleted,
+ * because two connections may share one wallet (an Autonomous Database wallet holds the
+ * high, medium and low services, and pointing a connection at each is the normal way to
+ * use it). Reachability is the only safe test.
+ *
+ * The grace period covers the gap the wizard opens: a wallet is uploaded a few fields before
+ * the connection that will point at it exists, and a registry change from somewhere else in
+ * that window — a second browser tab deleting a connection — would otherwise collect it out
+ * from under the form. An abandoned upload is swept up by the next prune after an hour.
+ */
+function pruneWallets() {
+  const inUse = new Set([...registry.values()].map((c) => c.walletId).filter(Boolean));
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(WALLET_DIR);
+  } catch {
+    return; // nothing has ever been uploaded
+  }
+  for (const dir of dirs) {
+    if (!isWalletId(dir) || inUse.has(dir)) continue;
+    try {
+      if (Date.now() - fs.statSync(walletPath(dir)).mtimeMs < WALLET_GRACE_MS) continue;
+      fs.rmSync(walletPath(dir), { recursive: true, force: true });
+    } catch (e) {
+      console.error(`Could not remove the unused wallet ${dir}:`, e);
+    }
+  }
+}
 
 /* ---------------- Workspace users: real server-side role enforcement ----------------
  * `accessRole` used to be a client-side dropdown backed by localStorage — cosmetic only,
@@ -363,6 +502,8 @@ async function closePools(c: LiveConnection): Promise<boolean> {
 }
 
 function pickConfig(body: any): ConnConfig {
+  const authMode: AuthMode = body?.authMode === "wallet" ? "wallet" : "basic";
+  const walletId = String(body?.walletId ?? "");
   return {
     name: String(body?.name ?? "").slice(0, 120),
     engine: "oracle",
@@ -374,7 +515,31 @@ function pickConfig(body: any): ConnConfig {
     // read-only unless the caller explicitly opts out — a connection created without
     // saying anything about writes is treated as the safest thing it could be
     readOnly: body?.readOnly !== false,
+    authMode,
+    // The wallet fields are dropped outright in basic mode, so switching a connection back
+    // to host/port cannot leave a stale wallet behind for `pruneWallets` to keep alive.
+    ...(authMode === "wallet"
+      ? {
+          walletId: isWalletId(walletId) ? walletId : "",
+          walletPassword: String(body?.walletPassword ?? ""),
+        }
+      : {}),
   };
+}
+
+/**
+ * Fills in the endpoint a wallet connection points at, from the wallet's own tnsnames.ora.
+ *
+ * `host` and `port` are display and bookkeeping values in wallet mode — the connection is
+ * made through the alias — but they are what the UI shows, what `sameEndpoint` compares and
+ * what `withNetworkHint` reads, so they are derived here rather than trusted from the
+ * request or left blank.
+ */
+function resolveWalletEndpoint(cfg: ConnConfig): ConnConfig {
+  if (cfg.authMode !== "wallet" || !cfg.walletId) return cfg;
+  const svc = walletServices(cfg.walletId)?.find((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase());
+  if (!svc) return cfg;
+  return { ...cfg, database: svc.alias, host: svc.host, port: svc.port };
 }
 
 /** closing character of an Oracle q-quote delimiter: q'[…]' and friends are mirrored, everything else is itself */
@@ -609,6 +774,17 @@ function confirmRequired(res: express.Response, confirmation: GuardConfirmation)
 
 function validate(cfg: ConnConfig): string | null {
   if (cfg.engine !== "oracle") return "Only Oracle Database connections are supported";
+  if (cfg.authMode === "wallet") {
+    if (!cfg.walletId) return "Upload the Oracle Cloud wallet zip for this connection";
+    const services = walletServices(cfg.walletId);
+    if (!services) return "That wallet is no longer on this server — upload the wallet zip again";
+    if (!cfg.database) return "Choose a database service from the wallet (e.g. the _high alias)";
+    if (!services.some((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase())) {
+      return `The wallet has no service called "${cfg.database}"`;
+    }
+    if (!cfg.user) return "Username is required";
+    return null;
+  }
   if (!cfg.host) return "Host is required";
   if (cfg.engine === "oracle" && !cfg.database) return "Service name is required for Oracle (e.g. FREEPDB1)";
   if (!Number.isFinite(cfg.port) || cfg.port < 1 || cfg.port > 65535) return "Invalid port";
@@ -696,7 +872,23 @@ function mapVal(v: unknown): string | number | null {
 
 /* ---------------- Oracle driver (node-oracledb Thin mode — no client install needed) ---------------- */
 
-const oraConnectString = (c: ConnConfig) => `${c.host}:${c.port}/${c.database}`;
+const oraConnectString = (c: ConnConfig) =>
+  // In wallet mode the descriptor lives in the wallet's tnsnames.ora and `database` is the
+  // alias into it — the host and port on the config are what that alias resolved to, kept
+  // for display, not for dialling.
+  c.authMode === "wallet" ? c.database : `${c.host}:${c.port}/${c.database}`;
+
+/**
+ * The connection attributes that make an Oracle Cloud wallet work in Thin mode: the
+ * directory holding `tnsnames.ora` (`configDir`, so the alias resolves) and the one holding
+ * `ewallet.pem` with the password it is encrypted under (`walletLocation` / `walletPassword`,
+ * so mutual TLS can complete). They are the same directory here. Empty in basic mode.
+ */
+function oraWalletOptions(c: ConnConfig): oracledb.ConnectionAttributes {
+  if (c.authMode !== "wallet" || !c.walletId) return {};
+  const dir = walletPath(c.walletId);
+  return { configDir: dir, walletLocation: dir, ...(c.walletPassword ? { walletPassword: c.walletPassword } : {}) };
+}
 
 /** SYS can only connect AS SYSDBA (ORA-28009) — apply the privilege automatically, like SQL Developer does. */
 const isSysUser = (user: string) => user.trim().toLowerCase() === "sys";
@@ -705,6 +897,7 @@ async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
   if (!c.oraPool) {
     c.oraPool = await oracledb.createPool({
       user: c.user, password: c.password, connectString: oraConnectString(c),
+      ...oraWalletOptions(c),
       poolMin: 0, poolMax: 4, connectTimeout: 8,
     });
   }
@@ -716,6 +909,7 @@ async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
   if (isSysUser(c.user)) {
     return oracledb.getConnection({
       user: c.user, password: c.password, connectString: oraConnectString(c),
+      ...oraWalletOptions(c),
       privilege: oracledb.SYSDBA, connectTimeout: 8,
     });
   }
@@ -726,6 +920,7 @@ async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
 async function oraTest(cfg: ConnConfig): Promise<string> {
   const conn = await oracledb.getConnection({
     user: cfg.user, password: cfg.password, connectString: oraConnectString(cfg), connectTimeout: 8,
+    ...oraWalletOptions(cfg),
     ...(isSysUser(cfg.user) ? { privilege: oracledb.SYSDBA } : {}),
   });
   await conn.execute("SELECT 1 FROM dual");
@@ -3959,10 +4154,58 @@ async function runTest(cfg: ConnConfig) {
  */
 app.get("/api/connections", (_req, res) => {
   const connections = [...registry.values()].map((c) => {
-    const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+    const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
     return safe;
   });
   res.json({ connections });
+});
+
+/* ---------------- Uploading an Oracle Cloud wallet ------------------------------------
+ * The wallet zip is the whole endpoint definition for an Autonomous Database: host, port,
+ * service names and the certificate to present, all inside the file Oracle Cloud hands you.
+ * So a wallet connection is made by uploading that zip rather than by typing an endpoint —
+ * this unpacks it, keeps the two files Thin mode reads, and answers with the services it
+ * found so the user can pick one.
+ *
+ * Full access only, like every route that writes to `data/`. What lands on disk is a private
+ * key, and an upload with no connection saved after it is swept up by `pruneWallets`.
+ */
+app.post("/api/wallets", requireFullAccess, (req, res) => {
+  const b64 = String(req.body?.data ?? "");
+  if (!b64) return res.status(400).json({ error: "No wallet file was uploaded." });
+  // base64 runs ~4/3 the size of the bytes; refuse an oversized upload before decoding it.
+  if (b64.length > WALLET_ZIP_MAX_BYTES * 2) {
+    return res.status(413).json({ error: `That file is larger than the ${WALLET_ZIP_MAX_BYTES / 1024 / 1024} MB a wallet zip may be.` });
+  }
+  let files: WalletFiles;
+  try {
+    files = extractWallet(Buffer.from(b64, "base64"));
+  } catch (e) {
+    return res.status(400).json({ error: errMsg(e) });
+  }
+
+  let id: string;
+  try {
+    id = storeWallet(files);
+  } catch (e) {
+    console.error("Could not store the uploaded wallet:", e);
+    return res.status(500).json({ error: "The wallet could not be written to disk." });
+  }
+  console.log(`Stored an Oracle Cloud wallet as ${id} — requested by ${(res.locals.userName as string | undefined) ?? (res.locals.role as Role)}`);
+  res.json({
+    walletId: id,
+    services: parseTnsNames(files["tnsnames.ora"]),
+    needsPassword: walletNeedsPassword(files["ewallet.pem"]),
+  });
+});
+
+/** The services in an already-uploaded wallet — what the edit form repopulates from. */
+app.get("/api/wallets/:id", requireFullAccess, (req, res) => {
+  if (!isWalletId(req.params.id)) return res.status(400).json({ error: "Not a wallet id." });
+  const services = walletServices(req.params.id);
+  if (!services) return res.status(404).json({ error: "That wallet is no longer on this server — upload the wallet zip again." });
+  const pem = readWallet(req.params.id)?.["ewallet.pem"] ?? "";
+  res.json({ walletId: req.params.id, services, needsPassword: walletNeedsPassword(pem) });
 });
 
 /**
@@ -3974,7 +4217,7 @@ app.get("/api/connections", (_req, res) => {
  * Analyst and Viewer reach anything at all, not a registry or data mutation.
  */
 app.post("/api/connections/test", requireFullAccess, async (req, res) => {
-  res.json(await runTest(pickConfig(req.body)));
+  res.json(await runTest(resolveWalletEndpoint(pickConfig(req.body))));
 });
 
 /**
@@ -3994,27 +4237,46 @@ const sameEndpoint = (a: ConnConfig, b: ConnConfig) =>
   a.host === b.host &&
   Number(a.port) === Number(b.port) &&
   a.user === b.user &&
-  (a.database ?? "") === (b.database ?? "");
+  (a.database ?? "") === (b.database ?? "") &&
+  // A wallet is part of the destination's identity: swapping in a different wallet points
+  // the same alias at a different Autonomous Database, which is exactly the substitution
+  // the stored-password rule exists to stop.
+  a.authMode === b.authMode &&
+  (a.walletId ?? "") === (b.walletId ?? "");
+
+/**
+ * Fills a blank password with the stored one, for the endpoint it was stored against.
+ * Returns the reason it may not be reused, or null once `cfg` is ready to connect with.
+ */
+function reuseStoredSecrets(cfg: ConnConfig, saved: LiveConnection): string | null {
+  const needsWalletPassword = cfg.authMode === "wallet" && !cfg.walletPassword && !!saved.walletPassword;
+  if (cfg.password && !needsWalletPassword) return null;
+  if (!sameEndpoint(cfg, saved)) return SAME_ENDPOINT_ERROR;
+  if (!cfg.password) cfg.password = saved.password;
+  if (needsWalletPassword) cfg.walletPassword = saved.walletPassword;
+  return null;
+}
 
 /** Test against an existing connection — an empty password means "use the stored one". */
 app.post("/api/connections/:id/test", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.json({ ok: false, error: "Unknown connection (backend may have restarted — recreate it)" });
-  const cfg = pickConfig(req.body);
-  if (!cfg.password) {
-    if (!sameEndpoint(cfg, c)) return res.json({ ok: false, error: SAME_ENDPOINT_ERROR });
-    cfg.password = c.password;
-  }
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
+  const refused = reuseStoredSecrets(cfg, c);
+  if (refused) return res.json({ ok: false, error: refused });
   res.json(await runTest(cfg));
 });
 
 app.post("/api/connections", requireFullAccess, (req, res) => {
-  const cfg = pickConfig(req.body);
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
   const bad = validate(cfg);
   if (bad) return res.status(400).json({ error: bad });
   const id = `live${seq++}`;
   registry.set(id, { ...cfg, id });
   saveRegistry();
+  // An upload the user abandoned before saving leaves a private key on disk; the first save
+  // after it is as good a moment as any to notice nothing points at it.
+  pruneWallets();
   res.json({ id });
 });
 
@@ -4022,16 +4284,15 @@ app.post("/api/connections", requireFullAccess, (req, res) => {
 app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  const cfg = pickConfig(req.body);
-  if (!cfg.password) {
-    if (!sameEndpoint(cfg, c)) return res.status(400).json({ error: SAME_ENDPOINT_ERROR });
-    cfg.password = c.password;
-  }
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
+  const refused = reuseStoredSecrets(cfg, c);
+  if (refused) return res.status(400).json({ error: refused });
   const bad = validate(cfg);
   if (bad) return res.status(400).json({ error: bad });
   await closePools(c);
   registry.set(c.id, { ...cfg, id: c.id });
   saveRegistry();
+  pruneWallets(); // the wallet this connection used to point at may now be unreferenced
   res.json({ ok: true });
 });
 
@@ -4041,6 +4302,7 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
     await closePools(c);
     registry.delete(c.id);
     saveRegistry();
+    pruneWallets();
   }
   res.json({ ok: true });
 });
@@ -4063,9 +4325,29 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
  * exists only inside `encryptExport` — connectionExport.ts, where the envelope format lives
  * and where its tests are — and what leaves here is ciphertext.
  */
-/** One connection as it appears inside the encrypted payload — the stored config minus the
- *  server-assigned id, which is a registry sequence number and means nothing elsewhere. */
-type ExportedConnection = ConnConfig;
+/**
+ * One connection as it appears inside the encrypted payload — the stored config minus the
+ * server-assigned id, which is a registry sequence number and means nothing elsewhere.
+ *
+ * A wallet connection carries its wallet along, inline. `walletId` is a directory name on
+ * the machine that wrote the file, so an export without the files themselves would restore
+ * to a connection pointing at nothing; the wallet is a few kilobytes, and the envelope it
+ * travels in is the same passphrase-encrypted one already carrying the passwords.
+ */
+type ExportedConnection = ConnConfig & { wallet?: WalletFiles };
+
+/** The wallet files of an entry in an uploaded export, or null — every field is untrusted. */
+function pickWalletFiles(entry: unknown): WalletFiles | null {
+  const raw = (entry as { wallet?: unknown } | null)?.wallet;
+  if (!raw || typeof raw !== "object") return null;
+  const files: WalletFiles = {};
+  for (const name of WALLET_KEPT_FILES) {
+    const v = (raw as Record<string, unknown>)[name];
+    if (typeof v !== "string" || !v || v.length > WALLET_ZIP_MAX_BYTES) return null;
+    files[name] = v;
+  }
+  return files;
+}
 
 /**
  * Export saved connections as one passphrase-encrypted JSON file.
@@ -4085,8 +4367,20 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
   if (!chosen.length) return res.status(400).json({ error: "Select at least one connection to export." });
 
   const payload: ExportedConnection[] = (chosen as LiveConnection[]).map(
-    ({ name, engine, host, port, user, password, database, readOnly }) => ({ name, engine, host, port, user, password, database, readOnly })
+    ({ name, engine, host, port, user, password, database, readOnly, authMode, walletId, walletPassword }) => {
+      const wallet = authMode === "wallet" && walletId ? readWallet(walletId) : null;
+      return {
+        name, engine, host, port, user, password, database, readOnly, authMode,
+        ...(authMode === "wallet" ? { walletId, walletPassword, ...(wallet ? { wallet } : {}) } : {}),
+      };
+    }
   );
+  const missingWallet = payload.find((c) => c.authMode === "wallet" && !c.wallet);
+  if (missingWallet) {
+    return res.status(409).json({
+      error: `"${missingWallet.name}" uses an Oracle Cloud wallet that is no longer on this server — upload its wallet zip again before exporting.`,
+    });
+  }
 
   const file = await encryptExport(payload, passphrase);
   // Credentials leaving the machine is worth a line in the operator's console — the same
@@ -4117,8 +4411,51 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
  *  shaped — so an entry from a later export carrying extra fields lands as the fields this
  *  build understands rather than going into the registry unexamined. */
 async function decryptExportFile(raw: unknown, passphrase: string): Promise<ExportedConnection[]> {
-  return (await decryptExport(raw, passphrase)).map((e) => pickConfig(e));
+  return (await decryptExport(raw, passphrase)).map((e) => {
+    const cfg = pickConfig(e) as ExportedConnection;
+    // The id inside the file names a directory on the machine that wrote it and means
+    // nothing here; the files travelling with it are what this import can actually use.
+    if (cfg.authMode === "wallet") {
+      cfg.walletId = "";
+      const wallet = pickWalletFiles(e);
+      if (wallet) cfg.wallet = wallet;
+    }
+    return cfg;
+  });
 }
+
+/**
+ * Whether an entry can be imported. A wallet entry cannot be checked against the wallets on
+ * this server — it brings its own — so its alias is checked against the tnsnames.ora inside
+ * the file, and `validate` is left to the entries that describe a host and a port.
+ */
+function validateImport(cfg: ExportedConnection): string | null {
+  if (cfg.authMode !== "wallet") return validate(cfg);
+  if (!cfg.wallet) return "This connection uses an Oracle Cloud wallet that the export file does not carry";
+  if (!cfg.database) return "The export does not say which service of the wallet to use";
+  if (!parseTnsNames(cfg.wallet["tnsnames.ora"]).some((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase())) {
+    return `The wallet in the file has no service called "${cfg.database}"`;
+  }
+  if (!cfg.user) return "Username is required";
+  return null;
+}
+
+/**
+ * Whether an entry points where a saved connection already points.
+ *
+ * Deliberately not `sameEndpoint`: that one compares `walletId` too, which is a local
+ * directory name and therefore never equal across machines — every re-import of a wallet
+ * connection would look new and land as a second copy with a second wallet on disk. What
+ * identifies an Autonomous Database instead is the host, port and service the alias
+ * resolved to, which is what the exporting server stored and what this compares.
+ */
+const sameImportTarget = (a: ExportedConnection, b: LiveConnection) =>
+  a.engine === b.engine &&
+  a.authMode === b.authMode &&
+  a.host === b.host &&
+  Number(a.port) === Number(b.port) &&
+  a.user === b.user &&
+  (a.database ?? "") === (b.database ?? "");
 
 /** What the browser is told about one entry in an uploaded file — deliberately no password. */
 interface ImportPreviewEntry {
@@ -4129,6 +4466,8 @@ interface ImportPreviewEntry {
   user: string;
   database: string;
   readOnly: boolean;
+  /** `wallet` entries restore the Oracle Cloud wallet that came inside the file with them */
+  authMode: AuthMode;
   /** why this entry cannot be imported, when it cannot */
   error?: string;
   /** the saved connection this entry points at the same place as */
@@ -4138,7 +4477,7 @@ interface ImportPreviewEntry {
 
 function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
   return entries.map((cfg, index) => {
-    const existing = [...registry.values()].find((c) => sameEndpoint(cfg, c));
+    const existing = [...registry.values()].find((c) => sameImportTarget(cfg, c));
     return {
       index,
       name: cfg.name,
@@ -4147,7 +4486,8 @@ function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
       user: cfg.user,
       database: cfg.database,
       readOnly: cfg.readOnly,
-      error: validate(cfg) ?? undefined,
+      authMode: cfg.authMode,
+      error: validateImport(cfg) ?? undefined,
       duplicateOfId: existing?.id,
       duplicateOfName: existing?.name,
     };
@@ -4192,19 +4532,31 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
   if (!wanted.length) return res.status(400).json({ error: "Select at least one connection to import." });
 
   const chosen = wanted.map((i) => entries[i]);
-  const invalid = chosen.map((cfg) => validate(cfg)).find(Boolean);
+  const invalid = chosen.map((cfg) => validateImport(cfg)).find(Boolean);
   if (invalid) return res.status(400).json({ error: `The file contains a connection this app cannot use: ${invalid}` });
 
   const added: string[] = [];
   const replaced: string[] = [];
   const skipped: string[] = [];
-  for (const cfg of chosen) {
-    const existing = [...registry.values()].find((c) => sameEndpoint(cfg, c));
-    if (existing) {
-      if (mode === "skip") {
-        skipped.push(existing.name);
-        continue;
+  for (const entry of chosen) {
+    const existing = [...registry.values()].find((c) => sameImportTarget(entry, c));
+    if (existing && mode === "skip") {
+      skipped.push(existing.name);
+      continue;
+    }
+    // The wallet lands on disk under an id this server issues, replacing the exporting
+    // machine's. Written only once the entry is going to be saved, so a skipped duplicate
+    // leaves nothing behind.
+    const { wallet, ...cfg } = entry;
+    if (cfg.authMode === "wallet" && wallet) {
+      try {
+        cfg.walletId = storeWallet(wallet);
+      } catch (e) {
+        console.error("Could not store an imported wallet:", e);
+        return res.status(500).json({ error: `The wallet for "${cfg.name}" could not be written to disk.` });
       }
+    }
+    if (existing) {
       // the pooled sessions belong to the credentials being overwritten
       await closePools(existing);
       registry.set(existing.id, { ...cfg, id: existing.id });
@@ -4215,7 +4567,10 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
       added.push(cfg.name);
     }
   }
-  if (added.length || replaced.length) saveRegistry();
+  if (added.length || replaced.length) {
+    saveRegistry();
+    pruneWallets(); // a replaced connection's old wallet is now unreferenced
+  }
   console.log(
     `Imported connections from an encrypted export — ${added.length} added, ${replaced.length} replaced, ${skipped.length} skipped — requested by ${
       (res.locals.userName as string | undefined) ?? (res.locals.role as Role)

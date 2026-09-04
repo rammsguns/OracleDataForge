@@ -20,8 +20,9 @@ Verified against the source, not just the README:
 - **No container image.** See [deployment.md](deployment.md).
 - **No object-name autocomplete.** Completions are keyword-only; object names previously came
   from mock data that no longer exists.
-- **No tests.** There is no test runner and no test files. Verification is `npm run typecheck`,
-  `npm run build`, and a health check.
+- **Almost no tests.** `npm test` covers two pure modules — the connection-export envelope and
+  the Oracle Cloud wallet reader — on Node's built-in runner. Everything else is verified by
+  `npm run typecheck`, `npm run build`, a health check, and hand.
 
 ## SQL execution
 
@@ -226,6 +227,31 @@ comment as reconstructed.
 Schema comparison in the migration assistant is **structure only** — no data. Indexes and
 constraints are matched by semantic signature rather than name, and renamed objects are
 reported as informational with no DDL generated.
+
+## Oracle Cloud wallets
+
+- **The wallet must carry `ewallet.pem`.** node-oracledb runs in Thin mode here, which reads
+  the PEM wallet and cannot use `cwallet.sso` — so an *auto-login* wallet is refused at upload
+  with a message saying so. Download the wallet again and give it a wallet password.
+- **Only the two files Thin mode reads are kept**, `ewallet.pem` and `tnsnames.ora`. Anything
+  else in the zip — the SSO wallet, the PKCS#12 wallet, the Java keystores, `sqlnet.ora`,
+  `ojdbc.properties` — is discarded rather than stored.
+- **The zip reader is deliberately minimal.** Stored and deflated entries only; zip64,
+  encrypted archives and unknown compression methods are refused, not worked around. A wallet
+  zip is a few kilobytes written by Oracle, so nothing legitimate reaches those paths. Uploads
+  are capped at 2 MB and each extracted file at 512 KB.
+- **`data/wallets/` is not covered by `DATAFORGE_ENCRYPTION_KEY`.** That key encrypts the
+  connection registry; the wallet files sit on disk as they came out of the zip. The wallet
+  *password* is in the registry and therefore is encrypted. See
+  [credentials.md](credentials.md#oracle-cloud-wallets).
+- **A wallet is not refreshed automatically.** Oracle Cloud wallets expire (rotating
+  certificates, or a regional wallet re-issued); when yours does, download a new zip and use
+  **Replace wallet** in the connection's edit dialog. Nothing in the app warns you beforehand —
+  the first sign is a TLS failure on connect.
+- **No proxy, no `TNS_ADMIN`, no thick mode.** There is no setting for an HTTP proxy in front
+  of the database endpoint, no way to point at an existing `TNS_ADMIN` directory instead of
+  uploading a zip, and no Instant Client path — all three are things Thin mode either does not
+  support or this app does not expose.
 
 ## Platform notes
 

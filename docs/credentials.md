@@ -23,7 +23,7 @@ than by building an allowlist by hand, so a field added to the config later cann
 begin leaking through that endpoint:
 
 ```ts
-const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
 ```
 
 Credentials go browser → backend once when you create or edit a connection, and never come
@@ -107,6 +107,34 @@ sensitivity lives in `data/versions/`, unencrypted, for as long as the version h
 kept. Excluding `data/` from sync (the same fix as above) covers this too — there is no
 separate exclusion needed.
 
+## Oracle Cloud wallets
+
+A connection created with **Oracle Cloud wallet** carries a second secret: the wallet itself.
+The uploaded zip is unpacked on the backend into `data/wallets/<id>/`, and the connection
+stores only that directory's id.
+
+Two of the zip's files are kept — `ewallet.pem` and `tnsnames.ora` — and the rest are
+discarded. `cwallet.sso`, `ewallet.p12` and the Java keystores are the same private key in
+formats node-oracledb's Thin mode cannot read, and an unused secret is still a secret to
+lose. The directory is created `0700` and the files `0600`, with the same Windows caveat as
+above.
+
+**`DATAFORGE_ENCRYPTION_KEY` does not cover `data/wallets/`.** That key encrypts the
+connection registry; the wallet files are written as they came out of the zip. What is
+encrypted with the registry is the **wallet password** — the one you set when downloading the
+wallet from Oracle Cloud, which the PEM key is encrypted under, and which the backend supplies
+to the driver on every connection. So a stolen `data/wallets/` directory alone does not open a
+database, and the sync-root advice above applies to it exactly as it does to
+`connections.json`.
+
+Wallets are reference-counted rather than owned by one connection: pointing three connections
+at the `_high`, `_medium` and `_low` services of the same Autonomous Database uses one wallet.
+A wallet directory nothing points at any more is deleted the next time a connection is saved,
+edited, deleted or imported, once it is an hour old — which also sweeps up a wallet uploaded
+into a wizard that was then cancelled. The hour is what keeps a wallet uploaded in one browser
+tab from being collected by a registry change made in another before the connection using it
+has been saved.
+
 ## Exporting connections to an encrypted file
 
 `data/connections.json` is only a backup of the registry for as long as the machine holding
@@ -118,6 +146,14 @@ downloads `dataforge-connections-<date>.json`.
 What that file holds is the **Oracle username and password** of every connection you picked,
 encrypted under that passphrase and nothing else. Treat it exactly as you would treat the
 passwords themselves.
+
+A wallet connection carries its **whole wallet** inside the same envelope — `ewallet.pem`,
+`tnsnames.ora` and the wallet password — because `walletId` names a directory on the machine
+that wrote the file and would restore to a connection pointing at nothing. The export list
+marks those entries *wallet included*. One consequence is worth stating plainly: such a file
+is a complete, self-contained credential for an Autonomous Database, and the passphrase is
+the only thing protecting it. If a wallet is no longer on this server, the export is refused
+rather than written without it.
 
 - The browser never assembles it. Passwords do not live there, so the encryption happens
   server-side and the browser only receives, and saves, ciphertext.
@@ -174,11 +210,18 @@ written by the first one**:
    configured — the plaintext default above applies to imported credentials exactly as it does
    to typed ones).
 
+A wallet entry restores its wallet as part of step 2: the files inside the envelope are
+written to a fresh `data/wallets/<id>/` on this server and the connection is pointed at that,
+never at the id the file carried. The preview marks those entries *restores its wallet*, and
+an entry whose wallet is missing from the file is refused rather than imported as a broken
+connection.
+
 ### Connections you already have
 
 An entry is treated as one you already have when its **engine, host, port, user and service
-name** all match a saved connection — the same identity test that governs whether a stored
-password may be replayed. The preview marks those **ALREADY SAVED**, and offers a choice:
+name** all match a saved connection — for a wallet connection, the host, port and alias its
+wallet resolved to, since the wallet's own id differs on every machine. The preview marks
+those **ALREADY SAVED**, and offers a choice:
 
 | | |
 | --- | --- |
@@ -255,8 +298,11 @@ password** to mean *keep the stored one*, so you are not forced to retype it to 
 unrelated field.
 
 That convenience is deliberately constrained. A stored password may only be replayed to the
-exact endpoint it was saved against — engine, host, port, user, **and service name** must all
-still match. The code is explicit about why:
+exact endpoint it was saved against — engine, host, port, user, **service name**, and (for a
+wallet connection) **the wallet itself** must all still match. Swapping in a different wallet
+points the same alias at a different Autonomous Database, which is precisely the substitution
+this rule exists to stop. The saved **wallet password** is replayed on the same terms. The
+code is explicit about why:
 
 > point a saved connection at a rogue server, and the backend dials out and authenticates with
 > the real password

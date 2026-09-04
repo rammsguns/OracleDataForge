@@ -355,7 +355,7 @@ reading files outside the versions directory.
 rather than an allowlist, so a field added to the config later cannot silently begin leaking:
 
 ```ts
-const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
 ```
 
 Result data is also shaped defensively: LOBs render as `[BLOB]`/`[CLOB]` placeholders rather
@@ -379,6 +379,22 @@ decrypted entry goes through the same `pickConfig`/`validate` path as a hand-typ
 Both endpoints are full-access only, and an import is logged with what it added, replaced and
 skipped.
 
+## Uploaded Oracle Cloud wallets
+
+`POST /api/wallets` takes a file a user picked and writes parts of it to disk, so it is
+treated the way the connection import is. Full access only. The upload is capped at 2 MB
+before it is even decoded and each extracted file at 512 KB, with the inflate bounded so a
+decompression bomb fails rather than fills memory. Only two entries are kept — `ewallet.pem`
+and `tnsnames.ora` — matched on the **basename** of each zip entry and written under names
+from that whitelist, so an entry called `../../../../etc/ewallet.pem` is simply "the PEM":
+nothing an archive says ever becomes a path. Encrypted archives, zip64 and unknown
+compression methods are refused rather than half-read, and a zip whose PEM holds no private
+key is refused too. Wallet ids are server-issued (`w1`, `w2`, …) and every id arriving in a
+request is checked against that shape before it is joined to a path.
+
+Where the files then live, and what does and does not encrypt them, is in
+[credentials.md](credentials.md#oracle-cloud-wallets).
+
 ## Caps
 
 Denial-of-service resistance is incidental rather than designed, but the limits are real:
@@ -392,6 +408,7 @@ Denial-of-service resistance is incidental rather than designed, but the limits 
 | Routine output lines | 1,000 |
 | PL/SQL block binds | 32 |
 | Request body | 16 MB |
+| Wallet zip upload / extracted file | 2 MB / 512 KB |
 | Failed sign-ins per address | 10 per minute, then a 60 s cooldown |
 | Verified-credential cache | 5 minutes, 500 entries |
 

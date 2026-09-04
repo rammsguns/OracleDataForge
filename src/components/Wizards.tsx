@@ -1,7 +1,7 @@
-import { useState } from "react";
-import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, ShieldAlert, XCircle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, Server, ShieldAlert, XCircle } from "lucide-react";
 import { useStudio } from "../state/store";
-import { api, type ImportPreview, type ImportRequest, type ImportResult } from "../utils/api";
+import { api, type AuthMode, type ImportPreview, type ImportRequest, type ImportResult, type WalletService } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
 import { download } from "../utils/sql";
 import type { Engine } from "../types";
@@ -18,6 +18,7 @@ export function ConnectionWizard() {
   const [port, setPort] = useState(editing?.port ?? 1521);
   const [user, setUser] = useState(editing && editing.user !== "—" ? editing.user : "");
   const [password, setPassword] = useState("");
+  // In wallet mode this holds the tnsnames.ora alias instead of a typed service name.
   const [database, setDatabase] = useState(editing?.database ?? "");
   // new connections start read-only: writing to a database you just pointed at should be
   // a deliberate choice, so the checkbox is on until the user turns it off
@@ -26,21 +27,92 @@ export function ConnectionWizard() {
   const [testMsg, setTestMsg] = useState("");
   const [saving, setSaving] = useState(false);
 
+  /* ---- Oracle Cloud wallet ----
+   * The zip goes to the backend, which unpacks it and answers with the services inside its
+   * tnsnames.ora. The wallet files themselves never come back here: this side holds an id,
+   * the alias list and whatever password the user types for the key. */
+  const [authMode, setAuthMode] = useState<AuthMode>(editing?.authMode === "wallet" ? "wallet" : "basic");
+  const [walletId, setWalletId] = useState(editing?.walletId ?? "");
+  const [services, setServices] = useState<WalletService[]>([]);
+  const [walletPassword, setWalletPassword] = useState("");
+  const [walletNeedsPassword, setWalletNeedsPassword] = useState(true);
+  const [walletFileName, setWalletFileName] = useState("");
+  const [walletBusy, setWalletBusy] = useState(false);
+  const [walletError, setWalletError] = useState("");
+  const wallet = authMode === "wallet";
+  const service = services.find((x) => x.alias === database);
+
+  // Editing a wallet connection: the alias list lives in the wallet on the server, so it is
+  // read back rather than remembered in the browser. A wallet deleted underneath the
+  // connection says so here instead of at save time.
+  useEffect(() => {
+    const id = editing?.walletId;
+    if (editing?.authMode !== "wallet" || !id) return;
+    let dropped = false;
+    api
+      .wallet(id)
+      .then((info) => {
+        if (dropped) return;
+        setServices(info.services);
+        setWalletNeedsPassword(info.needsPassword);
+      })
+      .catch((e: Error) => !dropped && setWalletError(e.message));
+    return () => {
+      dropped = true;
+    };
+  }, [editing?.authMode, editing?.walletId]);
+
+  const uploadWallet = async (f: File | undefined) => {
+    if (!f) return;
+    setWalletBusy(true);
+    setWalletError("");
+    setWalletFileName(f.name);
+    setTesting("idle");
+    setTestMsg("");
+    try {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      const info = await api.uploadWallet(btoa(binary));
+      setWalletId(info.walletId);
+      setServices(info.services);
+      setWalletNeedsPassword(info.needsPassword);
+      // Autonomous Database publishes the same database as _high/_medium/_low consumer
+      // groups; _high is the one SQL Developer opens with, and a sensible default here too.
+      const keep = info.services.find((x) => x.alias === database);
+      const preferred = keep ?? info.services.find((x) => /_high$/i.test(x.alias)) ?? info.services[0];
+      setDatabase(preferred?.alias ?? "");
+      if (!name.trim()) setName(f.name.replace(/\.zip$/i, "").replace(/^Wallet_/i, ""));
+    } catch (e) {
+      setWalletId("");
+      setServices([]);
+      setWalletError((e as Error).message);
+    } finally {
+      setWalletBusy(false);
+    }
+  };
+
   const close = () => {
     s.setWizardOpen(false);
     s.setEditingConn(null);
   };
-  const canNext = name.trim() && host.trim() && database.trim();
+  const canNext = wallet
+    ? Boolean(name.trim() && walletId && database && user.trim())
+    : Boolean(name.trim() && host.trim() && database.trim());
 
   const liveCfg = () => ({
     name: name.trim(),
     engine,
-    host: host.trim(),
-    port,
+    // In wallet mode the endpoint comes from the wallet, not from the form; the resolved
+    // host and port are sent along because they are what the connection list shows.
+    host: wallet ? service?.host ?? "" : host.trim(),
+    port: wallet ? service?.port ?? 0 : port,
     user: user.trim(),
     password,
     database: database.trim(),
     readOnly,
+    authMode,
+    ...(wallet ? { walletId, walletPassword } : {}),
   });
 
   const test = async () => {
@@ -67,11 +139,13 @@ export function ConnectionWizard() {
       const patched = {
         ...editing,
         name: name.trim(),
-        host: host.trim(),
-        port,
+        host: wallet ? service?.host ?? editing.host : host.trim(),
+        port: wallet ? service?.port ?? editing.port : port,
         user: user.trim() || "—",
         database: database.trim() || undefined,
         readOnly,
+        authMode,
+        walletId: wallet ? walletId : undefined,
       };
       setSaving(true);
       try {
@@ -93,14 +167,16 @@ export function ConnectionWizard() {
         id,
         name: name.trim(),
         engine,
-        host: host.trim(),
-        port,
+        host: wallet ? service?.host ?? "" : host.trim(),
+        port: wallet ? service?.port ?? 0 : port,
         user: user.trim() || "—",
         status: "connected",
         color: "#f4b13e",
         live: true,
         database: database.trim(),
         readOnly,
+        authMode,
+        walletId: wallet ? walletId : undefined,
       });
       close();
     } catch (e) {
@@ -137,17 +213,110 @@ export function ConnectionWizard() {
 
       {step === 1 && (
         <div className="space-y-3.5">
+          {/* Which of the two ways of reaching Oracle this connection uses. The wallet is
+              not an extra option on a host/port connection — it replaces the endpoint
+              entirely — so it is the first choice on the form rather than a checkbox. */}
+          <Field label="Connect using">
+            <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Connection method">
+              {([
+                { mode: "basic" as const, icon: <Server size={13} />, title: "Host and port", detail: "A database you reach directly" },
+                { mode: "wallet" as const, icon: <Cloud size={13} />, title: "Oracle Cloud wallet", detail: "Autonomous Database, over mTLS" },
+              ]).map((opt) => (
+                <button
+                  key={opt.mode}
+                  type="button"
+                  role="radio"
+                  aria-checked={authMode === opt.mode}
+                  onClick={() => {
+                    if (authMode === opt.mode) return;
+                    setAuthMode(opt.mode);
+                    // The service name and the wallet alias share a field but are never the
+                    // same string, so switching methods clears it rather than carrying a
+                    // value that cannot be right for the new one.
+                    setDatabase(editing && (editing.authMode === "wallet") === (opt.mode === "wallet") ? editing.database ?? "" : "");
+                    setTesting("idle");
+                    setTestMsg("");
+                  }}
+                  className={`text-left rounded-lg border p-2.5 transition-colors ${
+                    authMode === opt.mode ? "border-accent bg-accentdim" : "border-bdr hover:border-accent/50"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-ink">
+                    {opt.icon} {opt.title}
+                  </span>
+                  <span className="block text-[11px] text-mute mt-0.5">{opt.detail}</span>
+                </button>
+              ))}
+            </div>
+          </Field>
+
           <Field label="Connection name">
             <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sales Analytics (STAGING)" autoFocus />
           </Field>
-          <div className="grid grid-cols-[1fr_110px] gap-3">
-            <Field label="Host">
-              <input className={inputCls} value={host} onChange={(e) => setHost(e.target.value)} placeholder="db.example.corp" />
-            </Field>
-            <Field label="Port">
-              <input className={inputCls} type="number" value={port} onChange={(e) => setPort(+e.target.value)} />
-            </Field>
-          </div>
+
+          {wallet ? (
+            <>
+              <Field
+                label={walletId ? "Replace wallet" : "Wallet zip"}
+                hint="The zip from Oracle Cloud → your Autonomous Database → Database connection → Download wallet. It is unpacked on the backend; the browser never holds its key."
+              >
+                <input
+                  type="file"
+                  accept="application/zip,.zip"
+                  className="w-full text-[12px] text-soft file:mr-3 file:h-7 file:px-2.5 file:rounded-md file:border file:border-bdr file:bg-panel2 file:text-soft file:text-[12px] file:cursor-pointer hover:file:border-accent/60"
+                  onChange={(e) => void uploadWallet(e.target.files?.[0])}
+                />
+              </Field>
+              {walletBusy && (
+                <p className="flex items-center gap-1.5 text-[12px] text-mute">
+                  <Loader2 size={13} className="df-spin" /> Reading {walletFileName}…
+                </p>
+              )}
+              {walletError && (
+                <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+                  <XCircle size={14} className="shrink-0 mt-0.5" /> {walletError}
+                </p>
+              )}
+              {!walletBusy && !!services.length && (
+                <>
+                  <Field
+                    label="Database service"
+                    hint="Autonomous Database publishes one service per consumer group — _high gives each statement the most resources and the least concurrency, _low the reverse."
+                  >
+                    <select className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)}>
+                      {!database && <option value="">Choose a service…</option>}
+                      {services.map((x) => (
+                        <option key={x.alias} value={x.alias}>
+                          {x.alias}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {service && (
+                    <p className="text-[11px] text-mute -mt-1.5">
+                      Connects to <span className="font-mono text-soft">{service.host}:{service.port}</span> as{" "}
+                      <span className="font-mono text-soft">{service.serviceName}</span>
+                    </p>
+                  )}
+                </>
+              )}
+              {!walletBusy && !services.length && !walletError && editing?.authMode === "wallet" && (
+                <p className="flex items-center gap-1.5 text-[12px] text-mute">
+                  <Loader2 size={13} className="df-spin" /> Reading the saved wallet…
+                </p>
+              )}
+            </>
+          ) : (
+            <div className="grid grid-cols-[1fr_110px] gap-3">
+              <Field label="Host">
+                <input className={inputCls} value={host} onChange={(e) => setHost(e.target.value)} placeholder="db.example.corp" />
+              </Field>
+              <Field label="Port">
+                <input className={inputCls} type="number" value={port} onChange={(e) => setPort(+e.target.value)} />
+              </Field>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-3">
             <Field label="Username" hint="SYS connects automatically AS SYSDBA">
               <input className={inputCls} value={user} onChange={(e) => setUser(e.target.value)} placeholder="SYSTEM" autoComplete="off" />
@@ -159,9 +328,31 @@ export function ConnectionWizard() {
               <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
             </Field>
           </div>
-          <Field label="Service name" hint="Required — the Oracle service to connect to, e.g. FREEPDB1 on Oracle Database Free 23ai. Credentials are held in the backend only, never in the browser.">
-            <input className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="FREEPDB1" />
-          </Field>
+          {wallet ? (
+            walletNeedsPassword && (
+              <Field
+                label="Wallet password"
+                hint={
+                  editing?.authMode === "wallet"
+                    ? "Leave blank to keep the saved wallet password. This is the password you set when downloading the wallet, not the database password."
+                    : "The password you set when downloading the wallet from Oracle Cloud — it decrypts the wallet's private key, and is not the database password."
+                }
+              >
+                <input
+                  className={inputCls}
+                  type="password"
+                  value={walletPassword}
+                  onChange={(e) => setWalletPassword(e.target.value)}
+                  placeholder={editing?.authMode === "wallet" ? "(unchanged)" : "••••••••"}
+                  autoComplete="new-password"
+                />
+              </Field>
+            )
+          ) : (
+            <Field label="Service name" hint="Required — the Oracle service to connect to, e.g. FREEPDB1 on Oracle Database Free 23ai. Credentials are held in the backend only, never in the browser.">
+              <input className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="FREEPDB1" />
+            </Field>
+          )}
           <label className="flex items-start gap-2.5 border border-bdr rounded-lg p-3 cursor-pointer hover:border-accent/50 transition-colors">
             <input
               type="checkbox"
@@ -186,9 +377,23 @@ export function ConnectionWizard() {
           <div className="border border-bdr rounded-xl p-4 text-[12.5px] space-y-1.5">
             <div><span className="text-mute w-24 inline-block">Engine</span> <b>Oracle</b> <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span></div>
             <div><span className="text-mute w-24 inline-block">Name</span> <b>{name}</b></div>
-            <div><span className="text-mute w-24 inline-block">Target</span> <span className="font-mono">{`${host}:${port}`}</span></div>
             <div>
-              <span className="text-mute w-24 inline-block">Service</span>{" "}
+              <span className="text-mute w-24 inline-block">Method</span>{" "}
+              {wallet ? (
+                <>
+                  <b>Oracle Cloud wallet</b>{" "}
+                  <span className="text-[10px] font-bold bg-accentdim text-accenthi rounded px-1 py-0.5 ml-1">mTLS</span>
+                </>
+              ) : (
+                <b>Host and port</b>
+              )}
+            </div>
+            <div>
+              <span className="text-mute w-24 inline-block">Target</span>{" "}
+              <span className="font-mono">{wallet ? (service ? `${service.host}:${service.port}` : "—") : `${host}:${port}`}</span>
+            </div>
+            <div>
+              <span className="text-mute w-24 inline-block">{wallet ? "Wallet service" : "Service"}</span>{" "}
               <span className="font-mono">{database}</span>
             </div>
             <div><span className="text-mute w-24 inline-block">User</span> <span className="font-mono">{user || "—"}</span></div>
@@ -671,6 +876,9 @@ export function ExportConnectionsDialog() {
                         {c.host}:{c.port}
                         {c.database ? `/${c.database}` : ""} as {c.user}
                         {c.readOnly ? " · read-only" : ""}
+                        {/* the wallet travels inside the encrypted file, so the export is
+                            usable on a machine that has never seen it */}
+                        {c.authMode === "wallet" ? " · wallet included" : ""}
                       </span>
                     </span>
                   </label>
@@ -884,6 +1092,7 @@ export function ImportConnectionsDialog() {
                           {e.host}:{e.port}
                           {e.database ? `/${e.database}` : ""} as {e.user}
                           {e.readOnly ? " · read-only" : ""}
+                          {e.authMode === "wallet" ? " · restores its wallet" : ""}
                         </span>
                         {e.error && <span className="block text-[11px] text-err">Cannot import: {e.error}</span>}
                         {e.duplicateOfId && e.duplicateOfName !== e.name && (
