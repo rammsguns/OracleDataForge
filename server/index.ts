@@ -3716,12 +3716,20 @@ type CopyExisting = "skip" | "replace";
 interface ObjectCopyItem {
   name: string;
   existsInTarget: boolean;
+  /**
+   * The table this object is built on, when the target does not have it — an index whose
+   * table has not been copied yet. Absent for everything that can be created as things stand,
+   * which is every object of a kind that is not built on a table.
+   */
+  missingTable?: string;
 }
 
 interface ObjectCopyKindSummary {
   kind: CopyKind;
   label: string;
   note: string;
+  /** what replacing an existing one costs — dropping a table is not dropping an index */
+  replaceNote: string;
   /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
   selected: boolean;
   total: number;
@@ -3742,6 +3750,8 @@ interface ObjectCopyPlan {
   items: ObjectCopyItem[];
   total: number;
   conflicts: number;
+  /** how many of them name a table the target has not got — they would be skipped, not created */
+  blocked: number;
   cap: number;
   overCap: boolean;
   targetReadOnly: boolean;
@@ -3799,11 +3809,40 @@ interface ObjectCopyResult {
  * than tables, and `ORA_NOISE_TABLE` is the same exclusion the Explorer applies, so the copy
  * offers exactly the tables the rest of the app calls the user's.
  *
- * A kind is added here and in `OBJECT_COPY_KINDS`; nothing else in the server or the browser
- * needs to know about it.
+ * A kind is added here, in `OBJECT_COPY_KINDS`, and — if it is built on a table — in
+ * `OBJECT_COPY_BASE_TABLE_SQL`. Nothing else in the server needs to know about it, and the
+ * browser only needs the name added to its own copy of the union.
  */
 const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
   tables: `SELECT table_name AS "name" FROM user_tables WHERE NOT ${ORA_NOISE_TABLE} ORDER BY table_name`,
+  // Indexes are mostly an exercise in leaving out the ones that are not anybody's to copy:
+  //   · the index behind a primary or unique key is created *by* that constraint, and the
+  //     table copy already brings it — recreating it by hand would be a second index over the
+  //     same columns at best, and ORA-01408 at worst
+  //   · `generated = 'Y'` is Oracle's own answer to "did a human name this?", which catches
+  //     the constraint indexes it names itself along with LOB and IOT internals
+  //   · an index on someone else's table, or on a cluster, is not this schema's to recreate
+  // What is left is the indexes somebody wrote a CREATE INDEX for, which is the whole point.
+  indexes: `SELECT index_name AS "name" FROM user_indexes i
+     WHERE table_owner = USER AND table_type = 'TABLE'
+       AND generated = 'N' AND index_name NOT LIKE 'BIN$%'
+       AND index_type NOT IN ('LOB', 'IOT - TOP')
+       AND NOT ${ORA_NOISE_TABLE}
+       AND NOT EXISTS (
+         SELECT 1 FROM user_constraints c
+          WHERE c.index_name = i.index_name AND c.constraint_type IN ('P', 'U'))
+     ORDER BY index_name`,
+};
+
+/**
+ * Which table each object of a kind is built on, for the kinds that are built on one at all.
+ *
+ * Read from the source, because that is where the object exists; what the *target* is missing
+ * is then a lookup against the tables it already has. A kind with no entry here has
+ * `requiresTable: false` and never asks.
+ */
+const OBJECT_COPY_BASE_TABLE_SQL: Partial<Record<CopyKind, string>> = {
+  indexes: `SELECT index_name AS "name", table_name AS "tbl" FROM user_indexes WHERE table_owner = USER`,
 };
 
 /**
@@ -3829,6 +3868,14 @@ async function oraCopyPrepareMetadata(conn: oracledb.Connection, preserveTablesp
 async function oraCopyList(conn: oracledb.Connection, kind: CopyKind): Promise<string[]> {
   const rows = await oraExecRows(conn, OBJECT_COPY_LIST_SQL[kind]);
   return rows.map((r) => String(r.name));
+}
+
+/** Object name → the table it is built on, empty for a kind that is not built on one. */
+async function oraCopyBaseTables(conn: oracledb.Connection, kind: CopyKind): Promise<Map<string, string>> {
+  const sql = OBJECT_COPY_BASE_TABLE_SQL[kind];
+  if (!sql) return new Map();
+  const rows = await oraExecRows(conn, sql);
+  return new Map(rows.map((r) => [String(r.name), String(r.tbl)]));
 }
 
 /** What the target already has, as `KIND NAME` keys, for one query rather than one per kind. */
@@ -3968,10 +4015,12 @@ async function oraObjectCopyPlan(
   const targetSchema = target.user.toUpperCase();
   const srcConn = await getOraConn(source);
   const names = new Map<CopyKind, string[]>();
+  let baseTables = new Map<string, string>();
   let targetSystemSchema = false;
   let existing: Set<string>;
   try {
     for (const k of ALL_COPY_KINDS) names.set(k, await oraCopyList(srcConn, k));
+    if (copyKindSpec(kind).requiresTable) baseTables = await oraCopyBaseTables(srcConn, kind);
     const tgtConn = await getOraConn(target);
     try {
       targetSystemSchema = await oraUserIsSystem(target, tgtConn);
@@ -3989,16 +4038,24 @@ async function oraObjectCopyPlan(
       kind: spec.kind,
       label: spec.label,
       note: spec.note,
+      replaceNote: spec.replaceNote,
       selected: spec.kind === kind,
       total: of.length,
       conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
     };
   });
 
-  const items: ObjectCopyItem[] = (names.get(kind) ?? []).map((name) => ({
-    name,
-    existsInTarget: existing.has(`${kind} ${name}`),
-  }));
+  // `existing` was read for every kind, so the tables the target has are already in hand:
+  // an index whose table is not among them is one the run will skip, and saying so here is
+  // what lets the picker show it before anything is attempted rather than after.
+  const items: ObjectCopyItem[] = (names.get(kind) ?? []).map((name) => {
+    const base = baseTables.get(name);
+    return {
+      name,
+      existsInTarget: existing.has(`${kind} ${name}`),
+      ...(base && !existing.has(`tables ${base}`) ? { missingTable: base } : {}),
+    };
+  });
 
   return {
     sourceId: source.id,
@@ -4013,6 +4070,7 @@ async function oraObjectCopyPlan(
     items,
     total: items.length,
     conflicts: items.filter((i) => i.existsInTarget).length,
+    blocked: items.filter((i) => i.missingTable).length,
     cap: OBJECT_COPY_MAX_OBJECTS,
     overCap: items.length > OBJECT_COPY_MAX_OBJECTS,
     targetReadOnly: !!target.readOnly,
@@ -4063,7 +4121,10 @@ async function oraObjectCopy(
       // ten seconds turns that into one reported failure instead of a stalled request.
       await tgtConn.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
 
-      const present = await oraCopyExisting(tgtConn, [kind]);
+      // A kind built on a table needs the target's tables read too — the same query with a
+      // second type in its IN list, which is what makes the check below cost nothing.
+      const present = await oraCopyExisting(tgtConn, spec.requiresTable ? [kind, "tables"] : [kind]);
+      const baseTables = spec.requiresTable ? await oraCopyBaseTables(srcConn, kind) : new Map<string, string>();
       const wanted = opts.names ? new Set(opts.names) : null;
       for (const name of await oraCopyList(srcConn, kind)) {
         if (wanted && !wanted.has(name)) continue;
@@ -4078,6 +4139,18 @@ async function oraObjectCopy(
           // it is in the target, so its foreign keys are still this run's business: the second
           // pass fills in the ones the target is missing and leaves the ones it has
           landed.add(name);
+          continue;
+        }
+        // An index cannot be created before its table is there. Oracle's own answer to that is
+        // ORA-00942 on the CREATE INDEX, which names neither the index nor the table it wanted;
+        // this names both and says what to do about it.
+        const baseTable = baseTables.get(name);
+        if (baseTable && !present.has(`tables ${baseTable}`)) {
+          objects.push({
+            ...base,
+            status: "skipped",
+            reason: `${baseTable} is not in ${targetSchema} — copy the tables first, then run this again.`,
+          });
           continue;
         }
         try {
@@ -5224,6 +5297,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
   const picked = new Set(names ?? plan.items.map((i) => i.name));
   const total = picked.size;
   const conflicts = plan.items.filter((i) => picked.has(i.name) && i.existsInTarget).length;
+  const blocked = plan.items.filter((i) => picked.has(i.name) && i.missingTable).length;
 
   if (total > plan.cap) {
     return res.status(400).json({
@@ -5250,6 +5324,12 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
         ? ` ⚠ ${conflicts} of them already exist in ${plan.targetSchema} and will be DROPPED and recreated — a dropped table takes its rows with it and is not recoverable from the recycle bin.`
         : ` ${conflicts} of them already exist in ${plan.targetSchema} and will be left exactly as they are.`
       : "";
+    // Worth its own sentence because it is the one number that says "this run will not do all
+    // of what you just asked for": an index whose table is not there yet is reported, not
+    // created, and the dialog is the last place to say so before it happens.
+    const blockedLine = blocked
+      ? ` ${blocked} of them are built on a table ${plan.targetSchema} does not have and will be skipped — copy those tables first if you want them.`
+      : "";
     // The tablespace is worth a sentence either way round: preserved, it is the clause that
     // fails the whole copy on a target laid out differently; not preserved, the objects land
     // somewhere other than where they came from, which is not what everyone expects.
@@ -5266,6 +5346,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
         (names && total < plan.total ? ` (of ${plan.total})` : "") +
         ` will be created in ${plan.targetSchema} on "${target.name}".` +
         conflictLine +
+        blockedLine +
         tablespaceLine +
         ` ${copyKindSpec(kind).note} Objects that fail are reported and the rest of the copy continues.`,
       confirmLabel:

@@ -12,7 +12,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useStudio } from "../state/store";
-import type { CopyExisting, CopyKind, ObjectCopyPlan } from "../utils/api";
+import type { CopyExisting, CopyKind, ObjectCopyObjectResult, ObjectCopyPlan } from "../utils/api";
 import {
   getObjectCopyRun,
   loadObjectCopyPlan,
@@ -90,7 +90,7 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
   // the type list's counts come from the breakdown, which covers every kind; the selection's
   // counts come from the picker, and only the second one changes as names are moved across
   const summary = objectCopyKindSummary(plan, kind);
-  const { total, conflicts } = selectedCounts(plan, names);
+  const { total, conflicts, blocked } = selectedCounts(plan, names);
   const overCap = !!plan && total > plan.cap;
 
   const copy = useCallback(async () => {
@@ -248,9 +248,11 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                         {mode === "skip" ? "Leave them alone" : "Drop and recreate them"}
                       </div>
                       <div className="text-[11.5px] text-mute mt-0.5">
+                        {/* the cost of a replacement is the backend's to describe: dropping a
+                            table is not dropping an index, and only it knows which kind this is */}
                         {mode === "skip"
                           ? "Only what is missing from the target is created. Safe to re-run: a second copy fills in whatever failed the first time."
-                          : "Each existing object is dropped before it is recreated. A dropped table takes its rows with it and does not go to the recycle bin."}
+                          : summary?.replaceNote ?? "Each existing object is dropped before it is recreated."}
                       </div>
                     </div>
                   </label>
@@ -300,6 +302,12 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                   </>
                 )}
               </div>
+              {blocked > 0 && (
+                <div className="text-[11.5px] text-warn mt-1.5">
+                  {fmtNum(blocked)} of them sit on a table <span className="font-mono">{plan.targetSchema}</span> has not got
+                  and will be reported as skipped — copy those tables across first if you want them.
+                </div>
+              )}
               {overCap && (
                 <div className="text-[11.5px] text-warn mt-1.5">
                   Over the {fmtNum(plan.cap)}-object cap for one request — copy a smaller selection.
@@ -367,6 +375,25 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             </div>
           )}
 
+          {result.skipped > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Not copied</div>
+              <div className="space-y-1.5">
+                {skipGroups(result.objects).map((g) => (
+                  <div key={g.reason} className="border border-bdr rounded-lg px-3 py-2">
+                    <div className="text-[12px] text-soft">
+                      {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
+                    </div>
+                    <div className="font-mono text-[11.5px] text-mute mt-0.5 break-words">
+                      {g.names.slice(0, 24).join(", ")}
+                      {g.names.length > 24 ? `, +${fmtNum(g.names.length - 24)} more` : ""}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {result.fksFailed > 0 && (
             <div className="mb-3">
               <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Foreign keys not added</div>
@@ -391,10 +418,9 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             </div>
           )}
 
-          <p className="text-[11.5px] text-mute">
-            A copied table arrives with its columns, defaults, its own constraints and its foreign keys. Its rows and its indexes
-            are not part of this copy.
-          </p>
+          {/* what this kind carries, in the backend's own words — the same sentence the
+              confirmation dialog was written from, so the two cannot describe different copies */}
+          <p className="text-[11.5px] text-mute">{objectCopyKindSummary(plan, result.kind)?.note}</p>
         </section>
       )}
 
@@ -493,7 +519,7 @@ function ObjectPicker({
             {available.map((i) => (
               <option key={i.name} value={i.name} className="px-1 py-0.5">
                 {i.name}
-                {i.existsInTarget ? "  ·  in target" : ""}
+                {itemTag(i)}
               </option>
             ))}
           </select>
@@ -534,7 +560,7 @@ function ObjectPicker({
             {selected.map((i) => (
               <option key={i.name} value={i.name} className="px-1 py-0.5">
                 {i.name}
-                {i.existsInTarget ? "  ·  in target" : ""}
+                {itemTag(i)}
               </option>
             ))}
           </select>
@@ -544,10 +570,45 @@ function ObjectPicker({
       <p className="text-[11px] text-mute mt-1.5">
         Ctrl-click and shift-click pick several; double-click moves one. A name marked{" "}
         <span className="font-mono">· in target</span> already exists in {plan.targetSchema} and is what the choice above
-        decides the fate of.
+        decides the fate of; one marked <span className="font-mono">· needs …</span> is built on a table that is not there
+        yet, and copying it would only report that.
       </p>
     </section>
   );
+}
+
+/**
+ * What a name is marked with in the two lists.
+ *
+ * An `<option>` holds text and nothing else, so both marks are suffixes rather than badges.
+ * "In target" is the short one because the choice above already says what happens to it; the
+ * other one names the table, because the table is the thing the user has to go and copy. Only
+ * one mark is shown, and a missing table wins it: an object that cannot be created at all is
+ * not about to be skipped or replaced either.
+ */
+function itemTag(i: ObjectCopyPlan["items"][number]): string {
+  if (i.missingTable) return `  ·  needs ${i.missingTable}`;
+  return i.existsInTarget ? "  ·  in target" : "";
+}
+
+/**
+ * Skipped objects, gathered under the reason they were skipped.
+ *
+ * A flat skip list is the least useful part of a result — "already in the target" two hundred
+ * times is two hundred rows saying one thing. One row per reason says the same thing once, and
+ * the small groups go first because those are the ones worth reading: the handful of indexes
+ * whose table has not been copied yet, rather than the two hundred that were already there.
+ */
+function skipGroups(objects: ObjectCopyObjectResult[]): { reason: string; names: string[] }[] {
+  const groups = new Map<string, string[]>();
+  for (const o of objects) {
+    if (o.status !== "skipped") continue;
+    const reason = o.reason ?? "Skipped.";
+    groups.set(reason, [...(groups.get(reason) ?? []), o.name]);
+  }
+  return [...groups]
+    .map(([reason, names]) => ({ reason, names }))
+    .sort((a, b) => a.names.length - b.names.length || a.reason.localeCompare(b.reason));
 }
 
 /** The reason this copy cannot run at all, or null. The backend refuses each of these too. */

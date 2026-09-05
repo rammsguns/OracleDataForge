@@ -36,8 +36,14 @@ import {
 } from "./objectCopy.ts";
 
 describe("OBJECT_COPY_KINDS", () => {
-  it("is what one run can copy — tables today, indexes next", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["tables"]);
+  it("is what one run can copy, in the order the UI offers them", () => {
+    assert.deepEqual(ALL_COPY_KINDS, ["tables", "indexes"]);
+  });
+
+  it("puts tables before indexes, which is the order they have to be copied in", () => {
+    // an index cannot be created before its table, so offering them the other way round would
+    // walk the user into a run that reports nothing but "its table is not there"
+    assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("indexes"));
   });
 
   it("gives every kind a distinct label and a spec that can be looked up", () => {
@@ -59,12 +65,36 @@ describe("OBJECT_COPY_KINDS", () => {
     // difference nothing in the run reports
     assert.equal(copyKindSpec("tables").foreignKeys, true);
   });
+
+  it("does not run the foreign-key pass for a kind that cannot own one", () => {
+    // it would be a wasted pair of queries against the source at best, and the results it
+    // reported would be about tables this run never touched
+    assert.equal(copyKindSpec("indexes").foreignKeys, false);
+  });
+
+  it("marks indexes as built on a table, which is what checks the target for one first", () => {
+    // without it a whole run of indexes fails with ORA-00942 naming neither the index nor the
+    // table it wanted; with it each one is a skip that names the table to copy across
+    assert.equal(copyKindSpec("indexes").requiresTable, true);
+    assert.equal(copyKindSpec("tables").requiresTable, false);
+  });
+
+  it("says what each kind carries and what replacing one costs", () => {
+    // both are shown to the user verbatim — the note in the type list and in the confirmation
+    // dialog, the replace note under the "drop and recreate" choice
+    for (const spec of OBJECT_COPY_KINDS) {
+      assert.ok(spec.note.length > 20, `${spec.kind} needs a note`);
+      assert.ok(spec.replaceNote.length > 20, `${spec.kind} needs a replace note`);
+    }
+  });
 });
 
 describe("normalizeKind", () => {
   it("keeps a kind it recognises, however it was typed", () => {
     assert.equal(normalizeKind("tables"), "tables");
     assert.equal(normalizeKind(" TABLES "), "tables");
+    assert.equal(normalizeKind("indexes"), "indexes");
+    assert.equal(normalizeKind(" Indexes "), "indexes");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
@@ -349,9 +379,22 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("tables", 'X"Y'), 'DROP TABLE "X""Y" CASCADE CONSTRAINTS PURGE');
   });
 
+  it("drops an index by name alone", () => {
+    // nothing depends on an index and nothing goes to the recycle bin with it, so neither
+    // CASCADE CONSTRAINTS nor PURGE is a clause DROP INDEX even accepts
+    assert.equal(dropStatement("indexes", "EMP_NAME_IX"), 'DROP INDEX "EMP_NAME_IX"');
+  });
+
   it("refuses a name no object could have", () => {
     assert.equal(dropStatement("tables", "   "), null);
     assert.equal(dropStatement("tables", "A".repeat(129)), null);
+    assert.equal(dropStatement("indexes", ""), null);
+  });
+
+  it("has a statement for every kind, since replace is offered for all of them", () => {
+    for (const kind of ALL_COPY_KINDS) {
+      assert.match(String(dropStatement(kind, "SOMETHING")), /^DROP [A-Z ]+ "SOMETHING"/);
+    }
   });
 });
 
@@ -363,5 +406,9 @@ describe("copyCountLabel", () => {
 
   it("groups a count large enough to be hard to read", () => {
     assert.equal(copyCountLabel("tables", 1200), "1,200 Tables");
+  });
+
+  it("names every kind, since the dialog is written from whichever one was picked", () => {
+    assert.equal(copyCountLabel("indexes", 40), "40 Indexes");
   });
 });

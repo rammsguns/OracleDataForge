@@ -70,8 +70,9 @@ export const objectCopyKindSummary = (plan: ObjectCopyPlan | undefined, kind: Co
   plan?.breakdown.find((b) => b.kind === kind);
 
 /**
- * What the current selection comes to: how many objects, and how many of those the target
- * already has — which is what "skip" leaves alone and "replace" drops.
+ * What the current selection comes to: how many objects, how many of those the target already
+ * has — which is what "skip" leaves alone and "replace" drops — and how many name a table the
+ * target has not got, which the copy will report rather than create.
  *
  * Counted from the plan the browser already holds, so moving a name across the picker is
  * arithmetic rather than another pair of dictionary reads. The server counts it again from its
@@ -81,11 +82,15 @@ export const objectCopyKindSummary = (plan: ObjectCopyPlan | undefined, kind: Co
 export function selectedCounts(
   plan: ObjectCopyPlan | undefined,
   names: string[]
-): { total: number; conflicts: number } {
-  if (!plan) return { total: 0, conflicts: 0 };
+): { total: number; conflicts: number; blocked: number } {
+  if (!plan) return { total: 0, conflicts: 0, blocked: 0 };
   const picked = new Set(names);
   const chosen = plan.items.filter((i) => picked.has(i.name));
-  return { total: chosen.length, conflicts: chosen.filter((i) => i.existsInTarget).length };
+  return {
+    total: chosen.length,
+    conflicts: chosen.filter((i) => i.existsInTarget).length,
+    blocked: chosen.filter((i) => i.missingTable).length,
+  };
 }
 
 /** Preflight (or re-check). Safe to call repeatedly; refuses while a copy is running. */

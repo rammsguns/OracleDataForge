@@ -467,13 +467,13 @@ export interface CompileBatchResult {
 /**
  * One kind of object a copy can move, as `server/objectCopy.ts` defines it.
  *
- * One kind per run. The names are the backend's whitelist, but nothing else about a kind is
- * repeated here: its label, the note saying what it carries, and its counts all arrive on the
- * plan (`ObjectCopyPlan.breakdown` covers every kind, chosen or not), so the two sides cannot
- * drift into disagreeing about what a copy contains — and the next kind is a change to the
- * server alone.
+ * One kind per run. The names are the backend's whitelist, and they are all that is repeated
+ * here: every label, the note saying what a kind carries, the note saying what replacing one
+ * costs and all of the counts arrive on the plan (`ObjectCopyPlan.breakdown` covers every
+ * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
+ * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "tables";
+export type CopyKind = "tables" | "indexes";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
@@ -483,6 +483,8 @@ export interface ObjectCopyKindSummary {
   label: string;
   /** what this kind carries with it, and what it leaves behind */
   note: string;
+  /** what "drop and recreate" costs for this kind, in the backend's words */
+  replaceNote: string;
   selected: boolean;
   total: number;
   /** how many of them the target already has */
@@ -492,6 +494,8 @@ export interface ObjectCopyKindSummary {
 export interface ObjectCopyItem {
   name: string;
   existsInTarget: boolean;
+  /** the table this object needs and the target has not got — it would be skipped, not created */
+  missingTable?: string;
 }
 
 export interface ObjectCopyPlan {
@@ -508,6 +512,8 @@ export interface ObjectCopyPlan {
   items: ObjectCopyItem[];
   total: number;
   conflicts: number;
+  /** how many of them name a table the target has not got */
+  blocked: number;
   cap: number;
   overCap: boolean;
   targetReadOnly: boolean;

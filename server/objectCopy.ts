@@ -17,11 +17,11 @@
 /**
  * One kind of object a copy can move.
  *
- * A union of one, today. It is a union rather than a bare string because the next kind —
- * indexes — is an entry in `OBJECT_COPY_KINDS` and a listing query beside it, and the type is
- * what makes the compiler point at every place that has to grow when it is added.
+ * A union rather than a bare string, so the compiler points at every place a new kind has to
+ * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
+ * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "tables";
+export type CopyKind = "tables" | "indexes";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -35,8 +35,16 @@ export interface CopyKindSpec {
    * from running for a kind that has nothing to add.
    */
   foreignKeys: boolean;
+  /**
+   * Objects of this kind are built *on* a table, so one cannot land before its table does.
+   * The run looks for the table in the target first and reports a missing one as a skip that
+   * names it, rather than letting `CREATE` fail with an ORA-00942 that names nothing useful.
+   */
+  requiresTable: boolean;
   /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
   note: string;
+  /** what "drop and recreate" costs for this kind — a table and an index are not the same bet */
+  replaceNote: string;
 }
 
 /**
@@ -54,7 +62,20 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     label: "Tables",
     objectType: "TABLE",
     foreignKeys: true,
+    requiresTable: false,
     note: "Columns, defaults, constraints and, once every table is there, foreign keys. Not the rows or the indexes.",
+    replaceNote:
+      "Each existing table is dropped before it is recreated. A dropped table takes its rows with it and does not go to the recycle bin.",
+  },
+  {
+    kind: "indexes",
+    label: "Indexes",
+    objectType: "INDEX",
+    foreignKeys: false,
+    requiresTable: true,
+    note: "The indexes someone created, on tables the target already has. Not the ones Oracle built for a primary or unique key — those arrive with the table.",
+    replaceNote:
+      "Each existing index is dropped before it is recreated. That costs the time to rebuild it and queries run without it in between, but no data goes with it.",
   },
 ];
 
@@ -122,6 +143,9 @@ export function normalizeNames(value: unknown, available: string[]): string[] | 
  * pass over the tables that landed, which is what makes the order they were created in
  * irrelevant. Leaving them inside `CREATE TABLE` would fail every child copied before its
  * parent, and those are the tables a copy is least able to retry.
+ *
+ * Both constraint parameters describe tables, and Oracle ignores them for a kind that has no
+ * constraints — which is why one set of parameters serves every kind rather than one per kind.
  *
  * The tablespace is the caller's choice, and the two parameters move together because Oracle
  * makes them: `TABLESPACE=TRUE` emits nothing while `SEGMENT_ATTRIBUTES=FALSE` suppresses the
@@ -328,6 +352,10 @@ export function copyIdent(name: string): string | null {
  * points at cannot be dropped otherwise — and `PURGE` is what stops every replacement leaving
  * a recycle-bin copy of the old table behind. Both are why "replace" is offered as the
  * destructive choice it is rather than as a checkbox.
+ *
+ * Every other kind drops by name alone: `DROP INDEX "SALES_IX"` is a plain drop, and an index
+ * Oracle built for a constraint refuses it with ORA-02429 — which is the right answer, since
+ * that index belongs to the constraint and the copy has no business replacing it.
  */
 export function dropStatement(kind: CopyKind, name: string): string | null {
   const spec = copyKindSpec(kind);

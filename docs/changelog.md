@@ -13,7 +13,8 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and the type this first version copies is **tables**; indexes are next. Reading both
+  run, and there are two of them: **tables** and **indexes**, offered in that order because it
+  is the order they have to be copied in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -32,6 +33,15 @@ Dates are the date the change landed on `main`.
   target already has are left alone, which is what makes re-running a copy safe. Qualification a
   *developer* wrote (a default calling `HR.ORDER_SEQ.NEXTVAL`) is rewritten to the target schema
   by a scan that skips string literals and comments.
+  An index run copies the indexes somebody wrote a `CREATE INDEX` for, and only onto a table the
+  target already has. The ones Oracle made for a primary or unique key are left out: that index
+  is created by the constraint and arrives with the table, so copying it again would be a second
+  index over the same columns — as are LOB and index-organized-table internals, system-named
+  indexes and indexes on another schema's table. An index whose table is not in the target is
+  reported as a skip naming that table, and the picker marks it before the run starts rather
+  than letting Oracle answer with an ORA-00942 that names neither the index nor the table it
+  wanted. Copy the tables, then the indexes. Replacing an index is a rebuild rather than a
+  deletion, and the confirmation dialog says so instead of the sentence it uses for tables.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -44,14 +54,17 @@ Dates are the date the change landed on `main`.
   and says that a dropped table takes its rows with it and does not reach the recycle bin. A
   failure does not stop the run: unlike a table migration script, this is hundreds of independent
   objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
-  the Oracle error — is reported, which is also what makes re-running it useful.
+  the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
+  grouped by the reason they were skipped, smallest group first: "already in the target" two
+  hundred times is one line, and the handful whose table has not been copied yet is the line
+  worth reading.
   Both endpoints are addressed by the target connection, so read-only mode, the
   Oracle-maintained-schema refusal, the workspace role check and the write guard already covered
   it. The copy runs on the backend and survives switching tabs. The kind catalogue, the statement
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 50 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 57 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 

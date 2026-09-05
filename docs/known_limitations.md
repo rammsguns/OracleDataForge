@@ -234,14 +234,27 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and today that type is tables.** Indexes are next; sequences,
-  views, code objects and foreign keys are not copied at all yet. Nothing outside the schema —
+- **One object type per run, and there are two of them: tables and indexes.** Sequences, views,
+  code objects, triggers and synonyms are not copied at all yet. Nothing outside the schema —
   grants, roles, quotas, profiles, database links, directories — is copied, and nothing that
   lives in a DBA view the connection cannot read.
 - **A table arrives without its rows or its indexes.** Its columns, defaults, primary key,
   unique keys, check constraints and foreign keys come with it — the foreign keys through a
   second pass after every table in the run exists, which is why the order the tables were
-  copied in does not matter.
+  copied in does not matter. The indexes are the other run.
+- **Indexes are copied only onto a table the target already has.** An index is created on a
+  table, so one whose table has not been copied yet is reported as a skip naming the table
+  rather than attempted; the picker marks it the same way before the run starts. Copy the
+  tables first, then the indexes — which is the order the two types are offered in.
+- **The indexes Oracle made for you are not copied.** An index behind a primary or unique key
+  is created by that constraint and arrives with the table, so copying it again would be a
+  second index over the same columns; those, along with LOB and index-organized-table
+  internals, system-named indexes and indexes on another schema's table, are left out of the
+  listing entirely. What is offered is the indexes somebody wrote a `CREATE INDEX` for.
+- **A partitioned or domain index can still fail.** The DDL is copied as the source wrote it, so
+  a local index needs a target table partitioned the same way and a domain index needs its
+  indextype installed. Neither is checked in advance: the failure is reported per index, with
+  Oracle's error, and the rest of the run continues.
 - **A foreign key pointing outside the copy is reported, not created.** One that references a
   table the run did not bring across cannot be added until that table is in the target; the
   result names it and the reason. Copy the missing table and run the copy again — the second
@@ -249,7 +262,12 @@ replacement for Data Pump.
 - **Replacing a table drops the foreign keys pointing *at* it.** `DROP TABLE … CASCADE
   CONSTRAINTS` is what lets a parent be replaced at all, and it takes the children's references
   with it. A child in the same run gets its key back in the second pass; one outside the run
-  does not, and has to be copied again itself.
+  does not, and has to be copied again itself. It takes the target table's own indexes with it
+  too, so a table replaced after its indexes were copied needs the index run again.
+- **Replacing an index rebuilds it.** `DROP INDEX` and a fresh `CREATE INDEX` cost the build
+  time and leave queries running without the index in between; no data goes with it. An index
+  Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
+  the failure it is rather than worked around.
 - **The tablespace is a choice; the rest of the physical layout is not.** Left off — the
   default — the segment clause is suppressed and objects land on the target's default
   tablespace, which is what lets a production schema land on a laptop. Turned on, each object

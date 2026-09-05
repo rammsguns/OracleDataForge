@@ -1,16 +1,18 @@
 # Architecture
 
 Oracle DataForge is a two-process application: a React single-page frontend and an Express
-backend that owns every Oracle session. About 20,300 lines of TypeScript across `src/` and
+backend that owns every Oracle session. About 24,200 lines of TypeScript across `src/` and
 `server/`.
 
 The shape is deliberately flat. There is no router, no state-management library, no ORM and
-no service layer. The backend is **one file plus three modules**: `server/index.ts` holds every
+no service layer. The backend is **one file plus four modules**: `server/index.ts` holds every
 route, while `server/connectionExport.ts` (the encrypted-export envelope),
-`server/oracleWallet.ts` (reading an Oracle Cloud wallet zip and its `tnsnames.ora`) and
-`server/connectionRole.ts` (a connection's Oracle privilege) sit apart — the pieces of backend
-logic pure enough to test without a server around them, and the pieces whose input is
-untrusted: a file someone uploaded, or a role name from a request body or an older registry.
+`server/oracleWallet.ts` (reading an Oracle Cloud wallet zip and its `tnsnames.ora`),
+`server/connectionRole.ts` (a connection's Oracle privilege) and `server/objectCopy.ts` (what a
+copy may move and what its DDL is turned into) sit apart — the pieces of backend logic pure
+enough to test without a server around them, and the pieces whose input is untrusted: a file
+someone uploaded, a role name from a request body or an older registry, a list of object names
+from a browser.
 They are also all the test suite covers; the rest of the backend is still verified by hand.
 
 ## Layout
@@ -20,14 +22,14 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 6,918 lines
+server/index.ts                  the backend: routes, registry, guards — 7,102 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds, name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (tables, indexes), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -184,8 +186,8 @@ connection being written to — so `requireFullAccess`, the read-only refusal, t
 Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
 set of rules; the source arrives as a parameter and is only ever read.
 
-One run copies one kind of object, so what it did is legible from the result rather than
-having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
+One run copies one kind of object — **tables** or **indexes** — so what it did is legible from
+the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
 `server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
 mistake that looks like a success — a qualifier left pointing at the source is a VALID object
@@ -195,9 +197,18 @@ names with the source's own listing before any of them reaches `GET_DDL` or a `D
 `index.ts` keeps the Oracle half: the dictionary query that lists each kind, and the session
 that applies the parameters and runs the statements. The plan surveys every kind and marks the chosen
 one, so the browser renders the catalogue the server gave it rather than a copy that can drift,
-and adding the next kind — indexes — is an entry in `OBJECT_COPY_KINDS` and a listing query
-beside it. Unlike `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of
-independent objects, every one is attempted, and every outcome is reported.
+and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside it. Unlike
+`oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
+every one is attempted, and every outcome is reported.
+
+Two things follow from a kind rather than being written into the route. A kind that can own
+foreign keys gets a second pass after the object loop, which is why `REF_CONSTRAINTS` is left
+out of `CREATE TABLE` at all: a foreign key names a second table, and alphabetical order puts
+plenty of children before their parents. A kind that is *built on* a table — indexes — gets the
+opposite treatment, a check before the loop: the run reads which table each object belongs to
+and reports a missing one as a skip naming the table, because Oracle's own answer is an
+ORA-00942 that names neither the index nor the table it wanted. The plan runs the same check
+against the target's tables, so the picker marks those objects before anything is attempted.
 
 ## The write guard
 
