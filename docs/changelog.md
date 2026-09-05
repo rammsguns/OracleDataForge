@@ -10,6 +10,73 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- **Copy objects from one connection to another.** The Migration tab now opens on a choice —
+  **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
+  and target and recreates the source schema's objects of one type in the target. One type per
+  run, and there are three of them: **sequences**, **tables** and **indexes**, offered in that
+  order because it is the order they have to be copied in. Reading both
+  dictionaries first shows how many there are and which of them the target already has.
+  Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
+  source has on the left, everything this run will copy on the right, arrows between them, and a
+  name filter over the left list — the "move all" arrow moves what the filter is showing, so
+  filtering to `SALES_` and pressing it picks a whole family of tables at once. Ctrl-click and
+  shift-click pick several, double-click moves one, and a name already in the target is marked as
+  such in both lists. It opens with everything picked, which is the copy most people came for.
+  A table arrives with its columns, defaults, primary key, unique keys, check constraints and
+  foreign keys, and without its rows and its indexes. DDL is read with `EMIT_SCHEMA` off, so
+  nothing lands qualified with the source schema, and with `REF_CONSTRAINTS` off — not to drop
+  the foreign keys but to defer them. A foreign key names a second table the run may not have
+  reached yet (alphabetical order puts plenty of children before their parents), so leaving them
+  inside `CREATE TABLE` would fail every child copied before its parent. They are added instead
+  by a second pass once every table in the run is there, one constraint at a time, so a key
+  pointing at a table nobody copied is one reported line rather than a failed table. Ones the
+  target already has are left alone, which is what makes re-running a copy safe. Qualification a
+  *developer* wrote (a default calling `HR.ORDER_SEQ.NEXTVAL`) is rewritten to the target schema
+  by a scan that skips string literals and comments.
+  An index run copies the indexes somebody wrote a `CREATE INDEX` for, and only onto a table the
+  target already has. The ones Oracle made for a primary or unique key are left out: that index
+  is created by the constraint and arrives with the table, so copying it again would be a second
+  index over the same columns — as are LOB and index-organized-table internals, system-named
+  indexes and indexes on another schema's table. An index whose table is not in the target is
+  reported as a skip naming that table, and the picker marks it before the run starts rather
+  than letting Oracle answer with an ORA-00942 that names neither the index nor the table it
+  wanted. Copy the tables, then the indexes. Replacing an index is a rebuild rather than a
+  deletion, and the confirmation dialog says so instead of the sentence it uses for tables.
+  A sequence arrives at the number the source's has reached rather than at the number it
+  started from, so the copy carries on from where the source is instead of handing out values
+  the source has already used — which is also what makes replacing an existing sequence the
+  dangerous choice, since a target sequence that has gone further is reset backwards and its
+  next values collide with rows that are already there. The dialog says that in place of the
+  sentence it uses for a table. The sequences Oracle creates for identity columns are left out
+  of the listing: they belong to the table and arrive with it. And because a sequence occupies
+  no segment, the tablespace choice is not offered for it at all — the checkbox is absent and
+  the dialog says nothing about tablespaces — rather than being offered and quietly ignored.
+  **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
+  suppressed entirely and objects land in the target's default tablespace — which is what lets a
+  production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
+  database that has no such tablespace. On, each object is created where it lives in the source,
+  for a copy between two databases laid out the same way. Storage sizing (`INITIAL`, `NEXT`) is
+  left to the target either way: where a table lives is a different question from how much room
+  the source gave it. The confirmation dialog says which of the two is about to happen.
+  Objects the target already has are left alone by default; the other choice drops and recreates
+  them, and is presented as the destructive operation it is — the confirmation dialog counts them
+  and says that a dropped table takes its rows with it and does not reach the recycle bin. A
+  failure does not stop the run: unlike a table migration script, this is hundreds of independent
+  objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
+  the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
+  grouped by the reason they were skipped, smallest group first: "already in the target" two
+  hundred times is one line, and the handful whose table has not been copied yet is the line
+  worth reading.
+  Both endpoints are addressed by the target connection, so read-only mode, the
+  Oracle-maintained-schema refusal, the workspace role check and the write guard already covered
+  it. The copy runs on the backend and survives switching tabs. The kind catalogue, the statement
+  preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
+  block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
+  `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
+  `server/objectCopy.ts` with 60 tests, because each is a mistake that looks like a success
+  rather than an error. Caps and what the copy deliberately leaves out are in
+  [known_limitations.md](known_limitations.md#copying-objects-between-connections).
+
 - **Choose the connection's role, the way SQL Developer does.** The connection wizard now has a
   **Role** dropdown beside the username, offering the same list SQL Developer does — `default`,
   `SYSDBA`, `SYSOPER`, `SYSBACKUP`, `SYSDG`, `SYSKM`, `SYSASM` — and every session the

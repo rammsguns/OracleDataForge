@@ -20,9 +20,10 @@ Verified against the source, not just the README:
 - **No container image.** See [deployment.md](deployment.md).
 - **No object-name autocomplete.** Completions are keyword-only; object names previously came
   from mock data that no longer exists.
-- **Almost no tests.** `npm test` covers two pure modules — the connection-export envelope and
-  the Oracle Cloud wallet reader — on Node's built-in runner. Everything else is verified by
-  `npm run typecheck`, `npm run build`, a health check, and hand.
+- **Almost no tests.** `npm test` covers four pure modules — the connection-export envelope,
+  the Oracle Cloud wallet reader, the connection role and the object copy — on Node's built-in
+  runner. Everything else is verified by `npm run typecheck`, `npm run build`, a health check,
+  and hand.
 
 ## SQL execution
 
@@ -227,6 +228,78 @@ comment as reconstructed.
 Schema comparison in the migration assistant is **structure only** — no data. Indexes and
 constraints are matched by semantic signature rather than name, and renamed objects are
 reported as informational with no DDL generated.
+
+## Copying objects between connections
+
+The Migration tab's **Copy objects** is a working copy of a development schema, not a
+replacement for Data Pump.
+
+- **One object type per run, and there are three of them: sequences, tables and indexes.**
+  They are listed in the order they have to be copied in — a column default calling
+  `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, and an index cannot be
+  created before its table — but nothing enforces that order: each run is confirmed and
+  reported on its own, and running them out of order simply reports the failures. Views, code
+  objects, triggers and synonyms are not copied at all yet. Nothing outside the schema —
+  grants, roles, quotas, profiles, database links, directories — is copied, and nothing that
+  lives in a DBA view the connection cannot read.
+- **A sequence arrives at the number the source has reached, not the number it started from.**
+  That is what stops a copy handing out values the source has already used, and it is what
+  makes replacing an existing sequence the dangerous choice: a target sequence that has gone
+  further than the source's is reset *backwards*, and the next rows it numbers collide with
+  rows that are already there. The sequences Oracle creates for identity columns (`ISEQ$_…`)
+  are left out of the listing — they belong to the table and arrive with it.
+- **A table arrives without its rows or its indexes.** Its columns, defaults, primary key,
+  unique keys, check constraints and foreign keys come with it — the foreign keys through a
+  second pass after every table in the run exists, which is why the order the tables were
+  copied in does not matter. The indexes are the other run.
+- **Indexes are copied only onto a table the target already has.** An index is created on a
+  table, so one whose table has not been copied yet is reported as a skip naming the table
+  rather than attempted; the picker marks it the same way before the run starts. Copy the
+  tables first, then the indexes — which is the order the two types are offered in.
+- **The indexes Oracle made for you are not copied.** An index behind a primary or unique key
+  is created by that constraint and arrives with the table, so copying it again would be a
+  second index over the same columns; those, along with LOB and index-organized-table
+  internals, system-named indexes and indexes on another schema's table, are left out of the
+  listing entirely. What is offered is the indexes somebody wrote a `CREATE INDEX` for.
+- **A partitioned or domain index can still fail.** The DDL is copied as the source wrote it, so
+  a local index needs a target table partitioned the same way and a domain index needs its
+  indextype installed. Neither is checked in advance: the failure is reported per index, with
+  Oracle's error, and the rest of the run continues.
+- **A foreign key pointing outside the copy is reported, not created.** One that references a
+  table the run did not bring across cannot be added until that table is in the target; the
+  result names it and the reason. Copy the missing table and run the copy again — the second
+  pass fills in what is now possible and leaves alone what is already there.
+- **Replacing a table drops the foreign keys pointing *at* it.** `DROP TABLE … CASCADE
+  CONSTRAINTS` is what lets a parent be replaced at all, and it takes the children's references
+  with it. A child in the same run gets its key back in the second pass; one outside the run
+  does not, and has to be copied again itself. It takes the target table's own indexes with it
+  too, so a table replaced after its indexes were copied needs the index run again.
+- **Replacing an index rebuilds it.** `DROP INDEX` and a fresh `CREATE INDEX` cost the build
+  time and leave queries running without the index in between; no data goes with it. An index
+  Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
+  the failure it is rather than worked around.
+- **The tablespace is a choice for the kinds that occupy one, and not offered for the rest.** A
+  sequence lives in no segment, so the checkbox is not shown for it and the confirmation dialog
+  says nothing about tablespaces. For tables and indexes: left off — the
+  default — the segment clause is suppressed and objects land on the target's default
+  tablespace, which is what lets a production schema land on a laptop. Turned on, each object
+  is created in the tablespace it has in the source, and the copy fails outright on a target
+  that has no tablespace of that name. Storage sizing (`INITIAL`, `NEXT`, `MAXEXTENTS`) is
+  never carried either way, so the copy is not a way to reproduce a tuned physical design.
+- **A name that is not in the source's listing is not copied.** The picker's selection is
+  intersected with the dictionary before anything is read, because a name reaches
+  `dbms_metadata.get_ddl` and a `DROP`. Matching is exact, and the dictionary's spelling of a
+  name is the object's name — a hand-written API call asking for `employees` instead of
+  `EMPLOYEES` copies nothing and says so, rather than guessing.
+- **Caps, not streams.** A copy runs inside one HTTP request: at most 2,000 objects and a
+  five-minute budget. Both are reported before the copy starts, and a run that hits one says so
+  rather than reporting success.
+
+Schema qualification a *developer* wrote — a column default calling `HR.ORDER_SEQ.NEXTVAL` — is
+rewritten to the target schema by a scan that skips string literals and comments. It is a text
+pass, not a PL/SQL parser: a qualifier assembled at run time from a variable is not rewritten,
+and the copied object will read the source schema. DDL that Oracle itself emits is read
+unqualified (`EMIT_SCHEMA=FALSE`) and needs no rewriting.
 
 ## Oracle Cloud wallets
 

@@ -20,6 +20,19 @@ import {
   type WalletService,
 } from "./oracleWallet.ts";
 import { effectiveRole, normalizeRole, oraPrivilege, type ConnectionRole } from "./connectionRole.ts";
+import {
+  ALL_COPY_KINDS,
+  copyCountLabel,
+  copyKindSpec,
+  copyStatements,
+  copyTransforms,
+  dropStatement,
+  normalizeKind,
+  normalizeNames,
+  OBJECT_COPY_KINDS,
+  retargetSchema,
+  type CopyKind,
+} from "./objectCopy.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -3685,6 +3698,528 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
   }
 }
 
+/* ---------------- Copy objects into another connection (Oracle) ---------------- */
+
+/**
+ * A copy is capped rather than streamed. Everything below runs inside one HTTP request, so
+ * the caps are what stop a schema nobody looked at first from holding a request open for an
+ * hour. Both are reported in the plan, so the UI can say "this is more than one run" before
+ * anything is created rather than after.
+ */
+const OBJECT_COPY_MAX_OBJECTS = 2000;
+const OBJECT_COPY_BUDGET_MS = 300_000;
+const OBJECT_COPY_DDL_LOCK_S = 10;
+
+/** What a copy does with an object the target already has. */
+type CopyExisting = "skip" | "replace";
+
+interface ObjectCopyItem {
+  name: string;
+  existsInTarget: boolean;
+  /**
+   * The table this object is built on, when the target does not have it — an index whose
+   * table has not been copied yet. Absent for everything that can be created as things stand,
+   * which is every object of a kind that is not built on a table.
+   */
+  missingTable?: string;
+}
+
+interface ObjectCopyKindSummary {
+  kind: CopyKind;
+  label: string;
+  note: string;
+  /** what replacing an existing one costs — dropping a table is not dropping an index */
+  replaceNote: string;
+  /** objects of this kind live in a tablespace, so the choice about it is worth offering */
+  hasTablespace: boolean;
+  /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
+  selected: boolean;
+  total: number;
+  conflicts: number;
+}
+
+interface ObjectCopyPlan {
+  sourceId: string;
+  sourceName: string;
+  sourceSchema: string;
+  targetId: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  breakdown: ObjectCopyKindSummary[];
+  /** the objects of the chosen kind, in name order — what the run will walk */
+  items: ObjectCopyItem[];
+  total: number;
+  conflicts: number;
+  /** how many of them name a table the target has not got — they would be skipped, not created */
+  blocked: number;
+  cap: number;
+  overCap: boolean;
+  targetReadOnly: boolean;
+  targetSystemSchema: boolean;
+  /** the two connections resolve to the same schema on the same database — nothing to copy */
+  sameSchema: boolean;
+  checkedAt: string;
+}
+
+interface ObjectCopyObjectResult {
+  name: string;
+  status: "created" | "replaced" | "skipped" | "failed";
+  /** skipped: why. failed: the Oracle error. */
+  reason?: string;
+  error?: string;
+  /** how many statements it took */
+  statements: number;
+}
+
+/** One foreign key of a copied table, added after every table in the run exists. */
+interface ObjectCopyFkResult {
+  table: string;
+  name: string;
+  status: "created" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+}
+
+interface ObjectCopyResult {
+  sourceName: string;
+  sourceSchema: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  existing: CopyExisting;
+  objects: ObjectCopyObjectResult[];
+  foreignKeys: ObjectCopyFkResult[];
+  created: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  fksCreated: number;
+  fksFailed: number;
+  timedOut: boolean;
+  elapsedMs: number;
+  note?: string;
+}
+
+/**
+ * What each kind lists in the *source* dictionary.
+ *
+ * The listing excludes the objects Oracle generated for something else, because a copy that
+ * recreates them is a copy that fails: recycle-bin (`BIN$`) entries are dropped tables rather
+ * than tables, and `ORA_NOISE_TABLE` is the same exclusion the Explorer applies, so the copy
+ * offers exactly the tables the rest of the app calls the user's.
+ *
+ * A kind is added here, in `OBJECT_COPY_KINDS`, and — if it is built on a table — in
+ * `OBJECT_COPY_BASE_TABLE_SQL`. Nothing else in the server needs to know about it, and the
+ * browser only needs the name added to its own copy of the union.
+ */
+const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
+  // The sequence behind an identity column is Oracle's, not the user's: it is created with the
+  // table, dropped with it, named ISEQ$_<object id>_<column> and refuses to be dropped on its
+  // own (ORA-32794). `user_objects.generated` is Oracle's own answer to "did a human name
+  // this?", so it is the same test the index listing uses rather than a second guess at it.
+  sequences: `SELECT s.sequence_name AS "name" FROM user_sequences s
+     WHERE NOT EXISTS (
+       SELECT 1 FROM user_objects o
+        WHERE o.object_name = s.sequence_name AND o.object_type = 'SEQUENCE' AND o.generated = 'Y')
+     ORDER BY s.sequence_name`,
+  tables: `SELECT table_name AS "name" FROM user_tables WHERE NOT ${ORA_NOISE_TABLE} ORDER BY table_name`,
+  // Indexes are mostly an exercise in leaving out the ones that are not anybody's to copy:
+  //   · the index behind a primary or unique key is created *by* that constraint, and the
+  //     table copy already brings it — recreating it by hand would be a second index over the
+  //     same columns at best, and ORA-01408 at worst
+  //   · `generated = 'Y'` is Oracle's own answer to "did a human name this?", which catches
+  //     the constraint indexes it names itself along with LOB and IOT internals
+  //   · an index on someone else's table, or on a cluster, is not this schema's to recreate
+  // What is left is the indexes somebody wrote a CREATE INDEX for, which is the whole point.
+  indexes: `SELECT index_name AS "name" FROM user_indexes i
+     WHERE table_owner = USER AND table_type = 'TABLE'
+       AND generated = 'N' AND index_name NOT LIKE 'BIN$%'
+       AND index_type NOT IN ('LOB', 'IOT - TOP')
+       AND NOT ${ORA_NOISE_TABLE}
+       AND NOT EXISTS (
+         SELECT 1 FROM user_constraints c
+          WHERE c.index_name = i.index_name AND c.constraint_type IN ('P', 'U'))
+     ORDER BY index_name`,
+};
+
+/**
+ * Which table each object of a kind is built on, for the kinds that are built on one at all.
+ *
+ * Read from the source, because that is where the object exists; what the *target* is missing
+ * is then a lookup against the tables it already has. A kind with no entry here has
+ * `requiresTable: false` and never asks.
+ */
+const OBJECT_COPY_BASE_TABLE_SQL: Partial<Record<CopyKind, string>> = {
+  indexes: `SELECT index_name AS "name", table_name AS "tbl" FROM user_indexes WHERE table_owner = USER`,
+};
+
+/**
+ * Ask this session for DDL that can land in another schema.
+ *
+ * Which parameters and why is `copyTransforms` in `server/objectCopy.ts`; this is the half
+ * that talks to Oracle. Each parameter is set on its own and its failure ignored: the set is
+ * version-dependent, and an older database refusing one of them (ORA-31604) must not cost the
+ * copy the other seven.
+ */
+async function oraCopyPrepareMetadata(conn: oracledb.Connection, preserveTablespace: boolean): Promise<void> {
+  for (const [name, value] of copyTransforms(preserveTablespace)) {
+    await conn
+      .execute(
+        `BEGIN dbms_metadata.set_transform_param(dbms_metadata.session_transform, :n, :v); END;`,
+        { n: name, v: value }
+      )
+      .catch(() => {});
+  }
+}
+
+/** Every object of one kind in the connected schema, as the dictionary spells it. */
+async function oraCopyList(conn: oracledb.Connection, kind: CopyKind): Promise<string[]> {
+  const rows = await oraExecRows(conn, OBJECT_COPY_LIST_SQL[kind]);
+  return rows.map((r) => String(r.name));
+}
+
+/** Object name → the table it is built on, empty for a kind that is not built on one. */
+async function oraCopyBaseTables(conn: oracledb.Connection, kind: CopyKind): Promise<Map<string, string>> {
+  const sql = OBJECT_COPY_BASE_TABLE_SQL[kind];
+  if (!sql) return new Map();
+  const rows = await oraExecRows(conn, sql);
+  return new Map(rows.map((r) => [String(r.name), String(r.tbl)]));
+}
+
+/** What the target already has, as `KIND NAME` keys, for one query rather than one per kind. */
+async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Promise<Set<string>> {
+  const have = new Set<string>();
+  if (!kinds.length) return have;
+  const types = kinds.map((k) => copyKindSpec(k).objectType);
+  const rows = await oraExecRows(
+    conn,
+    `SELECT object_type AS "type", object_name AS "name" FROM user_objects
+     WHERE object_type IN (${types.map((t) => `'${t}'`).join(",")}) AND object_name NOT LIKE 'BIN$%'`
+  );
+  const kindOfType = new Map(kinds.map((k) => [copyKindSpec(k).objectType, k]));
+  for (const r of rows) {
+    const kind = kindOfType.get(String(r.type));
+    if (kind) have.add(`${kind} ${String(r.name)}`);
+  }
+  return have;
+}
+
+/**
+ * The statements that recreate one object in another schema.
+ *
+ * Empty when the object has no readable DDL — an object someone dropped between the plan and
+ * the run, a table DBMS_METADATA refuses. The caller reports that as a skip rather than
+ * inventing a statement for it.
+ */
+async function oraCopyObjectDdl(
+  conn: oracledb.Connection,
+  kind: CopyKind,
+  name: string,
+  fromSchema: string,
+  toSchema: string
+): Promise<string[]> {
+  const rows = await oraExecRows(conn, `SELECT dbms_metadata.get_ddl(:t, :n) AS "ddl" FROM dual`, {
+    t: copyKindSpec(kind).objectType,
+    n: name,
+  });
+  const ddl = rows[0]?.ddl;
+  if (ddl == null) return [];
+  return copyStatements(retargetSchema(String(ddl), fromSchema, toSchema));
+}
+
+/**
+ * Add the foreign keys of the tables this run put in the target.
+ *
+ * The second half of leaving `REF_CONSTRAINTS` out of `CREATE TABLE`. A foreign key names a
+ * second table, so it cannot be part of the statement that creates the first one without
+ * making the order the tables are copied in matter — and the order is alphabetical, which puts
+ * plenty of children before their parents. Deferring them to here is what makes a copied
+ * schema come out with its referential integrity intact whatever order the tables arrived in.
+ *
+ * Each constraint is read and run on its own rather than through `GET_DEPENDENT_DDL` for the
+ * whole table, so one foreign key pointing at a table nobody copied is one reported failure
+ * instead of a table's worth of them. What the target already has is read once and skipped:
+ * re-running a copy is expected, and a constraint that is already there is not an error to
+ * report — Oracle would raise ORA-02264 on the name, which says nothing useful about why.
+ */
+async function oraCopyForeignKeys(
+  srcConn: oracledb.Connection,
+  tgtConn: oracledb.Connection,
+  tables: Set<string>,
+  fromSchema: string,
+  toSchema: string,
+  deadline: number
+): Promise<{ results: ObjectCopyFkResult[]; timedOut: boolean }> {
+  const results: ObjectCopyFkResult[] = [];
+  if (!tables.size) return { results, timedOut: false };
+
+  // the whole schema's foreign keys, filtered here rather than with an IN list: a run can
+  // carry two thousand table names and Oracle stops at a thousand expressions in one IN
+  const all = await oraExecRows(
+    srcConn,
+    `SELECT constraint_name AS "name", table_name AS "table" FROM user_constraints
+     WHERE constraint_type = 'R' ORDER BY table_name, constraint_name`
+  );
+  const wanted = all.filter((r) => tables.has(String(r.table)));
+  if (!wanted.length) return { results, timedOut: false };
+
+  const present = new Set(
+    (
+      await oraExecRows(tgtConn, `SELECT constraint_name AS "name" FROM user_constraints WHERE constraint_type = 'R'`)
+    ).map((r) => String(r.name))
+  );
+
+  let timedOut = false;
+  for (const row of wanted) {
+    const name = String(row.name);
+    const table = String(row.table);
+    if (Date.now() > deadline) {
+      timedOut = true;
+      break;
+    }
+    if (present.has(name)) {
+      results.push({ table, name, status: "skipped", reason: `Already in ${toSchema}.` });
+      continue;
+    }
+    try {
+      const rows = await oraExecRows(srcConn, `SELECT dbms_metadata.get_ddl('REF_CONSTRAINT', :n) AS "ddl" FROM dual`, {
+        n: name,
+      });
+      const ddl = rows[0]?.ddl;
+      if (ddl == null) {
+        results.push({ table, name, status: "skipped", reason: "The source has no readable DDL for this constraint." });
+        continue;
+      }
+      for (const sql of copyStatements(retargetSchema(String(ddl), fromSchema, toSchema))) {
+        await tgtConn.execute(sql, [], { autoCommit: true });
+      }
+      results.push({ table, name, status: "created" });
+    } catch (e) {
+      results.push({ table, name, status: "failed", error: errMsg(e) });
+    }
+  }
+  return { results, timedOut };
+}
+
+/**
+ * Read the source and the target and describe what a copy would do, without touching either.
+ *
+ * The plan is what the confirmation dialog is written from, so it counts the same objects the
+ * run will walk, using the same query — a preview built from a different list than the run is
+ * worse than no preview.
+ *
+ * It surveys **every** kind and marks which one is chosen, rather than surveying only the
+ * chosen one. That is what lets the browser render the whole list of kinds — with a count
+ * beside each and the note saying what that kind carries — from the server's own catalogue
+ * instead of a copy of it that can drift, and it is what will make the next kind a change to
+ * this file alone. Only the chosen kind is counted into `total`, `conflicts` and the cap.
+ */
+async function oraObjectCopyPlan(
+  source: LiveConnection,
+  target: LiveConnection,
+  kind: CopyKind
+): Promise<ObjectCopyPlan> {
+  const sourceSchema = source.user.toUpperCase();
+  const targetSchema = target.user.toUpperCase();
+  const srcConn = await getOraConn(source);
+  const names = new Map<CopyKind, string[]>();
+  let baseTables = new Map<string, string>();
+  let targetSystemSchema = false;
+  let existing: Set<string>;
+  try {
+    for (const k of ALL_COPY_KINDS) names.set(k, await oraCopyList(srcConn, k));
+    if (copyKindSpec(kind).requiresTable) baseTables = await oraCopyBaseTables(srcConn, kind);
+    const tgtConn = await getOraConn(target);
+    try {
+      targetSystemSchema = await oraUserIsSystem(target, tgtConn);
+      existing = await oraCopyExisting(tgtConn, ALL_COPY_KINDS);
+    } finally {
+      await tgtConn.close();
+    }
+  } finally {
+    await srcConn.close();
+  }
+
+  const breakdown: ObjectCopyKindSummary[] = OBJECT_COPY_KINDS.map((spec) => {
+    const of = names.get(spec.kind) ?? [];
+    return {
+      kind: spec.kind,
+      label: spec.label,
+      note: spec.note,
+      replaceNote: spec.replaceNote,
+      hasTablespace: spec.hasTablespace,
+      selected: spec.kind === kind,
+      total: of.length,
+      conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
+    };
+  });
+
+  // `existing` was read for every kind, so the tables the target has are already in hand:
+  // an index whose table is not among them is one the run will skip, and saying so here is
+  // what lets the picker show it before anything is attempted rather than after.
+  const items: ObjectCopyItem[] = (names.get(kind) ?? []).map((name) => {
+    const base = baseTables.get(name);
+    return {
+      name,
+      existsInTarget: existing.has(`${kind} ${name}`),
+      ...(base && !existing.has(`tables ${base}`) ? { missingTable: base } : {}),
+    };
+  });
+
+  return {
+    sourceId: source.id,
+    sourceName: source.name,
+    sourceSchema,
+    targetId: target.id,
+    targetName: target.name,
+    targetSchema,
+    kind,
+    label: copyKindSpec(kind).label,
+    breakdown,
+    items,
+    total: items.length,
+    conflicts: items.filter((i) => i.existsInTarget).length,
+    blocked: items.filter((i) => i.missingTable).length,
+    cap: OBJECT_COPY_MAX_OBJECTS,
+    overCap: items.length > OBJECT_COPY_MAX_OBJECTS,
+    targetReadOnly: !!target.readOnly,
+    targetSystemSchema,
+    sameSchema: sameOracleSchema(source, target),
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Run the copy: one source session and one target session, one kind of object.
+ *
+ * A failure does not stop the run. `oraApplyTableDdl` stops on the first error because it is
+ * applying one table's ordered script, where everything after the failure depends on it; this
+ * is hundreds of independent objects, and one table with a missing grant must not cost the
+ * other two hundred. Every object is attempted and every outcome is reported, which is also
+ * what makes a second run useful: re-running with "skip" fills in only what failed.
+ *
+ * `names` is the objects the caller picked, already intersected with the source listing by
+ * `normalizeNames`, or null for every object of the kind. It is applied against a *fresh*
+ * listing rather than trusted as a list of things to fetch, so a name that has been dropped
+ * since the plan was read simply is not there to copy.
+ */
+async function oraObjectCopy(
+  source: LiveConnection,
+  target: LiveConnection,
+  kind: CopyKind,
+  existing: CopyExisting,
+  opts: { names: string[] | null; preserveTablespace: boolean }
+): Promise<ObjectCopyResult> {
+  const t0 = Date.now();
+  const deadline = t0 + OBJECT_COPY_BUDGET_MS;
+  const sourceSchema = source.user.toUpperCase();
+  const targetSchema = target.user.toUpperCase();
+  const spec = copyKindSpec(kind);
+  const objects: ObjectCopyObjectResult[] = [];
+  const foreignKeys: ObjectCopyFkResult[] = [];
+  /** what this run left standing in the target, and therefore owes foreign keys to */
+  const landed = new Set<string>();
+  let timedOut = false;
+
+  const srcConn = await getOraConn(source);
+  try {
+    await oraCopyPrepareMetadata(srcConn, opts.preserveTablespace);
+    const tgtConn = await getOraConn(target);
+    try {
+      // A dropped or replaced object someone else is using would otherwise block for ever;
+      // ten seconds turns that into one reported failure instead of a stalled request.
+      await tgtConn.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
+
+      // A kind built on a table needs the target's tables read too — the same query with a
+      // second type in its IN list, which is what makes the check below cost nothing.
+      const present = await oraCopyExisting(tgtConn, spec.requiresTable ? [kind, "tables"] : [kind]);
+      const baseTables = spec.requiresTable ? await oraCopyBaseTables(srcConn, kind) : new Map<string, string>();
+      const wanted = opts.names ? new Set(opts.names) : null;
+      for (const name of await oraCopyList(srcConn, kind)) {
+        if (wanted && !wanted.has(name)) continue;
+        if (Date.now() > deadline) {
+          timedOut = true;
+          break;
+        }
+        const base = { name, statements: 0 };
+        const already = present.has(`${kind} ${name}`);
+        if (already && existing === "skip") {
+          objects.push({ ...base, status: "skipped", reason: `Already in ${targetSchema} — left as it is.` });
+          // it is in the target, so its foreign keys are still this run's business: the second
+          // pass fills in the ones the target is missing and leaves the ones it has
+          landed.add(name);
+          continue;
+        }
+        // An index cannot be created before its table is there. Oracle's own answer to that is
+        // ORA-00942 on the CREATE INDEX, which names neither the index nor the table it wanted;
+        // this names both and says what to do about it.
+        const baseTable = baseTables.get(name);
+        if (baseTable && !present.has(`tables ${baseTable}`)) {
+          objects.push({
+            ...base,
+            status: "skipped",
+            reason: `${baseTable} is not in ${targetSchema} — copy the tables first, then run this again.`,
+          });
+          continue;
+        }
+        try {
+          const statements = await oraCopyObjectDdl(srcConn, kind, name, sourceSchema, targetSchema);
+          if (!statements.length) {
+            objects.push({ ...base, status: "skipped", reason: "The source has no readable DDL for this object." });
+            continue;
+          }
+          if (already) {
+            const drop = dropStatement(kind, name);
+            if (drop) await tgtConn.execute(drop, [], { autoCommit: true });
+          }
+          for (const sql of statements) await tgtConn.execute(sql, [], { autoCommit: true });
+          objects.push({ ...base, status: already ? "replaced" : "created", statements: statements.length });
+          landed.add(name);
+        } catch (e) {
+          objects.push({ ...base, status: "failed", error: withNetworkHint(errMsg(e), target.host) });
+        }
+      }
+
+      // Second pass, once every table this run is responsible for exists in the target — the
+      // point of having taken the foreign keys out of CREATE TABLE in the first place.
+      if (spec.foreignKeys && !timedOut) {
+        const fks = await oraCopyForeignKeys(srcConn, tgtConn, landed, sourceSchema, targetSchema, deadline);
+        foreignKeys.push(...fks.results);
+        timedOut = timedOut || fks.timedOut;
+      }
+    } finally {
+      await tgtConn.close();
+    }
+  } finally {
+    await srcConn.close();
+  }
+
+  const count = (s: ObjectCopyObjectResult["status"]) => objects.filter((o) => o.status === s).length;
+  return {
+    sourceName: source.name,
+    sourceSchema,
+    targetName: target.name,
+    targetSchema,
+    kind,
+    label: spec.label,
+    existing,
+    objects,
+    foreignKeys,
+    created: count("created"),
+    replaced: count("replaced"),
+    skipped: count("skipped"),
+    failed: count("failed"),
+    fksCreated: foreignKeys.filter((f) => f.status === "created").length,
+    fksFailed: foreignKeys.filter((f) => f.status === "failed").length,
+    timedOut,
+    elapsedMs: Date.now() - t0,
+    ...(objects.length ? {} : { note: `Nothing to copy — ${sourceSchema} has no ${spec.label.toLowerCase()}.` }),
+  };
+}
+
 /* ---------------- HTTP API ---------------- */
 
 const app = express();
@@ -4261,6 +4796,24 @@ const sameEndpoint = (a: ConnConfig, b: ConnConfig) =>
   (a.walletId ?? "") === (b.walletId ?? "");
 
 /**
+ * The two connections are the same Oracle schema on the same database.
+ *
+ * `sameEndpoint` is deliberately case-sensitive about the username, because it guards
+ * replaying a stored password and the conservative answer there is "not the same
+ * destination". Oracle is not: `hr` and `HR` are one account, and a copy of a schema onto
+ * itself — which with "replace" drops every object and recreates it from a dictionary it is
+ * in the middle of changing — is exactly what the copy refusal exists to stop. So this folds
+ * the case that one does not, and leaves the wallet out of it: two saved connections reaching
+ * the same database through different copies of the same wallet are still the same schema.
+ */
+const sameOracleSchema = (a: ConnConfig, b: ConnConfig) =>
+  a.engine === b.engine &&
+  a.host === b.host &&
+  Number(a.port) === Number(b.port) &&
+  (a.database ?? "") === (b.database ?? "") &&
+  a.user.trim().toUpperCase() === b.user.trim().toUpperCase();
+
+/**
  * Fills a blank password with the stored one, for the endpoint it was stored against.
  * Returns the reason it may not be reused, or null once `cfg` is ready to connect with.
  */
@@ -4646,6 +5199,181 @@ app.get("/api/connections/:id/schema/group", async (req, res) => {
     res.json(group);
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
+  }
+});
+
+/**
+ * The two object-copy endpoints, both addressed by the **target** connection.
+ *
+ * Which id is in the path is the whole access-control story: a copy writes to the target and
+ * only reads the source, so putting the target in the path is what makes the existing guards
+ * cover it without a second set of rules — `requireFullAccess`, the read-only refusal, the
+ * Oracle-maintained-schema refusal and the confirmation dialog all already describe "this
+ * connection is about to be changed". The source is a body/query parameter and is treated as
+ * what it is: a connection this browser must also be allowed to read.
+ */
+function readCopyRequest(
+  src: Record<string, unknown>,
+  targetId: string
+): CopyRequest | { error: string } {
+  const sourceId = String(src.sourceId ?? src.source ?? "").trim();
+  if (!sourceId) return { error: "Missing source connection (sourceId)." };
+  if (sourceId === targetId) return { error: "The source and the target are the same connection." };
+  const existing = String(src.existing ?? "skip").trim().toLowerCase();
+  if (existing !== "skip" && existing !== "replace") {
+    return { error: `\`existing\` must be "skip" or "replace", not "${existing}".` };
+  }
+  return {
+    sourceId,
+    kind: normalizeKind(src.kind),
+    existing,
+    // left raw on purpose: which of these names are real is a question only the source
+    // dictionary can answer, so `normalizeNames` gets them once the listing is in hand
+    names: src.names,
+    preserveTablespace: src.preserveTablespace === true || src.preserveTablespace === "true",
+  };
+}
+
+interface CopyRequest {
+  sourceId: string;
+  kind: CopyKind;
+  existing: CopyExisting;
+  /** the names the caller picked, unvalidated — absent means every object of the kind */
+  names: unknown;
+  preserveTablespace: boolean;
+}
+
+/** Both connections, or the reason the copy cannot be set up at all. */
+function copyEndpoints(sourceId: string, targetId: string): { source: LiveConnection; target: LiveConnection } | { error: string; status: number } {
+  const target = registry.get(targetId);
+  if (!target) return { status: 404, error: "Unknown connection (backend may have restarted — recreate it)" };
+  const source = registry.get(sourceId);
+  if (!source) return { status: 404, error: "Unknown source connection (backend may have restarted — recreate it)" };
+  if (source.engine !== "oracle" || target.engine !== "oracle") {
+    return { status: 400, error: "Copying objects between connections is Oracle-to-Oracle only." };
+  }
+  return { source, target };
+}
+
+/** What a copy would do, without doing any of it: GET ?source=<id>&kind=tables */
+app.get("/api/connections/:id/objects/copy", requireSchemaMetadataAccess, async (req, res) => {
+  const parsed = readCopyRequest(req.query as Record<string, unknown>, req.params.id);
+  if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  try {
+    res.json(await oraObjectCopyPlan(ends.source, ends.target, parsed.kind));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), ends.target.host) });
+  }
+});
+
+/** Run it: body { sourceId, kind?, existing?, confirm? } */
+app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res) => {
+  const parsed = readCopyRequest((req.body ?? {}) as Record<string, unknown>, req.params.id);
+  if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  const { source, target } = ends;
+  const { kind, existing } = parsed;
+  const label = copyKindSpec(kind).label.toLowerCase();
+
+  if (target.readOnly) {
+    return res.status(400).json({
+      error: `"${target.name}" is read-only — copying ${label} into it is blocked. Edit the connection to disable read-only mode.`,
+    });
+  }
+  // Two saved connections can name the same schema on the same database. Copying it onto
+  // itself is not a no-op — with "replace" it drops every object and recreates it from a
+  // dictionary it is in the middle of changing — so it is refused rather than confirmed.
+  if (sameOracleSchema(source, target)) {
+    return res.status(400).json({
+      error: `"${source.name}" and "${target.name}" are the same schema on the same database — there is nothing to copy between them.`,
+    });
+  }
+
+  let plan: ObjectCopyPlan;
+  try {
+    plan = await oraObjectCopyPlan(source, target, kind);
+  } catch (e) {
+    return res.status(500).json({ error: withNetworkHint(errMsg(e), target.host) });
+  }
+  if (plan.targetSystemSchema) {
+    return res.status(400).json({
+      error: `${plan.targetSchema} is an Oracle-maintained schema — copying objects into it from here is blocked.`,
+    });
+  }
+  // What the caller actually picked, against the listing the plan just read: everything when
+  // it named nothing, and exactly nothing when it named only objects the source does not have.
+  const names = normalizeNames(parsed.names, plan.items.map((i) => i.name));
+  const picked = new Set(names ?? plan.items.map((i) => i.name));
+  const total = picked.size;
+  const conflicts = plan.items.filter((i) => picked.has(i.name) && i.existsInTarget).length;
+  const blocked = plan.items.filter((i) => picked.has(i.name) && i.missingTable).length;
+
+  if (total > plan.cap) {
+    return res.status(400).json({
+      error: `${total} object(s) is more than this tool copies in one request (cap ${plan.cap}). Copy a smaller selection, or use Data Pump for a schema this size.`,
+    });
+  }
+  // Nothing to do is not something to confirm — the guard exists to describe real changes.
+  if (!total) {
+    return res.json({
+      sourceName: source.name, sourceSchema: plan.sourceSchema,
+      targetName: target.name, targetSchema: plan.targetSchema,
+      kind, label: plan.label, existing, objects: [], foreignKeys: [],
+      created: 0, replaced: 0, skipped: 0, failed: 0, fksCreated: 0, fksFailed: 0,
+      timedOut: false, elapsedMs: 0,
+      note: plan.total
+        ? `Nothing to copy — none of the ${label} that were asked for are in ${plan.sourceSchema}.`
+        : `Nothing to copy — ${plan.sourceSchema} has no ${label}.`,
+    } satisfies ObjectCopyResult);
+  }
+
+  if (!acknowledged(req)) {
+    const conflictLine = conflicts
+      ? existing === "replace"
+        ? ` ⚠ ${conflicts} of them already exist in ${plan.targetSchema} and will be DROPPED and recreated — a dropped table takes its rows with it and is not recoverable from the recycle bin.`
+        : ` ${conflicts} of them already exist in ${plan.targetSchema} and will be left exactly as they are.`
+      : "";
+    // Worth its own sentence because it is the one number that says "this run will not do all
+    // of what you just asked for": an index whose table is not there yet is reported, not
+    // created, and the dialog is the last place to say so before it happens.
+    const blockedLine = blocked
+      ? ` ${blocked} of them are built on a table ${plan.targetSchema} does not have and will be skipped — copy those tables first if you want them.`
+      : "";
+    // The tablespace is worth a sentence either way round: preserved, it is the clause that
+    // fails the whole copy on a target laid out differently; not preserved, the objects land
+    // somewhere other than where they came from, which is not what everyone expects. For a
+    // kind that occupies no segment there is nothing to say, and saying it anyway would be
+    // the dialog describing something that is not going to happen.
+    const tablespaceLine = !copyKindSpec(kind).hasTablespace
+      ? ""
+      : parsed.preserveTablespace
+      ? ` Each one keeps the tablespace it has in ${plan.sourceSchema}, and fails if ${target.name} has no tablespace of that name.`
+      : ` They are created in ${plan.targetSchema}'s default tablespace.`;
+    return confirmRequired(res, describeOperation({
+      level: existing === "replace" && conflicts ? "destructive" : "write",
+      verb: `COPY ${copyKindSpec(kind).label.toUpperCase()}`,
+      target: plan.targetSchema,
+      title: `Copy ${plan.sourceSchema}'s ${label} into ${plan.targetSchema}?`,
+      body:
+        `${copyCountLabel(kind, total)} from "${source.name}"` +
+        (names && total < plan.total ? ` (of ${plan.total})` : "") +
+        ` will be created in ${plan.targetSchema} on "${target.name}".` +
+        conflictLine +
+        blockedLine +
+        tablespaceLine +
+        ` ${copyKindSpec(kind).note} Objects that fail are reported and the rest of the copy continues.`,
+      confirmLabel:
+        existing === "replace" && conflicts ? `Replace and copy ${total} object(s)` : `Copy ${total} object(s)`,
+    }));
+  }
+
+  try {
+    res.json(await oraObjectCopy(source, target, kind, existing, { names, preserveTablespace: parsed.preserveTablespace }));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), target.host) });
   }
 });
 
