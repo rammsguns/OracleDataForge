@@ -234,16 +234,19 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are six of them: sequences, tables, indexes, views,
-  materialized views and triggers.** They are listed in the order they have to be copied in — a
-  column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there,
-  an index cannot be created before its table, a view over a table that has not arrived is
-  created invalid, and a materialized view over one fails outright, which is why the kind that
-  cannot recover is offered after the kind that can. Triggers come last of all, because one
-  stands on both the object it fires for and everything its body calls. Nothing enforces that
+- **One object type per run, and there are seven of them: sequences, tables, indexes, views,
+  materialized views, synonyms and triggers.** They are listed in the order they have to be
+  copied in — a column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence
+  is not there, an index cannot be created before its table, a view over a table that has not
+  arrived is created invalid, and a materialized view over one fails outright, which is why the
+  kind that cannot recover is offered after the kind that can. Synonyms sit between the
+  materialized views and the triggers on a weaker argument than the rest: nothing makes a synonym
+  fail, whatever it points at, but a trigger's body can call a synonym and no synonym can name a
+  trigger, so the one dependency there is runs that way round. Triggers come last of all, because
+  one stands on both the object it fires for and everything its body calls. Nothing enforces that
   order: each run is confirmed and reported on its own, and running them out of order simply
-  reports the outcome. Code objects — packages, procedures, functions, types — and synonyms are
-  not copied at all yet. Nothing outside the schema — grants, roles, quotas, profiles, database
+  reports the outcome. Code objects — packages, procedures, functions, types — are not copied at
+  all yet. Nothing outside the schema — grants, roles, quotas, profiles, database
   links, directories — is copied, and nothing that lives in a DBA view the connection cannot
   read.
 - **A sequence arrives at the number the source has reached, not the number it started from.**
@@ -290,10 +293,10 @@ replacement for Data Pump.
   grants on it and the views built on it survive — which is the one kind where "replace" costs
   nothing but the definition itself. Anything selecting from the old view sees the source's
   columns from that moment on.
-- **A view or a trigger from a newer database can fail on an older one.** `GET_DDL` emits the
-  `EDITIONABLE` keyword on 12.1 and later, which 11g does not accept; either copied backwards
-  across that line fails with Oracle's own syntax error, reported per object, and the rest of
-  the run continues.
+- **A view, a synonym or a trigger from a newer database can fail on an older one.** `GET_DDL`
+  emits the `EDITIONABLE` keyword on 12.1 and later, which 11g does not accept; any of them
+  copied backwards across that line fails with Oracle's own syntax error, reported per object,
+  and the rest of the run continues.
 - **A materialized view is the one kind that moves data.** Oracle builds it the way the source
   wrote it, and that is almost always `BUILD IMMEDIATE`: the `CREATE` runs the view's query
   against the *target's* tables and fills the container table before it returns. So the rows
@@ -320,6 +323,41 @@ replacement for Data Pump.
   MATERIALIZED VIEW` takes the container table with it, so the replacement is a full rebuild
   from the target's tables — and anything querying it in between finds it missing rather than
   stale.
+- **A synonym for the source's own object is repointed at the target; one for a third schema is
+  not.** A synonym is nothing but a qualified name, so this is the whole of what the copy does
+  to it. `HR.EMPLOYEES` copied out of `HR` into `STAGE` arrives as `STAGE.EMPLOYEES`, which is
+  what stops the target's queries reading the source database through the name. A synonym for
+  `FINANCE.LEDGER` is left naming `FINANCE.LEDGER`, because that is a cross-schema reference
+  somebody meant — and it is therefore a synonym that resolves only where the target database
+  has a `FINANCE` with that object in it. Copying between two databases rather than two schemas
+  of one is where that bites.
+- **A synonym is created whether or not what it points at exists.** Oracle does not resolve the
+  target of a synonym at creation, so nothing is pre-checked here the way an index's table or a
+  trigger's base object is: the run would otherwise turn away objects the database was going to
+  accept, and a synonym's target can be a package or a database link, neither of which this
+  copies. A synonym whose object is not in the target is created and answers ORA-00980 the first
+  time anything uses it. The run asks the target afterwards which of the new synonyms it marks
+  invalid and reports those as created with the sentence saying they do not work yet — but
+  whether Oracle marks a never-resolvable synonym invalid **at all** has not been checked
+  against a live database, and where it does not, such a synonym is reported as the plain
+  "created" it also is. That is the first thing to look at when a database is available.
+- **A synonym over a database link lands, and the link does not.** Database links are not one of
+  the seven types and are not copied — nor are the credentials stored in one. A synonym naming
+  `TABLE@LINK` is offered and created anyway, on the grounds that a target which already has the
+  link needs the synonym and dropping the object silently would be worse; on a target without
+  the link it is one more synonym that does not resolve.
+- **Public synonyms are not offered.** A public synonym belongs to `PUBLIC` rather than to the
+  schema and is visible to every session on the database, so creating one is a change to the
+  database rather than to the target schema — outside what this feature does, and needing a
+  privilege of its own. Only the connected schema's private synonyms are listed. Nor are the
+  ones Oracle named for something of its own, or one left pointing at a `BIN$` name by a table
+  that has since been dropped.
+- **Replacing a synonym changes what a name means, and nothing has to be recompiled for it to
+  take effect.** Its own `CREATE OR REPLACE` lands on the old one, so nothing is dropped and the
+  grants on the name survive — but from that moment every query in the target that goes through
+  the name reads whatever the source's synonym pointed at, which may be a different table or
+  another schema entirely. It is the quietest replacement of the seven types: no error, no
+  invalid object, and a different table behind the same name.
 - **A trigger fires for a table or a view, and that object has to be in the target first.**
   Oracle refuses `CREATE TRIGGER` on an object it cannot find (ORA-00942), so the run looks for
   the base object among the target's tables *and* views before it tries — an `INSTEAD OF`
@@ -362,9 +400,9 @@ replacement for Data Pump.
   Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
   the failure it is rather than worked around.
 - **The tablespace is a choice for the kinds that occupy one, and not offered for the rest.** A
-  sequence is a row in the dictionary, and a view and a trigger are text, so none of them lives
-  in a segment: the checkbox is not shown for them and the confirmation dialog says nothing
-  about tablespaces.
+  sequence is a row in the dictionary, a synonym is a name pointing at something else, and a
+  view and a trigger are text, so none of them lives in a segment: the checkbox is not shown for
+  them and the confirmation dialog says nothing about tablespaces.
   For tables and indexes: left off — the
   default — the segment clause is suppressed and objects land on the target's default
   tablespace, which is what lets a production schema land on a laptop. Turned on, each object

@@ -3782,10 +3782,11 @@ interface ObjectCopyObjectResult {
   error?: string;
   /**
    * Created, and still not working: a view the target cannot compile because something it
-   * selects from is not there, a trigger whose body calls a package that is not. The object
-   * exists, so this is not a failure — but reporting it as a plain "created" would be a green
-   * result for a view that raises ORA-04063 on the next select, or a trigger that raises it on
-   * the next insert.
+   * selects from is not there, a trigger whose body calls a package that is not, a synonym
+   * for a table nobody copied. The object exists, so this is not a failure — but reporting it
+   * as a plain "created" would be a green result for a view that raises ORA-04063 on the next
+   * select, a trigger that raises it on the next insert, or a synonym that answers ORA-00980
+   * to whatever names it next.
    */
   warning?: string;
   /** how many statements it took */
@@ -3889,6 +3890,27 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
   // materialized view is listed from `user_mviews` alone and nothing here has to describe the
   // pieces underneath it — the table and index listings leave those out instead.
   mviews: `SELECT mview_name AS "name" FROM user_mviews ORDER BY mview_name`,
+  // `user_synonyms` is the private ones, which is exactly the right list: a PUBLIC synonym is
+  // owned by PUBLIC rather than by this schema, is visible to every session on the database,
+  // and needs a privilege of its own to create — copying one is a change to the database, not
+  // to the target schema, so it is not offered and the kind's note says so.
+  //
+  //   · a synonym whose object has been dropped points at a `BIN$` name, and recreating it in
+  //     the target is a name for something that does not exist there under any name
+  //   · `generated = 'Y'` leaves out the ones Oracle named for something of its own, the same
+  //     test the sequence, index, view and trigger listings use
+  //
+  // A synonym over a database link is *not* excluded, and that is a decision rather than an
+  // oversight. The link is not one of the kinds this copies, so one landing in a target that
+  // has no such link is a synonym that does not resolve — but a target that does have the
+  // link needs the synonym, and leaving them out would drop objects silently. It lands, and
+  // the invalid check afterwards is what says whether it works.
+  synonyms: `SELECT s.synonym_name AS "name" FROM user_synonyms s
+     WHERE s.table_name NOT LIKE 'BIN$%'
+       AND NOT EXISTS (
+         SELECT 1 FROM user_objects o
+          WHERE o.object_name = s.synonym_name AND o.object_type = 'SYNONYM' AND o.generated = 'Y')
+     ORDER BY s.synonym_name`,
   // A trigger is offered only where copying it means something in another schema:
   //   · `base_object_type` leaves out the ones on the SCHEMA and the DATABASE — a DDL or
   //     logon trigger is a rule about the account rather than one of its objects, and
@@ -3993,6 +4015,15 @@ async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Pr
  * A disabled trigger is not an invalid one — `status` is about compilation, and the copy
  * brings the source's enabled or disabled state across on purpose — so nothing here reports
  * one, which is right.
+ *
+ * A synonym is the odd one out, and knowingly so. Nothing about it is compiled: it is a name
+ * and a target, and Oracle creates one for an object that is not there rather than refusing
+ * it. Asking this question of the synonyms anyway costs one query and turns a dangling one
+ * into a reported warning wherever the target marks it INVALID — the case that matters most
+ * for this kind, since a synonym for a package or a database link is dangling by construction
+ * here, neither being something the copy moves. What is *not* established is whether Oracle
+ * marks a never-resolvable synonym at all; where it does not, this finds nothing and the
+ * synonym is reported as the plain "created" it also is.
  *
  * The whole schema's invalid objects of the type are read and filtered here rather than named
  * in an `IN` list, for the same reason the foreign-key pass does it: a run can carry two

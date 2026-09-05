@@ -13,9 +13,9 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are six of them: **sequences**, **tables**, **indexes**, **views**,
-  **materialized views** and **triggers**, offered in that order because it is the order they
-  have to be copied in. Reading both
+  run, and there are seven of them: **sequences**, **tables**, **indexes**, **views**,
+  **materialized views**, **synonyms** and **triggers**, offered in that order because it is the
+  order they have to be copied in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -105,6 +105,22 @@ Dates are the date the change landed on `main`.
   the ones Oracle keeps on its own tables — a materialized view log, a container table, a Text
   index table — nor triggers on another schema's table, the same exclusion the index listing
   makes.
+  A synonym run copies the name and what it points at, and for this type that is the whole
+  object — so the schema-repointing pass that a table barely needs *is* the copy here. A synonym
+  for one of the source's own objects arrives pointing at the target's; one for a third schema
+  is left pointing there, because that is a cross-schema reference somebody meant. Nothing is
+  pre-checked, and deliberately so: Oracle creates a synonym for an object that is not there
+  rather than refusing it, so a check would turn away objects the database was going to accept —
+  and a synonym's target can be a package or a database link, neither of which this copies, so
+  every one of those would be reported blocked by something sitting in the target already. What
+  happens instead is the second pass the views brought: whichever of the new synonyms the target
+  marks invalid is reported as created *with the sentence saying it does not work yet*. Synonyms
+  are offered after the materialized views and before the triggers, which is the one position in
+  the list that is not about a `CREATE` failing — nothing forces a synonym later, but a trigger's
+  body can call one and no synonym can name a trigger, so the only dependency there is runs that
+  way round. Public synonyms are not offered: one belongs to `PUBLIC` rather than to the schema
+  and is visible to every session on the database, so creating one is a change to the database
+  rather than to the target.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -116,7 +132,7 @@ Dates are the date the change landed on `main`.
   them, and is presented as the destructive operation it is — the confirmation dialog counts them
   and adds the sentence belonging to the kind being copied, since a dropped table takes its rows
   with it, a dropped index is a rebuild, a dropped sequence hands out numbers it has already
-  given away, and neither a view nor a trigger is dropped at all. A
+  given away, and a view, a synonym and a trigger are not dropped at all. A
   failure does not stop the run: unlike a table migration script, this is hundreds of independent
   objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
   the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
@@ -129,7 +145,7 @@ Dates are the date the change landed on `main`.
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 82 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 87 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 
