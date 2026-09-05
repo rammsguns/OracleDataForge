@@ -22,14 +22,14 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 7,250 lines
+server/index.ts                  the backend: routes, registry, guards — 7,282 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews, triggers), name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews, synonyms, triggers), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -187,9 +187,11 @@ Oracle-maintained-schema refusal and the confirmation guard all apply to it with
 set of rules; the source arrives as a parameter and is only ever read.
 
 One run copies one kind of object — **sequences**, **tables**, **indexes**, **views**,
-**materialized views** or **triggers**, listed in that order because it is the order they have
-to be copied in, with the kind that cannot recover from a missing dependency after the kind that
-can, and triggers last because one stands on more than any other kind does — so what it
+**materialized views**, **synonyms** or **triggers**, listed in that order because it is the
+order they have to be copied in, with the kind that cannot recover from a missing dependency
+after the kind that can, synonyms before the triggers because a trigger body can call a synonym
+and no synonym can name a trigger, and triggers last because one stands on more than any other
+kind does — so what it
 did is legible from
 the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
@@ -202,8 +204,9 @@ names with the source's own listing before any of them reaches `GET_DDL` or a `D
 that applies the parameters and runs the statements. The plan surveys every kind and marks the chosen
 one, so the browser renders the catalogue the server gave it rather than a copy that can drift,
 and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside it — indexes,
-sequences, views, materialized views and triggers were each added that way, plus the flags their
-kind of object needed. Materialized views cost no change to the panel at all. Unlike
+sequences, views, materialized views, triggers and synonyms were each added that way, plus the
+flags their kind of object needed. Materialized views and synonyms cost no change to the panel
+at all. Unlike
 `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
 every one is attempted, and every outcome is reported.
 
@@ -224,15 +227,20 @@ against the target's tables, so the picker marks those objects before anything i
 A trigger is built on something too, but on a table *or* a view — an `INSTEAD OF` trigger is
 how a view is written to at all — so the kind names which kinds its base object can be, the
 target is searched for both, and the sentence about what to copy first names those runs rather
-than always saying "tables".
-A kind that occupies no segment — sequences, views and triggers — does not offer the tablespace
-choice at all, in the panel or in the sentence the confirmation dialog writes about it, rather
-than offering it and quietly ignoring it. A kind whose own DDL is a `CREATE OR REPLACE` — views
-and triggers — is replaced without being dropped, because dropping it first would cost the
-grants on a view and the validity of everything built on it, and would leave a table running
-unguarded until the new trigger landed, to make room for a statement that was going to overwrite
-it anyway; the panel names that choice after what it does. And a kind that is *compiled* —
-views and triggers again — gets a second pass of its own after the loop: a view is created
+than always saying "tables". A synonym points at something too and is deliberately *not*
+pre-checked: Oracle creates one for an object that is not there rather than refusing it, so a
+check here would refuse objects the database was going to accept — and a synonym's target can
+be a package or a database link, neither of which is a kind this copies, so every one of those
+would be reported blocked by something sitting in the target already.
+A kind that occupies no segment — sequences, views, synonyms and triggers — does not offer the
+tablespace choice at all, in the panel or in the sentence the confirmation dialog writes about
+it, rather than offering it and quietly ignoring it. A kind whose own DDL is a `CREATE OR
+REPLACE` — views, synonyms and triggers — is replaced without being dropped, because dropping it
+first would cost the grants on a view and the validity of everything built on it, and would
+leave a table running unguarded until the new trigger landed, to make room for a statement that
+was going to overwrite it anyway; the panel names that choice after what it does. And a kind
+that is *compiled* — views and triggers again, and synonyms with them — gets a second pass of
+its own after the loop: a view is created
 `FORCE`, which is what makes the order views are copied in irrelevant, and the cost of that bet
 is that one whose tables are missing is created INVALID rather than refused. A trigger reaches
 the same place from the other side — its base table has to be there, but whatever its body
@@ -240,6 +248,11 @@ calls need not be. One query afterwards asks the target which of the objects jus
 cannot compile, and each of those is reported as created with the sentence saying it does not
 work yet — the alternative being a green result for a view that raises ORA-04063 the first time
 anybody selects from it, or a trigger that raises it on the first insert.
+A synonym is not compiled in that sense at all, and carries the flag for what the flag *does*:
+the same question asked of the target, at the cost of one query, catching the synonym for a
+package or a link that landed dangling. Whether Oracle marks a never-resolvable synonym INVALID
+is the one thing here that a real database has to answer; where it does not, the pass finds
+nothing and the synonym is reported as the plain "created" it also is.
 
 ## The write guard
 

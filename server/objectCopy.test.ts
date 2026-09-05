@@ -40,7 +40,7 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews", "triggers"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews", "synonyms", "triggers"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -54,6 +54,11 @@ describe("OBJECT_COPY_KINDS", () => {
     // and the kind that cannot recover goes after the kind that can: a view missing something
     // is created anyway and compiles itself later, a materialized view missing something fails
     assert.ok(ALL_COPY_KINDS.indexOf("views") < ALL_COPY_KINDS.indexOf("mviews"));
+    // synonyms after the objects one can name, and before the triggers: nothing makes a
+    // synonym fail, but a trigger body can call one and no synonym can name a trigger, so
+    // the only dependency there is runs this way round
+    assert.ok(ALL_COPY_KINDS.indexOf("mviews") < ALL_COPY_KINDS.indexOf("synonyms"));
+    assert.ok(ALL_COPY_KINDS.indexOf("synonyms") < ALL_COPY_KINDS.indexOf("triggers"));
     // triggers after everything: one stands on the table or view it fires for *and* on
     // whatever its body calls, which is more than any other kind asks of the target
     for (const kind of ALL_COPY_KINDS.filter((k) => k !== "triggers")) {
@@ -113,6 +118,8 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.equal(copyKindSpec("views").hasTablespace, false);
     // and a trigger is PL/SQL in the dictionary, which occupies no segment either
     assert.equal(copyKindSpec("triggers").hasTablespace, false);
+    // a synonym is a name pointing at something else and holds nothing at all
+    assert.equal(copyKindSpec("synonyms").hasTablespace, false);
     assert.equal(copyKindSpec("tables").hasTablespace, true);
     assert.equal(copyKindSpec("indexes").hasTablespace, true);
     // a materialized view keeps its rows in a container table, which is a segment like any other
@@ -135,7 +142,10 @@ describe("OBJECT_COPY_KINDS", () => {
     // a trigger is the same statement and the same reasoning: dropping it first would leave
     // the table unguarded for as long as the create takes, for no gain at all
     assert.equal(copyKindSpec("triggers").replaceInPlace, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers")) {
+    // and so is a synonym: GET_DDL emits CREATE OR REPLACE for one, and dropping it first
+    // would throw away the grants on the name for no gain
+    assert.equal(copyKindSpec("synonyms").replaceInPlace, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers" && k !== "synonyms")) {
       assert.equal(copyKindSpec(kind).replaceInPlace, false, kind);
     }
   });
@@ -147,7 +157,12 @@ describe("OBJECT_COPY_KINDS", () => {
     // a trigger lands the same way when its body calls something the target has not got: it
     // exists, it is invalid, and the first insert on the table is what finds out
     assert.equal(copyKindSpec("triggers").compiled, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers")) {
+    // a synonym is not compiled in that sense at all — it is a name, and Oracle creates one
+    // for an object that is not there. The flag is set for it because the question it asks
+    // the target afterwards is the one that catches a synonym for a package or a database
+    // link, neither of which this copies and both of which therefore land dangling.
+    assert.equal(copyKindSpec("synonyms").compiled, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers" && k !== "synonyms")) {
       assert.equal(copyKindSpec(kind).compiled, false, kind);
     }
   });
@@ -180,6 +195,16 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.deepEqual(copyKindSpec("triggers").baseKinds, ["tables", "views"]);
   });
 
+  it("asks nothing of a synonym either, because Oracle asks nothing of one", () => {
+    // the pre-check exists to turn an ORA-00942 nobody can read into a skip that names the
+    // missing object — but a synonym's CREATE never fails, so a pre-check here would refuse
+    // objects Oracle was going to accept. Worse, a synonym's target can be a package or a
+    // link, which are not kinds this copies at all, so every one of those would be reported
+    // blocked by something that is sitting in the target already.
+    assert.equal(copyKindSpec("synonyms").requiresTable, false);
+    assert.equal(copyKindSpec("synonyms").foreignKeys, false);
+  });
+
   it("says what each kind carries and what replacing one costs", () => {
     // both are shown to the user verbatim — the note in the type list and in the confirmation
     // dialog, the replace note under the "drop and recreate" choice
@@ -202,6 +227,8 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind(" MVIEWS "), "mviews");
     assert.equal(normalizeKind("triggers"), "triggers");
     assert.equal(normalizeKind(" TRIGGERS "), "triggers");
+    assert.equal(normalizeKind("synonyms"), "synonyms");
+    assert.equal(normalizeKind(" Synonyms "), "synonyms");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
@@ -209,7 +236,7 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind("grants"), DEFAULT_COPY_KIND);
     // a kind this app does not copy is not a kind, however plausible it sounds
     assert.equal(normalizeKind("procedures"), DEFAULT_COPY_KIND);
-    assert.equal(normalizeKind("synonyms"), DEFAULT_COPY_KIND);
+    assert.equal(normalizeKind("packages"), DEFAULT_COPY_KIND);
   });
 
   it("falls back for anything that is not a string at all", () => {
@@ -340,6 +367,9 @@ describe("isPlsqlDdl", () => {
       "CREATE UNIQUE INDEX ix ON t (id);",
       "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (p) REFERENCES q (id);",
       "CREATE SEQUENCE s START WITH 1;",
+      // a synonym reads like PL/SQL right up to the keyword: CREATE OR REPLACE EDITIONABLE,
+      // and then SYNONYM. Keeping its terminator would earn an ORA-00911 on every one.
+      'CREATE OR REPLACE EDITIONABLE SYNONYM "EMP" FOR "HR"."EMPLOYEES";',
     ]) {
       assert.ok(!isPlsqlDdl(sql), sql);
     }
@@ -428,6 +458,13 @@ describe("copyStatements", () => {
     assert.ok(stmts[0].endsWith("END;"), stmts[0]);
     // the ALTER is plain SQL, so its semicolon is a terminator and the driver must not see it
     assert.equal(stmts[1], 'ALTER TRIGGER "ORDERS_BI" ENABLE');
+  });
+
+  it("strips the terminator of a synonym, which only looks like PL/SQL", () => {
+    // the whole statement is one line and the last character is a terminator, so getting
+    // this wrong is not a subtle failure: every synonym in the run answers ORA-00911
+    const stmts = copyStatements('\n  CREATE OR REPLACE EDITIONABLE SYNONYM "EMP" FOR "HR"."EMPLOYEES";\n');
+    assert.deepEqual(stmts, ['CREATE OR REPLACE EDITIONABLE SYNONYM "EMP" FOR "HR"."EMPLOYEES"']);
   });
 
   it("keeps a disabled trigger disabled, because that is what the source says", () => {
@@ -535,6 +572,31 @@ describe("retargetSchema", () => {
     assert.ok(out.includes("STAGE.AUDIT_PKG.note"), out);
     assert.ok(out.includes("'raised in HR.ORDERS'"), out);
   });
+
+  it("repoints a synonym at the target's object, and leaves one for a third schema alone", () => {
+    // a synonym is nothing but a qualified name, so this pass is the entire copy for the
+    // kind. Getting the first line wrong gives the target a name that reads the source's
+    // table for ever; getting the second wrong quietly redirects a deliberate cross-schema
+    // reference at a schema that may not even have the object.
+    assert.equal(
+      retargetSchema('CREATE OR REPLACE SYNONYM "EMP" FOR "HR"."EMPLOYEES"', "HR", "STAGE"),
+      'CREATE OR REPLACE SYNONYM "EMP" FOR "STAGE"."EMPLOYEES"'
+    );
+    assert.equal(
+      retargetSchema('CREATE OR REPLACE SYNONYM "LEDGER" FOR "FINANCE"."LEDGER"', "HR", "STAGE"),
+      'CREATE OR REPLACE SYNONYM "LEDGER" FOR "FINANCE"."LEDGER"'
+    );
+  });
+
+  it("leaves the database link on a synonym where it is", () => {
+    // the link names a whole other database, and it is not this app's to rename — the owner
+    // in front of it is repointed the same as any other, and the copy lands pointing at the
+    // target's schema over the source's link, which is what the source said
+    assert.equal(
+      retargetSchema('CREATE OR REPLACE SYNONYM "R" FOR "HR"."ORDERS"@"WAREHOUSE"', "HR", "STAGE"),
+      'CREATE OR REPLACE SYNONYM "R" FOR "STAGE"."ORDERS"@"WAREHOUSE"'
+    );
+  });
 });
 
 describe("copyIdent", () => {
@@ -589,6 +651,10 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("mviews", "SALES_MV"), 'DROP MATERIALIZED VIEW "SALES_MV"');
   });
 
+  it("spells the drop for a synonym it will not use either", () => {
+    assert.equal(dropStatement("synonyms", "EMP"), 'DROP SYNONYM "EMP"');
+  });
+
   it("spells the drop for a trigger it will not use either", () => {
     // replaced in place like a view, for the stronger reason: a dropped trigger is a table
     // running unguarded until the create lands
@@ -624,13 +690,14 @@ describe("copyCountLabel", () => {
     assert.equal(copyCountLabel("views", 7), "7 Views");
     assert.equal(copyCountLabel("mviews", 2), "2 Materialized Views");
     assert.equal(copyCountLabel("triggers", 9), "9 Triggers");
+    assert.equal(copyCountLabel("synonyms", 15), "15 Synonyms");
   });
 });
 
 describe("copyBaseKinds", () => {
   it("is empty for a kind that stands on its own, so nothing is looked up for it", () => {
     // the run reads the target for these kinds and skips the base-object query entirely
-    for (const kind of ["sequences", "tables", "views", "mviews"] as const) {
+    for (const kind of ["sequences", "tables", "views", "mviews", "synonyms"] as const) {
       assert.deepEqual(copyBaseKinds(kind), []);
     }
   });
@@ -665,5 +732,7 @@ describe("copyBaseLabel", () => {
   it("is empty for a kind that is built on nothing", () => {
     assert.equal(copyBaseLabel("views"), "");
     assert.equal(copyBaseLabel("sequences"), "");
+    // and for the one that is built on anything at all but has nothing pre-checked for it
+    assert.equal(copyBaseLabel("synonyms"), "");
   });
 });

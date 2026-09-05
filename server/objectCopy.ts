@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "triggers";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "triggers";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -85,6 +85,15 @@ export interface CopyKindSpec {
    * the run asks the target which of the ones it just created are invalid and says which.
    * Without that a copy reports a green "created" for a view that raises ORA-04063 the first
    * time anybody selects from it.
+   *
+   * A synonym is not compiled in that sense at all — it is a name and a target, and Oracle
+   * creates one for an object that is not there. The flag is set for it anyway because what
+   * it buys is the same question asked of the target afterwards, at the cost of one query:
+   * a dangling synonym the target marks INVALID is then reported as created-and-not-working
+   * rather than as a plain success. Whether Oracle marks one at all is the single thing here
+   * that a real database has to answer, and `docs/known_limitations.md` says so; a target
+   * that calls them all VALID makes this a query that finds nothing, which is a gap in the
+   * report rather than a wrong line in it.
    */
   compiled: boolean;
   /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
@@ -108,13 +117,18 @@ export interface CopyKindSpec {
  * arrived is created invalid. Materialized views come after the views: a view that is missing
  * something is created anyway and compiles itself later, while a materialized view that is
  * missing something fails outright, so the kind that cannot recover goes after the kind that
- * can. Triggers come last of everything, because a trigger stands on more than any other kind
- * does — the table or view it fires for has to exist or the `CREATE` is refused, and its body
- * can call any sequence, table, view or package in the schema. Copied last, it lands on a
- * schema that is already whole.
+ * can. Synonyms come after all of those and before the triggers, and theirs is the one
+ * placement here that is not about a `CREATE` failing: Oracle creates a synonym whatever it
+ * points at, so nothing forces one later. What settles it is that the dependency runs only
+ * one way — a trigger's body can call a synonym, and no synonym can name a trigger at all —
+ * so the synonyms go first and the triggers land on names that already resolve. Triggers come
+ * last of everything, because a trigger stands on more than any other kind does — the table or
+ * view it fires for has to exist or the `CREATE` is refused, and its body can call any
+ * sequence, table, view, synonym or package in the schema. Copied last, it lands on a schema
+ * that is already whole.
  *
- * Sequences, then tables, then indexes, then views, then materialized views, then triggers.
- * Someone working down the list in order gets a schema that comes out whole.
+ * Sequences, then tables, then indexes, then views, then materialized views, then synonyms,
+ * then triggers. Someone working down the list in order gets a schema that comes out whole.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
   {
@@ -182,6 +196,19 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The materialized view and its query — and, because Oracle builds it the way the source wrote it, the rows that query returns against the target's own tables. This is the one kind that moves data and the one that can take a while. Not the materialized view log, and not anything the source's refresh schedule depends on.",
     replaceNote:
       "Each existing materialized view is dropped and rebuilt from the target's tables, so the rows it is holding now are thrown away and computed again. That costs the build, and anything querying it in between finds it missing rather than stale.",
+  },
+  {
+    kind: "synonyms",
+    label: "Synonyms",
+    objectType: "SYNONYM",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The name and what it points at — repointed at the target where the source's synonym named one of its own objects, and left alone where it named a third schema, which is the difference that decides whether the copy reads the target or the source from then on. Not the object itself: a synonym is only a name, so one for a table, package or database link the target has not got is created all the same and answers ORA-00980 the first time anything uses it. Public synonyms belong to the database rather than to this schema and are not offered.",
+    replaceNote:
+      "Each existing synonym is replaced in place rather than dropped, so the grants on it survive. What the name means changes at that moment though, and nothing in the target has to be recompiled for it to: every query that goes through the name reads whatever the source's synonym pointed at, which may be another table or another schema entirely.",
   },
   {
     kind: "triggers",
