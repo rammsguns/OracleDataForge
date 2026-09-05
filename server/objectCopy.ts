@@ -21,14 +21,24 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews";
 
 export interface CopyKindSpec {
   kind: CopyKind;
   /** what the UI calls it — read as "12 Tables", so it is plural */
   label: string;
-  /** USER_OBJECTS.object_type this kind lists */
+  /** USER_OBJECTS.object_type this kind lists, and the word a `DROP` for it uses */
   objectType: string;
+  /**
+   * What DBMS_METADATA calls this kind, when that is not what the dictionary calls it.
+   *
+   * The two vocabularies agree for most objects and then do not: `user_objects` says
+   * `MATERIALIZED VIEW` and `GET_DDL` wants `MATERIALIZED_VIEW`, the same way it wants
+   * `REF_CONSTRAINT` and `DB_LINK`. Passing the dictionary's spelling to `GET_DDL` earns an
+   * ORA-31600 that names the parameter rather than the mistake, so the difference is written
+   * down here once instead of being discovered per kind. Absent means the two agree.
+   */
+  metadataType?: string;
   /**
    * Objects of this kind can own foreign keys, so the run adds them in a second pass once
    * every object it is copying exists. Only tables can, but the flag is what keeps the pass
@@ -84,8 +94,11 @@ export interface CopyKindSpec {
  * **The order is the order they have to be copied in**, which is why it is worth stating: a
  * column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there
  * yet, an index cannot be created before its table, and a view over a table that has not
- * arrived is created invalid. Sequences, then tables, then indexes, then views. Someone
- * working down the list in order gets a schema that comes out whole.
+ * arrived is created invalid. Materialized views come last of all, after the views: a view
+ * that is missing something is created anyway and compiles itself later, while a materialized
+ * view that is missing something fails outright, so the kind that cannot recover goes after
+ * the kind that can. Sequences, then tables, then indexes, then views, then materialized
+ * views. Someone working down the list in order gets a schema that comes out whole.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
   {
@@ -139,6 +152,20 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The view's own SELECT as the source wrote it, with any schema qualifier inside it repointed at the target. Not the tables it reads: a view whose tables are not there yet is still created, and stays invalid until they are.",
     replaceNote:
       "Each existing view is replaced in place rather than dropped, so the grants on it and the views built on it survive. No data moves, but everything selecting from it sees the source's columns from that moment on.",
+  },
+  {
+    kind: "mviews",
+    label: "Materialized Views",
+    objectType: "MATERIALIZED VIEW",
+    metadataType: "MATERIALIZED_VIEW",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
+    note: "The materialized view and its query — and, because Oracle builds it the way the source wrote it, the rows that query returns against the target's own tables. This is the one kind that moves data and the one that can take a while. Not the materialized view log, and not anything the source's refresh schedule depends on.",
+    replaceNote:
+      "Each existing materialized view is dropped and rebuilt from the target's tables, so the rows it is holding now are thrown away and computed again. That costs the build, and anything querying it in between finds it missing rather than stale.",
   },
 ];
 
@@ -408,6 +435,18 @@ export function copyIdent(name: string): string | null {
 }
 
 /**
+ * What DBMS_METADATA calls this kind — which is not always what the dictionary calls it.
+ *
+ * Every `GET_DDL` goes through here rather than reading `objectType` directly, so a kind whose
+ * two names differ cannot be half-converted: the listing, the existence check and the `DROP`
+ * take the dictionary's word, and the metadata read takes this one.
+ */
+export const copyMetadataType = (kind: CopyKind): string => {
+  const spec = copyKindSpec(kind);
+  return spec.metadataType ?? spec.objectType;
+};
+
+/**
  * The statement removing an object the target already has, when the copy replaces rather than
  * skips it. Null when the name cannot be quoted safely.
  *
@@ -421,6 +460,10 @@ export function copyIdent(name: string): string | null {
  * that index belongs to the constraint and the copy has no business replacing it. `DROP
  * SEQUENCE "ORDER_SEQ"` always succeeds, and leaves every default and trigger that called it
  * invalid until the new one is there — which is why replacing a sequence says what it costs.
+ *
+ * `DROP MATERIALIZED VIEW "SALES_MV"` takes the container table and its rows with it, which is
+ * what replacing one costs and why the kind says so. The dictionary's spelling is the one a
+ * `DROP` wants, so this reads `objectType` rather than the DBMS_METADATA name beside it.
  *
  * A kind marked `replaceInPlace` never asks for one, because its own `CREATE OR REPLACE` is
  * the replacement. The statement is spelled for it anyway, so this stays the single place the

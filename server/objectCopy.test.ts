@@ -22,6 +22,7 @@ import {
   copyCountLabel,
   copyIdent,
   copyKindSpec,
+  copyMetadataType,
   copyStatements,
   copyTransforms,
   DEFAULT_COPY_KIND,
@@ -37,7 +38,7 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -48,6 +49,9 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("indexes"));
     // a view over a table that has not arrived is created, and created invalid
     assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("views"));
+    // and the kind that cannot recover goes after the kind that can: a view missing something
+    // is created anyway and compiles itself later, a materialized view missing something fails
+    assert.ok(ALL_COPY_KINDS.indexOf("views") < ALL_COPY_KINDS.indexOf("mviews"));
   });
 
   it("gives every kind a distinct label and a spec that can be looked up", () => {
@@ -58,6 +62,25 @@ describe("OBJECT_COPY_KINDS", () => {
 
   it("names an Oracle object type for each kind, since that is what the target is checked for", () => {
     for (const spec of OBJECT_COPY_KINDS) assert.match(spec.objectType, /^[A-Z ]+$/);
+  });
+
+  it("gives DBMS_METADATA its own name for a kind the dictionary spells differently", () => {
+    // user_objects says MATERIALIZED VIEW and GET_DDL wants MATERIALIZED_VIEW; the dictionary
+    // spelling passed to GET_DDL earns an ORA-31600 that names the parameter, not the mistake
+    assert.equal(copyKindSpec("mviews").objectType, "MATERIALIZED VIEW");
+    assert.equal(copyMetadataType("mviews"), "MATERIALIZED_VIEW");
+  });
+
+  it("falls back to the dictionary's name for every kind that shares it", () => {
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "mviews")) {
+      assert.equal(copyMetadataType(kind), copyKindSpec(kind).objectType, kind);
+    }
+  });
+
+  it("never passes a DBMS_METADATA type with a space in it", () => {
+    // the whole shape of the mistake: DBMS_METADATA's names are underscored, the dictionary's
+    // are spaced, and one is being read from a variable that used to hold the other
+    for (const kind of ALL_COPY_KINDS) assert.ok(!copyMetadataType(kind).includes(" "), kind);
   });
 
   it("offers the default as one of the kinds it lists", () => {
@@ -83,6 +106,16 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.equal(copyKindSpec("views").hasTablespace, false);
     assert.equal(copyKindSpec("tables").hasTablespace, true);
     assert.equal(copyKindSpec("indexes").hasTablespace, true);
+    // a materialized view keeps its rows in a container table, which is a segment like any other
+    assert.equal(copyKindSpec("mviews").hasTablespace, true);
+  });
+
+  it("drops and rebuilds a materialized view rather than replacing it in place", () => {
+    // there is no CREATE OR REPLACE MATERIALIZED VIEW, and the rows go with the drop — which
+    // is why the kind's replace note is about a rebuild rather than a definition swap
+    assert.equal(copyKindSpec("mviews").replaceInPlace, false);
+    // and it fails outright rather than landing invalid, so there is nothing to check after
+    assert.equal(copyKindSpec("mviews").compiled, false);
   });
 
   it("replaces a view in place, and everything else by dropping it first", () => {
@@ -142,6 +175,8 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind(" Indexes "), "indexes");
     assert.equal(normalizeKind("sequences"), "sequences");
     assert.equal(normalizeKind("views"), "views");
+    assert.equal(normalizeKind("mviews"), "mviews");
+    assert.equal(normalizeKind(" MVIEWS "), "mviews");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
@@ -470,6 +505,11 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("views", "ORDER_SUMMARY_V"), 'DROP VIEW "ORDER_SUMMARY_V"');
   });
 
+  it("drops a materialized view by the name the dictionary uses, not DBMS_METADATA's", () => {
+    // DROP MATERIALIZED_VIEW is a syntax error; the underscore belongs to GET_DDL alone
+    assert.equal(dropStatement("mviews", "SALES_MV"), 'DROP MATERIALIZED VIEW "SALES_MV"');
+  });
+
   it("refuses a name no object could have", () => {
     assert.equal(dropStatement("tables", "   "), null);
     assert.equal(dropStatement("tables", "A".repeat(129)), null);
@@ -497,5 +537,6 @@ describe("copyCountLabel", () => {
     assert.equal(copyCountLabel("indexes", 40), "40 Indexes");
     assert.equal(copyCountLabel("sequences", 3), "3 Sequences");
     assert.equal(copyCountLabel("views", 7), "7 Views");
+    assert.equal(copyCountLabel("mviews", 2), "2 Materialized Views");
   });
 });
