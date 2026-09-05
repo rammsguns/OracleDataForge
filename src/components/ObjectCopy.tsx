@@ -120,10 +120,12 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
           // the target's catalog just changed — drop the cached tree if it is the open one
           if (targetId === s.activeConnId) s.bumpSchema();
           s.toast(
-            r.failed || r.fksFailed ? "warning" : "success",
+            r.failed || r.fksFailed || r.invalid ? "warning" : "success",
             `${r.created + r.replaced} ${r.label.toLowerCase()} copied into ${r.targetSchema}` +
               (r.fksCreated ? `, ${r.fksCreated} foreign key(s)` : "") +
               (r.failed ? ` — ${r.failed} failed` : "") +
+              // created is not the same as working, and the toast is often all anyone reads
+              (r.invalid ? ` — ${r.invalid} not valid yet` : "") +
               (r.fksFailed ? ` — ${r.fksFailed} foreign key(s) not added` : "") +
               ` (${fmtSecs(r.elapsedMs)})`
           );
@@ -241,11 +243,23 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                       checked={existing === mode}
                       onChange={() => setObjectCopyOptions(key, { existing: mode })}
                       className="mt-0.5 accent-[var(--accent)]"
-                      aria-label={mode === "skip" ? "Leave existing objects alone" : "Drop and recreate existing objects"}
+                      aria-label={
+                        mode === "skip"
+                          ? "Leave existing objects alone"
+                          : summary?.replaceInPlace
+                          ? "Replace existing objects with the source's"
+                          : "Drop and recreate existing objects"
+                      }
                     />
                     <div className="min-w-0">
+                      {/* naming the choice after what it does: a view is not dropped, its own
+                          CREATE OR REPLACE lands on top of the old one */}
                       <div className="text-[12.5px] font-semibold">
-                        {mode === "skip" ? "Leave them alone" : "Drop and recreate them"}
+                        {mode === "skip"
+                          ? "Leave them alone"
+                          : summary?.replaceInPlace
+                          ? "Replace them with the source's"
+                          : "Drop and recreate them"}
                       </div>
                       <div className="text-[11.5px] text-mute mt-0.5">
                         {/* the cost of a replacement is the backend's to describe: dropping a
@@ -259,8 +273,9 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                 ))}
               </div>
 
-              {/* a sequence occupies no segment, so there is no tablespace to keep — the
-                  choice is left out for those kinds rather than shown and quietly ignored */}
+              {/* a sequence is a row in the dictionary and a view is text, so neither occupies
+                  a segment there is any tablespace to keep — the choice is left out for those
+                  kinds rather than shown and quietly ignored */}
               {summary?.hasTablespace !== false && (
                 <>
                   <h3 className="text-[11px] font-bold uppercase tracking-wider text-mute mt-3 mb-2">Tablespace</h3>
@@ -355,6 +370,9 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             {result.replaced > 0 && <Tile label="Replaced" value={result.replaced} tone="warn" />}
             <Tile label="Skipped" value={result.skipped} tone="neutral" />
             <Tile label="Failed" value={result.failed} tone={result.failed ? "err" : "neutral"} />
+            {/* counted out of "created" rather than beside it: the object is there, it just
+                does not work yet, and a tile is the only place that difference gets seen */}
+            {result.invalid > 0 && <Tile label="Not valid" value={result.invalid} tone="warn" />}
             {result.foreignKeys.length > 0 && (
               <Tile label="Foreign keys" value={result.fksCreated} tone={result.fksFailed ? "warn" : "accent"} />
             )}
@@ -381,19 +399,35 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             </div>
           )}
 
+          {result.invalid > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Created, but not valid</div>
+              <div className="space-y-1.5">
+                {reasonGroups(result.objects, (o) => o.warning).map((g) => (
+                  <div key={g.reason} className="border border-warn/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
+                    <AlertTriangle size={14} className="text-warn shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-[12px] text-soft">
+                        {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
+                      </div>
+                      <Names names={g.names} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {result.skipped > 0 && (
             <div className="mb-3">
               <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Not copied</div>
               <div className="space-y-1.5">
-                {skipGroups(result.objects).map((g) => (
+                {reasonGroups(result.objects, (o) => (o.status === "skipped" ? o.reason ?? "Skipped." : undefined)).map((g) => (
                   <div key={g.reason} className="border border-bdr rounded-lg px-3 py-2">
                     <div className="text-[12px] text-soft">
                       {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
                     </div>
-                    <div className="font-mono text-[11.5px] text-mute mt-0.5 break-words">
-                      {g.names.slice(0, 24).join(", ")}
-                      {g.names.length > 24 ? `, +${fmtNum(g.names.length - 24)} more` : ""}
-                    </div>
+                    <Names names={g.names} />
                   </div>
                 ))}
               </div>
@@ -606,23 +640,37 @@ function itemTag(i: ObjectCopyPlan["items"][number]): string {
 }
 
 /**
- * Skipped objects, gathered under the reason they were skipped.
+ * Objects gathered under the sentence the backend wrote about them — `of` picks that sentence
+ * and returns nothing for the objects this list is not about.
  *
- * A flat skip list is the least useful part of a result — "already in the target" two hundred
- * times is two hundred rows saying one thing. One row per reason says the same thing once, and
- * the small groups go first because those are the ones worth reading: the handful of indexes
- * whose table has not been copied yet, rather than the two hundred that were already there.
+ * A flat list is the least useful part of a result: "already in the target" two hundred times
+ * is two hundred rows saying one thing. One row per sentence says it once, and the small
+ * groups go first because those are the ones worth reading — the handful of indexes whose
+ * table has not been copied yet, rather than the two hundred that were already there.
  */
-function skipGroups(objects: ObjectCopyObjectResult[]): { reason: string; names: string[] }[] {
+function reasonGroups(
+  objects: ObjectCopyObjectResult[],
+  of: (o: ObjectCopyObjectResult) => string | undefined
+): { reason: string; names: string[] }[] {
   const groups = new Map<string, string[]>();
   for (const o of objects) {
-    if (o.status !== "skipped") continue;
-    const reason = o.reason ?? "Skipped.";
+    const reason = of(o);
+    if (!reason) continue;
     groups.set(reason, [...(groups.get(reason) ?? []), o.name]);
   }
   return [...groups]
     .map(([reason, names]) => ({ reason, names }))
     .sort((a, b) => a.names.length - b.names.length || a.reason.localeCompare(b.reason));
+}
+
+/** A group's names, up to two dozen of them — past that the count is the only readable part. */
+function Names({ names }: { names: string[] }) {
+  return (
+    <div className="font-mono text-[11.5px] text-mute mt-0.5 break-words">
+      {names.slice(0, 24).join(", ")}
+      {names.length > 24 ? `, +${fmtNum(names.length - 24)} more` : ""}
+    </div>
+  );
 }
 
 /** The reason this copy cannot run at all, or null. The backend refuses each of these too. */

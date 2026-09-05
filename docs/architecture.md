@@ -22,14 +22,14 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 7,119 lines
+server/index.ts                  the backend: routes, registry, guards — 7,184 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds (sequences, tables, indexes), name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -186,8 +186,8 @@ connection being written to — so `requireFullAccess`, the read-only refusal, t
 Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
 set of rules; the source arrives as a parameter and is only ever read.
 
-One run copies one kind of object — **sequences**, **tables** or **indexes**, listed in that
-order because it is the order they have to be copied in — so what it did is legible from
+One run copies one kind of object — **sequences**, **tables**, **indexes** or **views**, listed
+in that order because it is the order they have to be copied in — so what it did is legible from
 the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
 `server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
@@ -198,11 +198,12 @@ names with the source's own listing before any of them reaches `GET_DDL` or a `D
 `index.ts` keeps the Oracle half: the dictionary query that lists each kind, and the session
 that applies the parameters and runs the statements. The plan surveys every kind and marks the chosen
 one, so the browser renders the catalogue the server gave it rather than a copy that can drift,
-and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside it. Unlike
+and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside it — indexes,
+sequences and views were each added that way, plus the flags their kind of object needed. Unlike
 `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
 every one is attempted, and every outcome is reported.
 
-Three things follow from a kind rather than being written into the route. A kind that can own
+Five things follow from a kind rather than being written into the route. A kind that can own
 foreign keys gets a second pass after the object loop, which is why `REF_CONSTRAINTS` is left
 out of `CREATE TABLE` at all: a foreign key names a second table, and alphabetical order puts
 plenty of children before their parents. A kind that is *built on* a table — indexes — gets the
@@ -210,9 +211,18 @@ opposite treatment, a check before the loop: the run reads which table each obje
 and reports a missing one as a skip naming the table, because Oracle's own answer is an
 ORA-00942 that names neither the index nor the table it wanted. The plan runs the same check
 against the target's tables, so the picker marks those objects before anything is attempted.
-And a kind that occupies no segment — sequences — does not offer the tablespace choice at all,
-in the panel or in the sentence the confirmation dialog writes about it, rather than offering
-it and quietly ignoring it.
+A kind that occupies no segment — sequences and views — does not offer the tablespace choice at
+all, in the panel or in the sentence the confirmation dialog writes about it, rather than
+offering it and quietly ignoring it. A kind whose own DDL is a `CREATE OR REPLACE` — views —
+is replaced without being dropped, because dropping it first would cost the grants on it and
+the validity of everything built on it to make room for a statement that was going to overwrite
+it anyway; the panel names that choice after what it does. And a kind that is *compiled* —
+views again — gets a second pass of its own after the loop: a view is created `FORCE`, which is
+what makes the order views are copied in irrelevant, and the cost of that bet is that one whose
+tables are missing is created INVALID rather than refused. One query afterwards asks the target
+which of the objects just created it cannot compile, and each of those is reported as created
+with the sentence saying it does not work yet — the alternative being a green result for a view
+that raises ORA-04063 the first time anybody selects from it.
 
 ## The write guard
 

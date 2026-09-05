@@ -3732,6 +3732,8 @@ interface ObjectCopyKindSummary {
   replaceNote: string;
   /** objects of this kind live in a tablespace, so the choice about it is worth offering */
   hasTablespace: boolean;
+  /** replacing one is its own create statement, so "drop and recreate" is the wrong name for it */
+  replaceInPlace: boolean;
   /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
   selected: boolean;
   total: number;
@@ -3769,6 +3771,12 @@ interface ObjectCopyObjectResult {
   /** skipped: why. failed: the Oracle error. */
   reason?: string;
   error?: string;
+  /**
+   * Created, and still not working: a view the target cannot compile because something it
+   * selects from is not there. The object exists, so this is not a failure — but reporting it
+   * as a plain "created" would be a green result for a view that raises ORA-04063.
+   */
+  warning?: string;
   /** how many statements it took */
   statements: number;
 }
@@ -3796,6 +3804,8 @@ interface ObjectCopyResult {
   replaced: number;
   skipped: number;
   failed: number;
+  /** created, but the target cannot compile them yet — always 0 for a kind that is not compiled */
+  invalid: number;
   fksCreated: number;
   fksFailed: number;
   timedOut: boolean;
@@ -3843,6 +3853,19 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
          SELECT 1 FROM user_constraints c
           WHERE c.index_name = i.index_name AND c.constraint_type IN ('P', 'U'))
      ORDER BY index_name`,
+  // A view is text, and the copy's whole job is that text arriving in another schema with its
+  // meaning intact — which is why `retargetSchema` earns its keep here more than anywhere
+  // else: a view body is the likeliest place for someone to have typed WMT_RETAIL.ORDERS by
+  // hand, and a copy that leaves it reads the source database for ever.
+  //
+  // `generated = 'Y'` leaves out the views Oracle built for something of its own, the same
+  // test the sequence and index listings use. A materialized view is not in `user_views` at
+  // all, so nothing has to be done about one here.
+  views: `SELECT v.view_name AS "name" FROM user_views v
+     WHERE NOT EXISTS (
+       SELECT 1 FROM user_objects o
+        WHERE o.object_name = v.view_name AND o.object_type = 'VIEW' AND o.generated = 'Y')
+     ORDER BY v.view_name`,
 };
 
 /**
@@ -3905,6 +3928,27 @@ async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Pr
     if (kind) have.add(`${kind} ${String(r.name)}`);
   }
   return have;
+}
+
+/**
+ * Which of these objects the target has but cannot compile.
+ *
+ * A view is created `FORCE`, so one whose tables are not in the target is created INVALID
+ * rather than refused — which is the bet that makes the order views are copied in irrelevant,
+ * and the reason a run of them cannot be reported from the `CREATE`s alone.
+ *
+ * The whole schema's invalid objects of the type are read and filtered here rather than named
+ * in an `IN` list, for the same reason the foreign-key pass does it: a run can carry two
+ * thousand names and Oracle stops at a thousand expressions in one `IN`.
+ */
+async function oraCopyInvalid(conn: oracledb.Connection, kind: CopyKind, names: Set<string>): Promise<Set<string>> {
+  if (!names.size) return new Set();
+  const rows = await oraExecRows(
+    conn,
+    `SELECT object_name AS "name" FROM user_objects WHERE object_type = :t AND status <> 'VALID'`,
+    { t: copyKindSpec(kind).objectType }
+  );
+  return new Set(rows.map((r) => String(r.name)).filter((n) => names.has(n)));
 }
 
 /**
@@ -4051,6 +4095,7 @@ async function oraObjectCopyPlan(
       note: spec.note,
       replaceNote: spec.replaceNote,
       hasTablespace: spec.hasTablespace,
+      replaceInPlace: spec.replaceInPlace,
       selected: spec.kind === kind,
       total: of.length,
       conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
@@ -4171,7 +4216,10 @@ async function oraObjectCopy(
             objects.push({ ...base, status: "skipped", reason: "The source has no readable DDL for this object." });
             continue;
           }
-          if (already) {
+          // Replacing a view is the `CREATE OR REPLACE` the source itself emitted. Dropping it
+          // first would throw away the grants on it and invalidate every view built on it, to
+          // make room for a statement that was going to overwrite it anyway.
+          if (already && !spec.replaceInPlace) {
             const drop = dropStatement(kind, name);
             if (drop) await tgtConn.execute(drop, [], { autoCommit: true });
           }
@@ -4189,6 +4237,19 @@ async function oraObjectCopy(
         const fks = await oraCopyForeignKeys(srcConn, tgtConn, landed, sourceSchema, targetSchema, deadline);
         foreignKeys.push(...fks.results);
         timedOut = timedOut || fks.timedOut;
+      }
+
+      // The other kind of second pass: a view is created FORCE, so it lands whether or not the
+      // target has what it selects from, and a run that only reported the CREATEs would call
+      // that a success. One query says which of the ones just created are invalid, and each of
+      // those is still a created object — with the one sentence that says it does not work yet.
+      if (spec.compiled) {
+        const made = objects.filter((o) => o.status === "created" || o.status === "replaced");
+        const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name)));
+        for (const o of made) {
+          if (!invalid.has(o.name)) continue;
+          o.warning = `Created, but ${targetSchema} cannot compile it — something it selects from is not there. Copy that across and Oracle compiles this the next time anything uses it.`;
+        }
       }
     } finally {
       await tgtConn.close();
@@ -4212,6 +4273,7 @@ async function oraObjectCopy(
     replaced: count("replaced"),
     skipped: count("skipped"),
     failed: count("failed"),
+    invalid: objects.filter((o) => o.warning).length,
     fksCreated: foreignKeys.filter((f) => f.status === "created").length,
     fksFailed: foreignKeys.filter((f) => f.status === "failed").length,
     timedOut,
@@ -5322,7 +5384,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
       sourceName: source.name, sourceSchema: plan.sourceSchema,
       targetName: target.name, targetSchema: plan.targetSchema,
       kind, label: plan.label, existing, objects: [], foreignKeys: [],
-      created: 0, replaced: 0, skipped: 0, failed: 0, fksCreated: 0, fksFailed: 0,
+      created: 0, replaced: 0, skipped: 0, failed: 0, invalid: 0, fksCreated: 0, fksFailed: 0,
       timedOut: false, elapsedMs: 0,
       note: plan.total
         ? `Nothing to copy — none of the ${label} that were asked for are in ${plan.sourceSchema}.`
@@ -5331,9 +5393,12 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
   }
 
   if (!acknowledged(req)) {
+    // What a replacement costs is the kind's own sentence rather than one written here: a
+    // dropped table takes its rows with it, a dropped index is a rebuild, a dropped sequence
+    // hands out numbers it has already given away, and a view is not dropped at all.
     const conflictLine = conflicts
       ? existing === "replace"
-        ? ` ⚠ ${conflicts} of them already exist in ${plan.targetSchema} and will be DROPPED and recreated — a dropped table takes its rows with it and is not recoverable from the recycle bin.`
+        ? ` ⚠ ${conflicts} of them already exist in ${plan.targetSchema} and will be replaced. ${copyKindSpec(kind).replaceNote}`
         : ` ${conflicts} of them already exist in ${plan.targetSchema} and will be left exactly as they are.`
       : "";
     // Worth its own sentence because it is the one number that says "this run will not do all

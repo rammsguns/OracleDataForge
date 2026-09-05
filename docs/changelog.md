@@ -13,8 +13,8 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are three of them: **sequences**, **tables** and **indexes**, offered in that
-  order because it is the order they have to be copied in. Reading both
+  run, and there are four of them: **sequences**, **tables**, **indexes** and **views**, offered
+  in that order because it is the order they have to be copied in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -49,8 +49,23 @@ Dates are the date the change landed on `main`.
   next values collide with rows that are already there. The dialog says that in place of the
   sentence it uses for a table. The sequences Oracle creates for identity columns are left out
   of the listing: they belong to the table and arrive with it. And because a sequence occupies
-  no segment, the tablespace choice is not offered for it at all — the checkbox is absent and
-  the dialog says nothing about tablespaces — rather than being offered and quietly ignored.
+  no segment — nor does a view, which is text — the tablespace choice is not offered for those
+  kinds at all: the checkbox is absent and the dialog says nothing about tablespaces, rather
+  than the choice being offered and quietly ignored.
+  A view run copies the view's own `SELECT` as the source wrote it, with any schema name
+  written *inside* it repointed at the target — a body naming `HR.ORDERS` would otherwise
+  produce a view that is created, is valid, and reads the source database for ever. Oracle
+  emits view DDL as `CREATE OR REPLACE FORCE VIEW`, and `FORCE` is what makes the order views
+  are copied in irrelevant, the same bet deferring the foreign keys makes for tables: a view
+  built on a view that has not been copied yet still lands. The price is that one whose tables
+  are missing is created INVALID rather than refused, so the run asks the target which of the
+  views it just created it cannot compile and reports those apart from the ones that work —
+  a copy that reported every `CREATE` as a success would be calling a view that raises
+  ORA-04063 a green result. Nothing has to be re-run to fix one: copy what it needs, and Oracle
+  compiles the view the next time anything uses it. Replacing a view is the only replacement
+  that drops nothing — its own `CREATE OR REPLACE` lands on the old one, so the grants on it and
+  the views built on it survive, and the choice is named "Replace them with the source's"
+  rather than "Drop and recreate them" for that run alone.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -60,7 +75,9 @@ Dates are the date the change landed on `main`.
   the source gave it. The confirmation dialog says which of the two is about to happen.
   Objects the target already has are left alone by default; the other choice drops and recreates
   them, and is presented as the destructive operation it is — the confirmation dialog counts them
-  and says that a dropped table takes its rows with it and does not reach the recycle bin. A
+  and adds the sentence belonging to the kind being copied, since a dropped table takes its rows
+  with it, a dropped index is a rebuild, a dropped sequence hands out numbers it has already
+  given away, and a view is not dropped at all. A
   failure does not stop the run: unlike a table migration script, this is hundreds of independent
   objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
   the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
@@ -73,7 +90,7 @@ Dates are the date the change landed on `main`.
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 60 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 66 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 

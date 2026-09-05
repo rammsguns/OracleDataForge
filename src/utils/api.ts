@@ -473,7 +473,7 @@ export interface CompileBatchResult {
  * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
  * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "sequences" | "tables" | "indexes";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
@@ -483,10 +483,12 @@ export interface ObjectCopyKindSummary {
   label: string;
   /** what this kind carries with it, and what it leaves behind */
   note: string;
-  /** what "drop and recreate" costs for this kind, in the backend's words */
+  /** what replacing an existing one costs for this kind, in the backend's words */
   replaceNote: string;
   /** objects of this kind live in a tablespace — when false the choice is not offered at all */
   hasTablespace: boolean;
+  /** replacing one is its own create statement, so nothing is dropped and the choice is not called that */
+  replaceInPlace: boolean;
   selected: boolean;
   total: number;
   /** how many of them the target already has */
@@ -530,6 +532,8 @@ export interface ObjectCopyObjectResult {
   status: "created" | "replaced" | "skipped" | "failed";
   reason?: string;
   error?: string;
+  /** created, and still not working — a view the target cannot compile yet */
+  warning?: string;
   statements: number;
 }
 
@@ -556,6 +560,8 @@ export interface ObjectCopyResult {
   replaced: number;
   skipped: number;
   failed: number;
+  /** how many of the created ones the target cannot compile — counted out of `created`, not beside it */
+  invalid: number;
   fksCreated: number;
   fksFailed: number;
   timedOut: boolean;

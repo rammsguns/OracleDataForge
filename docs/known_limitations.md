@@ -234,14 +234,15 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are three of them: sequences, tables and indexes.**
-  They are listed in the order they have to be copied in — a column default calling
-  `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, and an index cannot be
-  created before its table — but nothing enforces that order: each run is confirmed and
-  reported on its own, and running them out of order simply reports the failures. Views, code
-  objects, triggers and synonyms are not copied at all yet. Nothing outside the schema —
-  grants, roles, quotas, profiles, database links, directories — is copied, and nothing that
-  lives in a DBA view the connection cannot read.
+- **One object type per run, and there are four of them: sequences, tables, indexes and
+  views.** They are listed in the order they have to be copied in — a column default calling
+  `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, an index cannot be
+  created before its table, and a view over a table that has not arrived is created invalid —
+  but nothing enforces that order: each run is confirmed and reported on its own, and running
+  them out of order simply reports the outcome. Materialized views, code objects, triggers and
+  synonyms are not copied at all yet. Nothing outside the schema — grants, roles, quotas,
+  profiles, database links, directories — is copied, and nothing that lives in a DBA view the
+  connection cannot read.
 - **A sequence arrives at the number the source has reached, not the number it started from.**
   That is what stops a copy handing out values the source has already used, and it is what
   makes replacing an existing sequence the dangerous choice: a target sequence that has gone
@@ -265,6 +266,31 @@ replacement for Data Pump.
   a local index needs a target table partitioned the same way and a domain index needs its
   indextype installed. Neither is checked in advance: the failure is reported per index, with
   Oracle's error, and the rest of the run continues.
+- **A view is created whether or not the target has what it selects from.** DBMS_METADATA
+  emits `CREATE OR REPLACE FORCE VIEW`, and `FORCE` is what makes the order views are copied in
+  irrelevant — alphabetical order puts plenty of views before the views they are built on. The
+  price is that a view whose tables are missing is created INVALID rather than refused, so the
+  run asks the target which of the views it just created are invalid and reports those
+  separately from the ones that work. Nothing has to be re-run to fix one: copy what it needs
+  and Oracle compiles the view the next time anything uses it.
+- **A view's dependencies are not checked in advance, the way an index's table is.** An index
+  has exactly one base table and the run can look for it first; a view can select from any
+  number of tables, views, functions and synonyms, and reading that out of `user_dependencies`
+  before the run would cost a query per view to say what one query afterwards says exactly.
+  The picker therefore marks nothing for views, and the result is where the news is.
+- **A view is copied as text, so a schema name written inside it is rewritten.** A body naming
+  `HR.ORDERS` is repointed at the target schema, because a copy that left it would create a
+  view that is valid, looks right, and reads the source database for ever. Only a qualifier
+  that is genuinely an identifier is rewritten: the same name inside a string literal or a
+  comment is left exactly as the source wrote it.
+- **Replacing a view does not drop it.** Its own `CREATE OR REPLACE` is the replacement, so the
+  grants on it and the views built on it survive — which is the one kind where "replace" costs
+  nothing but the definition itself. Anything selecting from the old view sees the source's
+  columns from that moment on.
+- **A view from a newer database can fail on an older one.** `GET_DDL` emits the `EDITIONABLE`
+  keyword on 12.1 and later, which 11g does not accept; a view copied backwards across that
+  line fails with Oracle's own syntax error, reported per view, and the rest of the run
+  continues.
 - **A foreign key pointing outside the copy is reported, not created.** One that references a
   table the run did not bring across cannot be added until that table is in the target; the
   result names it and the reason. Copy the missing table and run the copy again — the second
@@ -279,8 +305,9 @@ replacement for Data Pump.
   Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
   the failure it is rather than worked around.
 - **The tablespace is a choice for the kinds that occupy one, and not offered for the rest.** A
-  sequence lives in no segment, so the checkbox is not shown for it and the confirmation dialog
-  says nothing about tablespaces. For tables and indexes: left off — the
+  sequence is a row in the dictionary and a view is text, so neither lives in a segment: the
+  checkbox is not shown for them and the confirmation dialog says nothing about tablespaces.
+  For tables and indexes: left off — the
   default — the segment clause is suppressed and objects land on the target's default
   tablespace, which is what lets a production schema land on a laptop. Turned on, each object
   is created in the tablespace it has in the source, and the copy fails outright on a target

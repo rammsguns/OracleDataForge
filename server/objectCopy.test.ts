@@ -37,7 +37,7 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -46,6 +46,8 @@ describe("OBJECT_COPY_KINDS", () => {
     // list in order gets a schema that comes out whole, and any other order does not
     assert.ok(ALL_COPY_KINDS.indexOf("sequences") < ALL_COPY_KINDS.indexOf("tables"));
     assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("indexes"));
+    // a view over a table that has not arrived is created, and created invalid
+    assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("views"));
   });
 
   it("gives every kind a distinct label and a spec that can be looked up", () => {
@@ -78,8 +80,36 @@ describe("OBJECT_COPY_KINDS", () => {
     // a sequence is a row in the dictionary and lives in no segment, so the checkbox is left
     // out for it rather than shown and quietly ignored — and the dialog drops the sentence too
     assert.equal(copyKindSpec("sequences").hasTablespace, false);
+    assert.equal(copyKindSpec("views").hasTablespace, false);
     assert.equal(copyKindSpec("tables").hasTablespace, true);
     assert.equal(copyKindSpec("indexes").hasTablespace, true);
+  });
+
+  it("replaces a view in place, and everything else by dropping it first", () => {
+    // DBMS_METADATA emits CREATE OR REPLACE for a view, so a DROP first would cost the grants
+    // on it and the validity of every view built on it, to make room for a statement that was
+    // going to overwrite it anyway
+    assert.equal(copyKindSpec("views").replaceInPlace, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views")) {
+      assert.equal(copyKindSpec(kind).replaceInPlace, false, kind);
+    }
+  });
+
+  it("marks views as compiled, which is what checks the target for invalid ones afterwards", () => {
+    // a view is created FORCE — it lands whether or not the target has what it selects from,
+    // so without the check a run reports "created" for a view that raises ORA-04063
+    assert.equal(copyKindSpec("views").compiled, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views")) {
+      assert.equal(copyKindSpec(kind).compiled, false, kind);
+    }
+  });
+
+  it("asks nothing of a view but the schema it lands in", () => {
+    // it is text, not a segment, and its dependencies are many and of many types — which is
+    // why they are reported after the fact rather than pre-checked the way an index's one
+    // base table is
+    assert.equal(copyKindSpec("views").foreignKeys, false);
+    assert.equal(copyKindSpec("views").requiresTable, false);
   });
 
   it("asks nothing extra of a sequence, which stands on its own", () => {
@@ -111,6 +141,7 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind("indexes"), "indexes");
     assert.equal(normalizeKind(" Indexes "), "indexes");
     assert.equal(normalizeKind("sequences"), "sequences");
+    assert.equal(normalizeKind("views"), "views");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
@@ -241,6 +272,9 @@ describe("isPlsqlDdl", () => {
     for (const sql of [
       "CREATE TABLE t (id NUMBER);",
       "CREATE OR REPLACE VIEW v AS SELECT 1 FROM dual;",
+      // what GET_DDL actually emits for a view: FORCE sits where EDITIONABLE would, and the
+      // trailing semicolon is a terminator that has to go rather than the end of a block
+      'CREATE OR REPLACE FORCE EDITIONABLE VIEW "ORDER_SUMMARY_V" ("ID", "TOTAL") AS SELECT id, total FROM orders;',
       "CREATE UNIQUE INDEX ix ON t (id);",
       "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (p) REFERENCES q (id);",
       "CREATE SEQUENCE s START WITH 1;",
@@ -272,6 +306,11 @@ describe("prepareDdl", () => {
       "CREATE OR REPLACE PROCEDURE go IS BEGIN NULL; END;"
     );
     assert.equal(prepareDdl("CREATE TYPE t AS OBJECT (a NUMBER);\n  /  "), "CREATE TYPE t AS OBJECT (a NUMBER);");
+  });
+
+  it("strips the terminator from the view DDL Oracle emits", () => {
+    const ddl = 'CREATE OR REPLACE FORCE EDITIONABLE VIEW "V" ("ID") AS \n  SELECT id FROM orders;\n';
+    assert.equal(prepareDdl(ddl), 'CREATE OR REPLACE FORCE EDITIONABLE VIEW "V" ("ID") AS \n  SELECT id FROM orders');
   });
 
   it("leaves an already-clean statement alone", () => {
@@ -364,6 +403,24 @@ describe("retargetSchema", () => {
   it("matches a quoted qualifier only exactly, because the quotes made it case-sensitive", () => {
     assert.equal(retargetSchema('SELECT * FROM "hr"."T"', "HR", "STAGE"), 'SELECT * FROM "hr"."T"');
   });
+
+  it("repoints the tables inside a view, which is where a qualifier is likeliest to be", () => {
+    // the failure this exists to stop: the view is created in the target, it is VALID, and
+    // every query against it reads the source database
+    const ddl = [
+      'CREATE OR REPLACE FORCE EDITIONABLE VIEW "ORDER_SUMMARY_V" ("ID", "CUSTOMER") AS',
+      '  SELECT o.id, c.name FROM "HR"."ORDERS" o',
+      "  JOIN HR.CUSTOMERS c ON c.id = o.customer_id",
+      "  WHERE o.note <> 'sent to HR.OLD_QUEUE'",
+      "  -- was HR.ORDERS_OLD until the rename",
+    ].join("\n");
+    const out = retargetSchema(ddl, "HR", "STAGE");
+    assert.ok(out.includes('"STAGE"."ORDERS"'), out);
+    assert.ok(out.includes("STAGE.CUSTOMERS"), out);
+    // the two that are not identifiers stay exactly as the source wrote them
+    assert.ok(out.includes("'sent to HR.OLD_QUEUE'"), out);
+    assert.ok(out.includes("-- was HR.ORDERS_OLD until the rename"), out);
+  });
 });
 
 describe("copyIdent", () => {
@@ -407,6 +464,12 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("sequences", "ORDER_SEQ"), 'DROP SEQUENCE "ORDER_SEQ"');
   });
 
+  it("spells the drop for a view it will not use", () => {
+    // views are replaced in place, so nothing asks for this — but a `DROP` is spelled in one
+    // place only, and a null here would mean "the name is unusable" to everyone who reads it
+    assert.equal(dropStatement("views", "ORDER_SUMMARY_V"), 'DROP VIEW "ORDER_SUMMARY_V"');
+  });
+
   it("refuses a name no object could have", () => {
     assert.equal(dropStatement("tables", "   "), null);
     assert.equal(dropStatement("tables", "A".repeat(129)), null);
@@ -433,5 +496,6 @@ describe("copyCountLabel", () => {
   it("names every kind, since the dialog is written from whichever one was picked", () => {
     assert.equal(copyCountLabel("indexes", 40), "40 Indexes");
     assert.equal(copyCountLabel("sequences", 3), "3 Sequences");
+    assert.equal(copyCountLabel("views", 7), "7 Views");
   });
 });

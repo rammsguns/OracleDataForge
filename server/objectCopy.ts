@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -47,9 +47,28 @@ export interface CopyKindSpec {
    * for it rather than offered and quietly ignored.
    */
   hasTablespace: boolean;
+  /**
+   * Replacing one of these *is* the create statement. DBMS_METADATA emits `CREATE OR REPLACE`
+   * for a view, so dropping it first would buy nothing and cost the grants on it along with
+   * the validity of everything selecting from it. The run lets the new definition land on the
+   * old one instead, and never asks for a `DROP` at all.
+   */
+  replaceInPlace: boolean;
+  /**
+   * Objects of this kind are compiled, so one can be created and still not work.
+   *
+   * A view arrives as `CREATE ... FORCE VIEW`, which is what makes the order views are copied
+   * in irrelevant — the same bet `REF_CONSTRAINTS=FALSE` makes for tables, since alphabetical
+   * order puts plenty of views before the views and tables they select from. The price is that
+   * one whose dependencies are not in the target is created INVALID rather than refused, so
+   * the run asks the target which of the ones it just created are invalid and says which.
+   * Without that a copy reports a green "created" for a view that raises ORA-04063 the first
+   * time anybody selects from it.
+   */
+  compiled: boolean;
   /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
   note: string;
-  /** what "drop and recreate" costs for this kind — a table and an index are not the same bet */
+  /** what replacing an existing one costs here — a table, an index and a view are three different bets */
   replaceNote: string;
 }
 
@@ -64,8 +83,9 @@ export interface CopyKindSpec {
  *
  * **The order is the order they have to be copied in**, which is why it is worth stating: a
  * column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there
- * yet, and an index cannot be created before its table. Sequences, then tables, then indexes.
- * Someone working down the list in order gets a schema that comes out whole.
+ * yet, an index cannot be created before its table, and a view over a table that has not
+ * arrived is created invalid. Sequences, then tables, then indexes, then views. Someone
+ * working down the list in order gets a schema that comes out whole.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
   {
@@ -75,6 +95,8 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     foreignKeys: false,
     requiresTable: false,
     hasTablespace: false,
+    replaceInPlace: false,
+    compiled: false,
     note: "The sequence and the number it has reached in the source, so the copy carries on from there rather than starting again at 1. Not the tables, defaults or triggers that use it.",
     replaceNote:
       "Each existing sequence is dropped and recreated at the source's number. A target sequence that has gone further will hand out numbers it has already given away, which is a duplicate key waiting to happen.",
@@ -86,6 +108,8 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     foreignKeys: true,
     requiresTable: false,
     hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
     note: "Columns, defaults, constraints and, once every table is there, foreign keys. Not the rows or the indexes.",
     replaceNote:
       "Each existing table is dropped before it is recreated. A dropped table takes its rows with it and does not go to the recycle bin.",
@@ -97,9 +121,24 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     foreignKeys: false,
     requiresTable: true,
     hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
     note: "The indexes someone created, on tables the target already has. Not the ones Oracle built for a primary or unique key — those arrive with the table.",
     replaceNote:
       "Each existing index is dropped before it is recreated. That costs the time to rebuild it and queries run without it in between, but no data goes with it.",
+  },
+  {
+    kind: "views",
+    label: "Views",
+    objectType: "VIEW",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The view's own SELECT as the source wrote it, with any schema qualifier inside it repointed at the target. Not the tables it reads: a view whose tables are not there yet is still created, and stays invalid until they are.",
+    replaceNote:
+      "Each existing view is replaced in place rather than dropped, so the grants on it and the views built on it survive. No data moves, but everything selecting from it sees the source's columns from that moment on.",
   },
 ];
 
@@ -382,6 +421,10 @@ export function copyIdent(name: string): string | null {
  * that index belongs to the constraint and the copy has no business replacing it. `DROP
  * SEQUENCE "ORDER_SEQ"` always succeeds, and leaves every default and trigger that called it
  * invalid until the new one is there — which is why replacing a sequence says what it costs.
+ *
+ * A kind marked `replaceInPlace` never asks for one, because its own `CREATE OR REPLACE` is
+ * the replacement. The statement is spelled for it anyway, so this stays the single place the
+ * copy knows how to drop anything and no caller has to decide what a missing one meant.
  */
 export function dropStatement(kind: CopyKind, name: string): string | null {
   const spec = copyKindSpec(kind);
