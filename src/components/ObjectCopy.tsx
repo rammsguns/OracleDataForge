@@ -325,8 +325,9 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
               </div>
               {blocked > 0 && (
                 <div className="text-[11.5px] text-warn mt-1.5">
-                  {fmtNum(blocked)} of them sit on a table <span className="font-mono">{plan.targetSchema}</span> has not got
-                  and will be reported as skipped — copy those tables across first if you want them.
+                  {fmtNum(blocked)} of them sit on something <span className="font-mono">{plan.targetSchema}</span> has
+                  not got and will be reported as skipped — copy the {summary?.baseLabel ?? "tables"} across first if
+                  you want them.
                 </div>
               )}
               {overCap && (
@@ -607,15 +608,15 @@ function ObjectPicker({
         </div>
       </div>
 
-      {/* the second half of the legend explains a mark that only a kind built on a table can
-          carry, so it is left out when nothing in these lists can be marked with it */}
+      {/* the second half of the legend explains a mark that only a kind built on something
+          else can carry, so it is left out when nothing in these lists can be marked with it */}
       <p className="text-[11px] text-mute mt-1.5">
         Ctrl-click and shift-click pick several; double-click moves one. A name marked{" "}
         <span className="font-mono">· in target</span> already exists in {plan.targetSchema} and is what the choice above
         decides the fate of
-        {plan.items.some((i) => i.missingTable) && (
+        {plan.items.some((i) => i.missingBase) && (
           <>
-            ; one marked <span className="font-mono">· needs …</span> is built on a table that is not there yet, and
+            ; one marked <span className="font-mono">· needs …</span> is built on something that is not there yet, and
             copying it would only report that
           </>
         )}
@@ -630,12 +631,12 @@ function ObjectPicker({
  *
  * An `<option>` holds text and nothing else, so both marks are suffixes rather than badges.
  * "In target" is the short one because the choice above already says what happens to it; the
- * other one names the table, because the table is the thing the user has to go and copy. Only
- * one mark is shown, and a missing table wins it: an object that cannot be created at all is
- * not about to be skipped or replaced either.
+ * other one names the object it is built on, because that is the thing the user has to go and
+ * copy. Only one mark is shown, and a missing base object wins it: an object that cannot be
+ * created at all is not about to be skipped or replaced either.
  */
 function itemTag(i: ObjectCopyPlan["items"][number]): string {
-  if (i.missingTable) return `  ·  needs ${i.missingTable}`;
+  if (i.missingBase) return `  ·  needs ${i.missingBase}`;
   return i.existsInTarget ? "  ·  in target" : "";
 }
 

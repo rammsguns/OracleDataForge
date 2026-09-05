@@ -473,7 +473,7 @@ export interface CompileBatchResult {
  * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
  * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "triggers";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
@@ -489,6 +489,8 @@ export interface ObjectCopyKindSummary {
   hasTablespace: boolean;
   /** replacing one is its own create statement, so nothing is dropped and the choice is not called that */
   replaceInPlace: boolean;
+  /** what objects of this kind are built on — "tables", "tables and views" — empty when nothing */
+  baseLabel: string;
   selected: boolean;
   total: number;
   /** how many of them the target already has */
@@ -498,8 +500,8 @@ export interface ObjectCopyKindSummary {
 export interface ObjectCopyItem {
   name: string;
   existsInTarget: boolean;
-  /** the table this object needs and the target has not got — it would be skipped, not created */
-  missingTable?: string;
+  /** the object this one is built on and the target has not got — it would be skipped, not created */
+  missingBase?: string;
 }
 
 export interface ObjectCopyPlan {

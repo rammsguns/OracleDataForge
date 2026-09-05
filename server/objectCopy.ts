@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "triggers";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -46,11 +46,22 @@ export interface CopyKindSpec {
    */
   foreignKeys: boolean;
   /**
-   * Objects of this kind are built *on* a table, so one cannot land before its table does.
-   * The run looks for the table in the target first and reports a missing one as a skip that
-   * names it, rather than letting `CREATE` fail with an ORA-00942 that names nothing useful.
+   * Objects of this kind are built *on* something else, so one cannot land before that does.
+   * The run looks for the base object in the target first and reports a missing one as a skip
+   * that names it, rather than letting `CREATE` fail with an ORA-00942 that names nothing
+   * useful.
    */
   requiresTable: boolean;
+  /**
+   * What the base object can be, for a kind that has one — `copyBaseKinds` reads it.
+   *
+   * An index is built on a table and nothing else. A trigger is built on a table *or* a view,
+   * because an `INSTEAD OF` trigger is how a view is written to at all, and a run that looked
+   * only among the target's tables would report every one of those as blocked by a view that
+   * is sitting right there. Absent means the table alone, which is the older and commoner
+   * case; meaningless without `requiresTable`.
+   */
+  baseKinds?: CopyKind[];
   /**
    * Objects of this kind occupy a segment, so "keep the source tablespace" means something for
    * them. A sequence is a row in the dictionary and lives nowhere, so the choice is not offered
@@ -94,11 +105,16 @@ export interface CopyKindSpec {
  * **The order is the order they have to be copied in**, which is why it is worth stating: a
  * column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there
  * yet, an index cannot be created before its table, and a view over a table that has not
- * arrived is created invalid. Materialized views come last of all, after the views: a view
- * that is missing something is created anyway and compiles itself later, while a materialized
- * view that is missing something fails outright, so the kind that cannot recover goes after
- * the kind that can. Sequences, then tables, then indexes, then views, then materialized
- * views. Someone working down the list in order gets a schema that comes out whole.
+ * arrived is created invalid. Materialized views come after the views: a view that is missing
+ * something is created anyway and compiles itself later, while a materialized view that is
+ * missing something fails outright, so the kind that cannot recover goes after the kind that
+ * can. Triggers come last of everything, because a trigger stands on more than any other kind
+ * does — the table or view it fires for has to exist or the `CREATE` is refused, and its body
+ * can call any sequence, table, view or package in the schema. Copied last, it lands on a
+ * schema that is already whole.
+ *
+ * Sequences, then tables, then indexes, then views, then materialized views, then triggers.
+ * Someone working down the list in order gets a schema that comes out whole.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
   {
@@ -166,6 +182,20 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The materialized view and its query — and, because Oracle builds it the way the source wrote it, the rows that query returns against the target's own tables. This is the one kind that moves data and the one that can take a while. Not the materialized view log, and not anything the source's refresh schedule depends on.",
     replaceNote:
       "Each existing materialized view is dropped and rebuilt from the target's tables, so the rows it is holding now are thrown away and computed again. That costs the build, and anything querying it in between finds it missing rather than stale.",
+  },
+  {
+    kind: "triggers",
+    label: "Triggers",
+    objectType: "TRIGGER",
+    foreignKeys: false,
+    requiresTable: true,
+    baseKinds: ["tables", "views"],
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The trigger's PL/SQL as the source wrote it, on the table or view it fires for, and enabled or disabled the way the source has it. Not what that code calls: a trigger whose packages or tables are not in the target is still created, and stays invalid until they are. Triggers on the schema or the database itself are not offered — those are not part of copying a schema's objects.",
+    replaceNote:
+      "Each existing trigger is replaced in place rather than dropped, so the table is never briefly without one. What it does changes at that moment though: from then on every insert, update and delete on that table runs the source's code rather than the target's.",
   },
 ];
 
@@ -445,6 +475,32 @@ export const copyMetadataType = (kind: CopyKind): string => {
   const spec = copyKindSpec(kind);
   return spec.metadataType ?? spec.objectType;
 };
+
+/**
+ * The kinds this kind's objects are built on, and therefore the kinds the target is searched
+ * for one in. Empty for a kind that stands on its own.
+ *
+ * A trigger's base object is a table or a view, an index's is a table, and both are looked for
+ * in the same listing the run already reads — so this is what turns "is `ORDERS` in the
+ * target?" into a question with an answer, rather than a guess that would call an `INSTEAD OF`
+ * trigger's view a missing table.
+ */
+export function copyBaseKinds(kind: CopyKind): CopyKind[] {
+  const spec = copyKindSpec(kind);
+  if (!spec.requiresTable) return [];
+  return spec.baseKinds ?? ["tables"];
+}
+
+/**
+ * What to go and copy first when the base object is missing — "tables", "tables and views" —
+ * named the way the type list names those runs, because going and doing one of them is the
+ * whole point of the sentence this appears in.
+ */
+export function copyBaseLabel(kind: CopyKind): string {
+  const labels = copyBaseKinds(kind).map((k) => copyKindSpec(k).label.toLowerCase());
+  if (labels.length < 2) return labels.join("");
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
 
 /**
  * The statement removing an object the target already has, when the copy replaces rather than

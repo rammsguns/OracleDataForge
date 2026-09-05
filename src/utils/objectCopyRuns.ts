@@ -89,7 +89,7 @@ export function selectedCounts(
   return {
     total: chosen.length,
     conflicts: chosen.filter((i) => i.existsInTarget).length,
-    blocked: chosen.filter((i) => i.missingTable).length,
+    blocked: chosen.filter((i) => i.missingBase).length,
   };
 }
 
