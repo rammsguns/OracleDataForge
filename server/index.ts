@@ -3730,6 +3730,8 @@ interface ObjectCopyKindSummary {
   note: string;
   /** what replacing an existing one costs — dropping a table is not dropping an index */
   replaceNote: string;
+  /** objects of this kind live in a tablespace, so the choice about it is worth offering */
+  hasTablespace: boolean;
   /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
   selected: boolean;
   total: number;
@@ -3814,6 +3816,15 @@ interface ObjectCopyResult {
  * browser only needs the name added to its own copy of the union.
  */
 const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
+  // The sequence behind an identity column is Oracle's, not the user's: it is created with the
+  // table, dropped with it, named ISEQ$_<object id>_<column> and refuses to be dropped on its
+  // own (ORA-32794). `user_objects.generated` is Oracle's own answer to "did a human name
+  // this?", so it is the same test the index listing uses rather than a second guess at it.
+  sequences: `SELECT s.sequence_name AS "name" FROM user_sequences s
+     WHERE NOT EXISTS (
+       SELECT 1 FROM user_objects o
+        WHERE o.object_name = s.sequence_name AND o.object_type = 'SEQUENCE' AND o.generated = 'Y')
+     ORDER BY s.sequence_name`,
   tables: `SELECT table_name AS "name" FROM user_tables WHERE NOT ${ORA_NOISE_TABLE} ORDER BY table_name`,
   // Indexes are mostly an exercise in leaving out the ones that are not anybody's to copy:
   //   · the index behind a primary or unique key is created *by* that constraint, and the
@@ -4039,6 +4050,7 @@ async function oraObjectCopyPlan(
       label: spec.label,
       note: spec.note,
       replaceNote: spec.replaceNote,
+      hasTablespace: spec.hasTablespace,
       selected: spec.kind === kind,
       total: of.length,
       conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
@@ -5332,8 +5344,12 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
       : "";
     // The tablespace is worth a sentence either way round: preserved, it is the clause that
     // fails the whole copy on a target laid out differently; not preserved, the objects land
-    // somewhere other than where they came from, which is not what everyone expects.
-    const tablespaceLine = parsed.preserveTablespace
+    // somewhere other than where they came from, which is not what everyone expects. For a
+    // kind that occupies no segment there is nothing to say, and saying it anyway would be
+    // the dialog describing something that is not going to happen.
+    const tablespaceLine = !copyKindSpec(kind).hasTablespace
+      ? ""
+      : parsed.preserveTablespace
       ? ` Each one keeps the tablespace it has in ${plan.sourceSchema}, and fails if ${target.name} has no tablespace of that name.`
       : ` They are created in ${plan.targetSchema}'s default tablespace.`;
     return confirmRequired(res, describeOperation({

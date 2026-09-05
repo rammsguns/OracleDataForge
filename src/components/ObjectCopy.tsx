@@ -259,28 +259,34 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                 ))}
               </div>
 
-              <h3 className="text-[11px] font-bold uppercase tracking-wider text-mute mt-3 mb-2">Tablespace</h3>
-              <label
-                className={`flex items-start gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors ${
-                  preserveTablespace ? "border-accent/60 bg-accentdim" : "border-bdr hover:border-accent/40"
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  checked={preserveTablespace}
-                  onChange={(e) => setObjectCopyOptions(key, { preserveTablespace: e.target.checked })}
-                  className="mt-0.5 accent-[var(--accent)]"
-                  aria-label="Keep the source tablespace"
-                />
-                <div className="min-w-0">
-                  <div className="text-[12.5px] font-semibold">Keep the source tablespace</div>
-                  <div className="text-[11.5px] text-mute mt-0.5">
-                    {preserveTablespace
-                      ? `Each object is created in the tablespace it has in ${plan.sourceSchema}, and fails if ${plan.targetName} has no tablespace of that name.`
-                      : `Objects are created in ${plan.targetSchema}'s default tablespace. Storage sizing is left to the target either way.`}
-                  </div>
-                </div>
-              </label>
+              {/* a sequence occupies no segment, so there is no tablespace to keep — the
+                  choice is left out for those kinds rather than shown and quietly ignored */}
+              {summary?.hasTablespace !== false && (
+                <>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wider text-mute mt-3 mb-2">Tablespace</h3>
+                  <label
+                    className={`flex items-start gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors ${
+                      preserveTablespace ? "border-accent/60 bg-accentdim" : "border-bdr hover:border-accent/40"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={preserveTablespace}
+                      onChange={(e) => setObjectCopyOptions(key, { preserveTablespace: e.target.checked })}
+                      className="mt-0.5 accent-[var(--accent)]"
+                      aria-label="Keep the source tablespace"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-[12.5px] font-semibold">Keep the source tablespace</div>
+                      <div className="text-[11.5px] text-mute mt-0.5">
+                        {preserveTablespace
+                          ? `Each object is created in the tablespace it has in ${plan.sourceSchema}, and fails if ${plan.targetName} has no tablespace of that name.`
+                          : `Objects are created in ${plan.targetSchema}'s default tablespace. Storage sizing is left to the target either way.`}
+                      </div>
+                    </div>
+                  </label>
+                </>
+              )}
             </section>
           </div>
 
@@ -567,11 +573,19 @@ function ObjectPicker({
         </div>
       </div>
 
+      {/* the second half of the legend explains a mark that only a kind built on a table can
+          carry, so it is left out when nothing in these lists can be marked with it */}
       <p className="text-[11px] text-mute mt-1.5">
         Ctrl-click and shift-click pick several; double-click moves one. A name marked{" "}
         <span className="font-mono">· in target</span> already exists in {plan.targetSchema} and is what the choice above
-        decides the fate of; one marked <span className="font-mono">· needs …</span> is built on a table that is not there
-        yet, and copying it would only report that.
+        decides the fate of
+        {plan.items.some((i) => i.missingTable) && (
+          <>
+            ; one marked <span className="font-mono">· needs …</span> is built on a table that is not there yet, and
+            copying it would only report that
+          </>
+        )}
+        .
       </p>
     </section>
   );

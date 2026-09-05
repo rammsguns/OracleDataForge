@@ -234,10 +234,20 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are two of them: tables and indexes.** Sequences, views,
-  code objects, triggers and synonyms are not copied at all yet. Nothing outside the schema —
+- **One object type per run, and there are three of them: sequences, tables and indexes.**
+  They are listed in the order they have to be copied in — a column default calling
+  `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, and an index cannot be
+  created before its table — but nothing enforces that order: each run is confirmed and
+  reported on its own, and running them out of order simply reports the failures. Views, code
+  objects, triggers and synonyms are not copied at all yet. Nothing outside the schema —
   grants, roles, quotas, profiles, database links, directories — is copied, and nothing that
   lives in a DBA view the connection cannot read.
+- **A sequence arrives at the number the source has reached, not the number it started from.**
+  That is what stops a copy handing out values the source has already used, and it is what
+  makes replacing an existing sequence the dangerous choice: a target sequence that has gone
+  further than the source's is reset *backwards*, and the next rows it numbers collide with
+  rows that are already there. The sequences Oracle creates for identity columns (`ISEQ$_…`)
+  are left out of the listing — they belong to the table and arrive with it.
 - **A table arrives without its rows or its indexes.** Its columns, defaults, primary key,
   unique keys, check constraints and foreign keys come with it — the foreign keys through a
   second pass after every table in the run exists, which is why the order the tables were
@@ -268,7 +278,9 @@ replacement for Data Pump.
   time and leave queries running without the index in between; no data goes with it. An index
   Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
   the failure it is rather than worked around.
-- **The tablespace is a choice; the rest of the physical layout is not.** Left off — the
+- **The tablespace is a choice for the kinds that occupy one, and not offered for the rest.** A
+  sequence lives in no segment, so the checkbox is not shown for it and the confirmation dialog
+  says nothing about tablespaces. For tables and indexes: left off — the
   default — the segment clause is suppressed and objects land on the target's default
   tablespace, which is what lets a production schema land on a laptop. Turned on, each object
   is created in the tablespace it has in the source, and the copy fails outright on a target

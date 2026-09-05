@@ -22,14 +22,14 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 7,102 lines
+server/index.ts                  the backend: routes, registry, guards — 7,119 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds (tables, indexes), name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -186,7 +186,8 @@ connection being written to — so `requireFullAccess`, the read-only refusal, t
 Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
 set of rules; the source arrives as a parameter and is only ever read.
 
-One run copies one kind of object — **tables** or **indexes** — so what it did is legible from
+One run copies one kind of object — **sequences**, **tables** or **indexes**, listed in that
+order because it is the order they have to be copied in — so what it did is legible from
 the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
 `server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
@@ -201,7 +202,7 @@ and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside 
 `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
 every one is attempted, and every outcome is reported.
 
-Two things follow from a kind rather than being written into the route. A kind that can own
+Three things follow from a kind rather than being written into the route. A kind that can own
 foreign keys gets a second pass after the object loop, which is why `REF_CONSTRAINTS` is left
 out of `CREATE TABLE` at all: a foreign key names a second table, and alphabetical order puts
 plenty of children before their parents. A kind that is *built on* a table — indexes — gets the
@@ -209,6 +210,9 @@ opposite treatment, a check before the loop: the run reads which table each obje
 and reports a missing one as a skip naming the table, because Oracle's own answer is an
 ORA-00942 that names neither the index nor the table it wanted. The plan runs the same check
 against the target's tables, so the picker marks those objects before anything is attempted.
+And a kind that occupies no segment — sequences — does not offer the tablespace choice at all,
+in the panel or in the sentence the confirmation dialog writes about it, rather than offering
+it and quietly ignoring it.
 
 ## The write guard
 

@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "tables" | "indexes";
+export type CopyKind = "sequences" | "tables" | "indexes";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -41,6 +41,12 @@ export interface CopyKindSpec {
    * names it, rather than letting `CREATE` fail with an ORA-00942 that names nothing useful.
    */
   requiresTable: boolean;
+  /**
+   * Objects of this kind occupy a segment, so "keep the source tablespace" means something for
+   * them. A sequence is a row in the dictionary and lives nowhere, so the choice is not offered
+   * for it rather than offered and quietly ignored.
+   */
+  hasTablespace: boolean;
   /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
   note: string;
   /** what "drop and recreate" costs for this kind — a table and an index are not the same bet */
@@ -55,14 +61,31 @@ export interface CopyKindSpec {
  * what it did is legible from the result instead of having to be untangled from it. Copying a
  * schema is then several runs in the order the kinds are listed here, each one confirmed and
  * reported on its own.
+ *
+ * **The order is the order they have to be copied in**, which is why it is worth stating: a
+ * column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there
+ * yet, and an index cannot be created before its table. Sequences, then tables, then indexes.
+ * Someone working down the list in order gets a schema that comes out whole.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
+  {
+    kind: "sequences",
+    label: "Sequences",
+    objectType: "SEQUENCE",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    note: "The sequence and the number it has reached in the source, so the copy carries on from there rather than starting again at 1. Not the tables, defaults or triggers that use it.",
+    replaceNote:
+      "Each existing sequence is dropped and recreated at the source's number. A target sequence that has gone further will hand out numbers it has already given away, which is a duplicate key waiting to happen.",
+  },
   {
     kind: "tables",
     label: "Tables",
     objectType: "TABLE",
     foreignKeys: true,
     requiresTable: false,
+    hasTablespace: true,
     note: "Columns, defaults, constraints and, once every table is there, foreign keys. Not the rows or the indexes.",
     replaceNote:
       "Each existing table is dropped before it is recreated. A dropped table takes its rows with it and does not go to the recycle bin.",
@@ -73,6 +96,7 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     objectType: "INDEX",
     foreignKeys: false,
     requiresTable: true,
+    hasTablespace: true,
     note: "The indexes someone created, on tables the target already has. Not the ones Oracle built for a primary or unique key — those arrive with the table.",
     replaceNote:
       "Each existing index is dropped before it is recreated. That costs the time to rebuild it and queries run without it in between, but no data goes with it.",
@@ -353,9 +377,11 @@ export function copyIdent(name: string): string | null {
  * a recycle-bin copy of the old table behind. Both are why "replace" is offered as the
  * destructive choice it is rather than as a checkbox.
  *
- * Every other kind drops by name alone: `DROP INDEX "SALES_IX"` is a plain drop, and an index
+ * Every other kind drops by name alone. `DROP INDEX "SALES_IX"` is a plain drop, and an index
  * Oracle built for a constraint refuses it with ORA-02429 — which is the right answer, since
- * that index belongs to the constraint and the copy has no business replacing it.
+ * that index belongs to the constraint and the copy has no business replacing it. `DROP
+ * SEQUENCE "ORDER_SEQ"` always succeeds, and leaves every default and trigger that called it
+ * invalid until the new one is there — which is why replacing a sequence says what it costs.
  */
 export function dropStatement(kind: CopyKind, name: string): string | null {
   const spec = copyKindSpec(kind);

@@ -473,7 +473,7 @@ export interface CompileBatchResult {
  * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
  * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "tables" | "indexes";
+export type CopyKind = "sequences" | "tables" | "indexes";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
@@ -485,6 +485,8 @@ export interface ObjectCopyKindSummary {
   note: string;
   /** what "drop and recreate" costs for this kind, in the backend's words */
   replaceNote: string;
+  /** objects of this kind live in a tablespace — when false the choice is not offered at all */
+  hasTablespace: boolean;
   selected: boolean;
   total: number;
   /** how many of them the target already has */

@@ -37,12 +37,14 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["tables", "indexes"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes"]);
   });
 
-  it("puts tables before indexes, which is the order they have to be copied in", () => {
-    // an index cannot be created before its table, so offering them the other way round would
-    // walk the user into a run that reports nothing but "its table is not there"
+  it("lists the kinds in the order they have to be copied in", () => {
+    // a column default calling ORDER_SEQ.NEXTVAL fails with ORA-02289 when the sequence is not
+    // there, and an index cannot be created before its table — so someone working down the
+    // list in order gets a schema that comes out whole, and any other order does not
+    assert.ok(ALL_COPY_KINDS.indexOf("sequences") < ALL_COPY_KINDS.indexOf("tables"));
     assert.ok(ALL_COPY_KINDS.indexOf("tables") < ALL_COPY_KINDS.indexOf("indexes"));
   });
 
@@ -72,6 +74,19 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.equal(copyKindSpec("indexes").foreignKeys, false);
   });
 
+  it("offers the tablespace choice only for the kinds that occupy one", () => {
+    // a sequence is a row in the dictionary and lives in no segment, so the checkbox is left
+    // out for it rather than shown and quietly ignored — and the dialog drops the sentence too
+    assert.equal(copyKindSpec("sequences").hasTablespace, false);
+    assert.equal(copyKindSpec("tables").hasTablespace, true);
+    assert.equal(copyKindSpec("indexes").hasTablespace, true);
+  });
+
+  it("asks nothing extra of a sequence, which stands on its own", () => {
+    assert.equal(copyKindSpec("sequences").foreignKeys, false);
+    assert.equal(copyKindSpec("sequences").requiresTable, false);
+  });
+
   it("marks indexes as built on a table, which is what checks the target for one first", () => {
     // without it a whole run of indexes fails with ORA-00942 naming neither the index nor the
     // table it wanted; with it each one is a skip that names the table to copy across
@@ -95,6 +110,7 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind(" TABLES "), "tables");
     assert.equal(normalizeKind("indexes"), "indexes");
     assert.equal(normalizeKind(" Indexes "), "indexes");
+    assert.equal(normalizeKind("sequences"), "sequences");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
@@ -385,6 +401,12 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("indexes", "EMP_NAME_IX"), 'DROP INDEX "EMP_NAME_IX"');
   });
 
+  it("drops a sequence by name alone", () => {
+    // it always succeeds, and leaves whatever called it invalid until the new one is there —
+    // which is what the kind's replace note is for, not something to guard here
+    assert.equal(dropStatement("sequences", "ORDER_SEQ"), 'DROP SEQUENCE "ORDER_SEQ"');
+  });
+
   it("refuses a name no object could have", () => {
     assert.equal(dropStatement("tables", "   "), null);
     assert.equal(dropStatement("tables", "A".repeat(129)), null);
@@ -410,5 +432,6 @@ describe("copyCountLabel", () => {
 
   it("names every kind, since the dialog is written from whichever one was picked", () => {
     assert.equal(copyCountLabel("indexes", 40), "40 Indexes");
+    assert.equal(copyCountLabel("sequences", 3), "3 Sequences");
   });
 });

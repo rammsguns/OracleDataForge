@@ -13,8 +13,8 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are two of them: **tables** and **indexes**, offered in that order because it
-  is the order they have to be copied in. Reading both
+  run, and there are three of them: **sequences**, **tables** and **indexes**, offered in that
+  order because it is the order they have to be copied in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -42,6 +42,15 @@ Dates are the date the change landed on `main`.
   than letting Oracle answer with an ORA-00942 that names neither the index nor the table it
   wanted. Copy the tables, then the indexes. Replacing an index is a rebuild rather than a
   deletion, and the confirmation dialog says so instead of the sentence it uses for tables.
+  A sequence arrives at the number the source's has reached rather than at the number it
+  started from, so the copy carries on from where the source is instead of handing out values
+  the source has already used — which is also what makes replacing an existing sequence the
+  dangerous choice, since a target sequence that has gone further is reset backwards and its
+  next values collide with rows that are already there. The dialog says that in place of the
+  sentence it uses for a table. The sequences Oracle creates for identity columns are left out
+  of the listing: they belong to the table and arrive with it. And because a sequence occupies
+  no segment, the tablespace choice is not offered for it at all — the checkbox is absent and
+  the dialog says nothing about tablespaces — rather than being offered and quietly ignored.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -64,7 +73,7 @@ Dates are the date the change landed on `main`.
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 57 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 60 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 
