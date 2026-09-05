@@ -22,14 +22,14 @@ index.html                       SPA entry; mounts #root, loads src/main.tsx
 vite.config.ts                   dev server, /api proxy, watch-ignore rules
 tsconfig.json                    app config (src/)
 tsconfig.server.json             server config (server/)
-server/index.ts                  the backend: routes, registry, guards — 7,184 lines
+server/index.ts                  the backend: routes, registry, guards — 7,200 lines
 server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
 server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
 server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views), name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -186,8 +186,10 @@ connection being written to — so `requireFullAccess`, the read-only refusal, t
 Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
 set of rules; the source arrives as a parameter and is only ever read.
 
-One run copies one kind of object — **sequences**, **tables**, **indexes** or **views**, listed
-in that order because it is the order they have to be copied in — so what it did is legible from
+One run copies one kind of object — **sequences**, **tables**, **indexes**, **views** or
+**materialized views**, listed in that order because it is the order they have to be copied in,
+with the kind that cannot recover from a missing dependency after the kind that can — so what it
+did is legible from
 the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
 `server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
@@ -202,6 +204,12 @@ and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside 
 sequences and views were each added that way, plus the flags their kind of object needed. Unlike
 `oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
 every one is attempted, and every outcome is reported.
+
+A kind also carries the two names Oracle has for it. `user_objects` says `MATERIALIZED VIEW`
+and `DBMS_METADATA` wants `MATERIALIZED_VIEW`, the way it wants `REF_CONSTRAINT` and `DB_LINK`,
+so every `GET_DDL` reads `copyMetadataType` while the listing, the existence check and the
+`DROP` read `objectType`. The difference is written down once rather than discovered per kind,
+because the dictionary's spelling reaches `GET_DDL` as an ORA-31600 naming the parameter.
 
 Five things follow from a kind rather than being written into the route. A kind that can own
 foreign keys gets a second pass after the object loop, which is why `REF_CONSTRAINTS` is left

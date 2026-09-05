@@ -234,15 +234,16 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are four of them: sequences, tables, indexes and
-  views.** They are listed in the order they have to be copied in — a column default calling
-  `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, an index cannot be
-  created before its table, and a view over a table that has not arrived is created invalid —
-  but nothing enforces that order: each run is confirmed and reported on its own, and running
-  them out of order simply reports the outcome. Materialized views, code objects, triggers and
-  synonyms are not copied at all yet. Nothing outside the schema — grants, roles, quotas,
-  profiles, database links, directories — is copied, and nothing that lives in a DBA view the
-  connection cannot read.
+- **One object type per run, and there are five of them: sequences, tables, indexes, views and
+  materialized views.** They are listed in the order they have to be copied in — a column
+  default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, an
+  index cannot be created before its table, a view over a table that has not arrived is created
+  invalid, and a materialized view over one fails outright, which is why the kind that cannot
+  recover is offered after the kind that can. Nothing enforces that order: each run is confirmed
+  and reported on its own, and running them out of order simply reports the outcome. Code
+  objects, triggers and synonyms are not copied at all yet. Nothing outside the schema — grants,
+  roles, quotas, profiles, database links, directories — is copied, and nothing that lives in a
+  DBA view the connection cannot read.
 - **A sequence arrives at the number the source has reached, not the number it started from.**
   That is what stops a copy handing out values the source has already used, and it is what
   makes replacing an existing sequence the dangerous choice: a target sequence that has gone
@@ -291,6 +292,32 @@ replacement for Data Pump.
   keyword on 12.1 and later, which 11g does not accept; a view copied backwards across that
   line fails with Oracle's own syntax error, reported per view, and the rest of the run
   continues.
+- **A materialized view is the one kind that moves data.** Oracle builds it the way the source
+  wrote it, and that is almost always `BUILD IMMEDIATE`: the `CREATE` runs the view's query
+  against the *target's* tables and fills the container table before it returns. So the rows
+  are the target's own rather than the source's — this is not a data copy — but it is real work,
+  it can take minutes, and a single one can run past the copy's five-minute budget, which is
+  checked between objects rather than during one.
+- **A materialized view over a table the target has not got fails outright.** There is no
+  `FORCE` for one the way there is for a view, so Oracle answers ORA-00942 and the object is
+  reported as a failure with that error while the run continues. Copy the tables and the views
+  first — which is the order the types are offered in.
+- **`REFRESH FAST` needs materialized view logs the copy does not bring.** The logs are not
+  copied (they are not one of the five types), so a materialized view that refreshes fast on a
+  base table without one fails with ORA-23413 at creation. `ENABLE QUERY REWRITE` similarly
+  needs the privilege on the target. Both are reported per object, with Oracle's error.
+- **The container table is not offered as a table, and its index is not offered as an index.** A
+  materialized view keeps its rows in a table of the same name that `user_tables` lists like any
+  other; copying that as a plain table would put a table where a materialized view belongs and
+  leave the materialized-view run to fail on the name with ORA-00955. Both listings leave those
+  out, so the whole object arrives from one run. A target that already has a *materialized view*
+  where the source has a plain *table* of that name is the one case left over: the table run
+  sees the name as taken and, if replacing, gets Oracle's ORA-12083 telling it to use `DROP
+  MATERIALIZED VIEW`, reported as the failure it is.
+- **Replacing a materialized view throws its rows away and computes them again.** `DROP
+  MATERIALIZED VIEW` takes the container table with it, so the replacement is a full rebuild
+  from the target's tables — and anything querying it in between finds it missing rather than
+  stale.
 - **A foreign key pointing outside the copy is reported, not created.** One that references a
   table the run did not bring across cannot be added until that table is in the target; the
   result names it and the reason. Copy the missing table and run the copy again — the second

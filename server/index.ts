@@ -24,6 +24,7 @@ import {
   ALL_COPY_KINDS,
   copyCountLabel,
   copyKindSpec,
+  copyMetadataType,
   copyStatements,
   copyTransforms,
   dropStatement,
@@ -3835,7 +3836,13 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
        SELECT 1 FROM user_objects o
         WHERE o.object_name = s.sequence_name AND o.object_type = 'SEQUENCE' AND o.generated = 'Y')
      ORDER BY s.sequence_name`,
-  tables: `SELECT table_name AS "name" FROM user_tables WHERE NOT ${ORA_NOISE_TABLE} ORDER BY table_name`,
+  // A materialized view keeps its rows in a table of the same name, and `user_tables` lists
+  // it like any other. Copying that as a table would create a plain table where a
+  // materialized view belongs and then leave the materialized-view run to fail on the name
+  // (ORA-00955), so the container is left to the kind that owns it.
+  tables: `SELECT table_name AS "name" FROM user_tables t WHERE NOT ${ORA_NOISE_TABLE}
+     AND NOT EXISTS (SELECT 1 FROM user_mviews m WHERE m.mview_name = t.table_name)
+     ORDER BY table_name`,
   // Indexes are mostly an exercise in leaving out the ones that are not anybody's to copy:
   //   · the index behind a primary or unique key is created *by* that constraint, and the
   //     table copy already brings it — recreating it by hand would be a second index over the
@@ -3852,6 +3859,8 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
        AND NOT EXISTS (
          SELECT 1 FROM user_constraints c
           WHERE c.index_name = i.index_name AND c.constraint_type IN ('P', 'U'))
+       AND NOT EXISTS (
+         SELECT 1 FROM user_mviews m WHERE m.mview_name = i.table_name)
      ORDER BY index_name`,
   // A view is text, and the copy's whole job is that text arriving in another schema with its
   // meaning intact — which is why `retargetSchema` earns its keep here more than anywhere
@@ -3866,6 +3875,10 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
        SELECT 1 FROM user_objects o
         WHERE o.object_name = v.view_name AND o.object_type = 'VIEW' AND o.generated = 'Y')
      ORDER BY v.view_name`,
+  // The container table, its index and the rows in it all arrive with the CREATE, so a
+  // materialized view is listed from `user_mviews` alone and nothing here has to describe the
+  // pieces underneath it — the table and index listings leave those out instead.
+  mviews: `SELECT mview_name AS "name" FROM user_mviews ORDER BY mview_name`,
 };
 
 /**
@@ -3965,8 +3978,11 @@ async function oraCopyObjectDdl(
   fromSchema: string,
   toSchema: string
 ): Promise<string[]> {
+  // `copyMetadataType` rather than `objectType`: DBMS_METADATA calls it MATERIALIZED_VIEW
+  // where the dictionary calls it MATERIALIZED VIEW, and the dictionary's spelling here earns
+  // an ORA-31600 naming the parameter rather than the mistake.
   const rows = await oraExecRows(conn, `SELECT dbms_metadata.get_ddl(:t, :n) AS "ddl" FROM dual`, {
-    t: copyKindSpec(kind).objectType,
+    t: copyMetadataType(kind),
     n: name,
   });
   const ddl = rows[0]?.ddl;

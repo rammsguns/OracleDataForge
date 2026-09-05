@@ -13,8 +13,9 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are four of them: **sequences**, **tables**, **indexes** and **views**, offered
-  in that order because it is the order they have to be copied in. Reading both
+  run, and there are five of them: **sequences**, **tables**, **indexes**, **views** and
+  **materialized views**, offered in that order because it is the order they have to be copied
+  in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -66,6 +67,23 @@ Dates are the date the change landed on `main`.
   that drops nothing — its own `CREATE OR REPLACE` lands on the old one, so the grants on it and
   the views built on it survive, and the choice is named "Replace them with the source's"
   rather than "Drop and recreate them" for that run alone.
+  A materialized view run brings the whole object in one statement — the container table its
+  rows live in, the index on it, and the query that fills it — which is why the table listing
+  and the index listing now leave those pieces out: `user_tables` lists the container like any
+  other table, and copying it separately would put a plain table where a materialized view
+  belongs and leave the materialized-view run to fail on the name. It is also the one type that
+  moves data. Oracle builds it as the source wrote it, and that is almost always `BUILD
+  IMMEDIATE`, so the `CREATE` runs the query against the *target's* tables and fills it before
+  returning: the rows are the target's own rather than the source's, but it is real work and one
+  materialized view can run past the copy's time budget. There is no `FORCE` for one the way
+  there is for a view, so a materialized view whose tables are not there fails outright with
+  ORA-00942 rather than landing invalid — which is why the type is offered after the views, the
+  kind that cannot recover from a missing dependency going after the kind that can. Replacing
+  one is a rebuild that throws away the rows it is holding, and the type says so. A last wrinkle
+  worth knowing: `user_objects` calls it a `MATERIALIZED VIEW` and DBMS_METADATA wants a
+  `MATERIALIZED_VIEW`, so kinds now carry both names — the listing, the existence check and the
+  `DROP` take the dictionary's, `GET_DDL` takes the other, and passing the wrong one earns an
+  ORA-31600 that names the parameter rather than the mistake.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -90,7 +108,7 @@ Dates are the date the change landed on `main`.
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 66 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 71 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 

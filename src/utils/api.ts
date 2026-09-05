@@ -473,7 +473,7 @@ export interface CompileBatchResult {
  * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
  * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
