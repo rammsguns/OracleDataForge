@@ -22,6 +22,8 @@ import {
 import { effectiveRole, normalizeRole, oraPrivilege, type ConnectionRole } from "./connectionRole.ts";
 import {
   ALL_COPY_KINDS,
+  copyBaseKinds,
+  copyBaseLabel,
   copyCountLabel,
   copyKindSpec,
   copyMetadataType,
@@ -3718,11 +3720,11 @@ interface ObjectCopyItem {
   name: string;
   existsInTarget: boolean;
   /**
-   * The table this object is built on, when the target does not have it — an index whose
-   * table has not been copied yet. Absent for everything that can be created as things stand,
-   * which is every object of a kind that is not built on a table.
+   * The object this one is built on, when the target does not have it — an index whose table
+   * has not been copied yet, a trigger whose table or view has not. Absent for everything that
+   * can be created as things stand, which is every object of a kind that stands on its own.
    */
-  missingTable?: string;
+  missingBase?: string;
 }
 
 interface ObjectCopyKindSummary {
@@ -3735,6 +3737,12 @@ interface ObjectCopyKindSummary {
   hasTablespace: boolean;
   /** replacing one is its own create statement, so "drop and recreate" is the wrong name for it */
   replaceInPlace: boolean;
+  /**
+   * What objects of this kind are built on — "tables", "tables and views" — so the browser can
+   * say which run to do first about a blocked object instead of always saying "tables". Empty
+   * for a kind that stands on its own.
+   */
+  baseLabel: string;
   /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
   selected: boolean;
   total: number;
@@ -3774,8 +3782,10 @@ interface ObjectCopyObjectResult {
   error?: string;
   /**
    * Created, and still not working: a view the target cannot compile because something it
-   * selects from is not there. The object exists, so this is not a failure — but reporting it
-   * as a plain "created" would be a green result for a view that raises ORA-04063.
+   * selects from is not there, a trigger whose body calls a package that is not. The object
+   * exists, so this is not a failure — but reporting it as a plain "created" would be a green
+   * result for a view that raises ORA-04063 on the next select, or a trigger that raises it on
+   * the next insert.
    */
   warning?: string;
   /** how many statements it took */
@@ -3822,9 +3832,9 @@ interface ObjectCopyResult {
  * than tables, and `ORA_NOISE_TABLE` is the same exclusion the Explorer applies, so the copy
  * offers exactly the tables the rest of the app calls the user's.
  *
- * A kind is added here, in `OBJECT_COPY_KINDS`, and — if it is built on a table — in
- * `OBJECT_COPY_BASE_TABLE_SQL`. Nothing else in the server needs to know about it, and the
- * browser only needs the name added to its own copy of the union.
+ * A kind is added here, in `OBJECT_COPY_KINDS`, and — if it is built on something else — in
+ * `OBJECT_COPY_BASE_SQL`. Nothing else in the server needs to know about it, and the browser
+ * only needs the name added to its own copy of the union.
  */
 const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
   // The sequence behind an identity column is Oracle's, not the user's: it is created with the
@@ -3879,17 +3889,44 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
   // materialized view is listed from `user_mviews` alone and nothing here has to describe the
   // pieces underneath it — the table and index listings leave those out instead.
   mviews: `SELECT mview_name AS "name" FROM user_mviews ORDER BY mview_name`,
+  // A trigger is offered only where copying it means something in another schema:
+  //   · `base_object_type` leaves out the ones on the SCHEMA and the DATABASE — a DDL or
+  //     logon trigger is a rule about the account rather than one of its objects, and
+  //     recreating it in the target changes what that account is allowed to do
+  //   · a trigger on someone else's table is not this schema's to recreate, the same
+  //     exclusion the index listing makes
+  //   · `ORA_NOISE_TABLE` takes out the triggers Oracle keeps on its own tables — a
+  //     materialized view log, a container table, a Text index table — which are the
+  //     dictionary's business and fail or misfire in a target that has no such thing
+  //   · `generated = 'Y'` leaves out the ones Oracle named for something of its own
+  triggers: `SELECT t.trigger_name AS "name" FROM user_triggers t
+     WHERE t.base_object_type IN ('TABLE', 'VIEW')
+       AND t.table_owner = USER
+       AND t.trigger_name NOT LIKE 'BIN$%'
+       AND NOT ${ORA_NOISE_TABLE}
+       AND NOT EXISTS (
+         SELECT 1 FROM user_objects o
+          WHERE o.object_name = t.trigger_name AND o.object_type = 'TRIGGER' AND o.generated = 'Y')
+     ORDER BY t.trigger_name`,
 };
 
 /**
- * Which table each object of a kind is built on, for the kinds that are built on one at all.
+ * What each object of a kind is built on, for the kinds that are built on something at all.
  *
  * Read from the source, because that is where the object exists; what the *target* is missing
- * is then a lookup against the tables it already has. A kind with no entry here has
- * `requiresTable: false` and never asks.
+ * is then a lookup against what it already has, among the kinds `copyBaseKinds` names. A kind
+ * with no entry here has `requiresTable: false` and never asks.
+ *
+ * The query answers with a name and nothing else — not which kind of object it is. That is
+ * deliberate: a trigger's base object can be a table or a view, the target is searched for
+ * both, and a name that is there under either is a base object this trigger can be created on.
+ * Asking Oracle which one it is in the *source* would only let the run refuse a name the
+ * target has.
  */
-const OBJECT_COPY_BASE_TABLE_SQL: Partial<Record<CopyKind, string>> = {
+const OBJECT_COPY_BASE_SQL: Partial<Record<CopyKind, string>> = {
   indexes: `SELECT index_name AS "name", table_name AS "tbl" FROM user_indexes WHERE table_owner = USER`,
+  triggers: `SELECT trigger_name AS "name", table_name AS "tbl" FROM user_triggers
+     WHERE base_object_type IN ('TABLE', 'VIEW') AND table_owner = USER`,
 };
 
 /**
@@ -3917,9 +3954,9 @@ async function oraCopyList(conn: oracledb.Connection, kind: CopyKind): Promise<s
   return rows.map((r) => String(r.name));
 }
 
-/** Object name → the table it is built on, empty for a kind that is not built on one. */
-async function oraCopyBaseTables(conn: oracledb.Connection, kind: CopyKind): Promise<Map<string, string>> {
-  const sql = OBJECT_COPY_BASE_TABLE_SQL[kind];
+/** Object name → the object it is built on, empty for a kind that is not built on one. */
+async function oraCopyBaseObjects(conn: oracledb.Connection, kind: CopyKind): Promise<Map<string, string>> {
+  const sql = OBJECT_COPY_BASE_SQL[kind];
   if (!sql) return new Map();
   const rows = await oraExecRows(conn, sql);
   return new Map(rows.map((r) => [String(r.name), String(r.tbl)]));
@@ -3948,7 +3985,14 @@ async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Pr
  *
  * A view is created `FORCE`, so one whose tables are not in the target is created INVALID
  * rather than refused — which is the bet that makes the order views are copied in irrelevant,
- * and the reason a run of them cannot be reported from the `CREATE`s alone.
+ * and the reason a run of them cannot be reported from the `CREATE`s alone. A trigger is the
+ * same shape of problem from the other direction: its base table has to be there or the
+ * `CREATE` is refused, but whatever its body *calls* need not be, and a trigger that cannot
+ * compile is a trigger that raises ORA-04063 on the next insert instead of the next select.
+ *
+ * A disabled trigger is not an invalid one — `status` is about compilation, and the copy
+ * brings the source's enabled or disabled state across on purpose — so nothing here reports
+ * one, which is right.
  *
  * The whole schema's invalid objects of the type are read and filtered here rather than named
  * in an `IN` list, for the same reason the foreign-key pass does it: a run can carry two
@@ -4086,12 +4130,12 @@ async function oraObjectCopyPlan(
   const targetSchema = target.user.toUpperCase();
   const srcConn = await getOraConn(source);
   const names = new Map<CopyKind, string[]>();
-  let baseTables = new Map<string, string>();
+  let baseObjects = new Map<string, string>();
   let targetSystemSchema = false;
   let existing: Set<string>;
   try {
     for (const k of ALL_COPY_KINDS) names.set(k, await oraCopyList(srcConn, k));
-    if (copyKindSpec(kind).requiresTable) baseTables = await oraCopyBaseTables(srcConn, kind);
+    if (copyKindSpec(kind).requiresTable) baseObjects = await oraCopyBaseObjects(srcConn, kind);
     const tgtConn = await getOraConn(target);
     try {
       targetSystemSchema = await oraUserIsSystem(target, tgtConn);
@@ -4112,21 +4156,25 @@ async function oraObjectCopyPlan(
       replaceNote: spec.replaceNote,
       hasTablespace: spec.hasTablespace,
       replaceInPlace: spec.replaceInPlace,
+      baseLabel: copyBaseLabel(spec.kind),
       selected: spec.kind === kind,
       total: of.length,
       conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
     };
   });
 
-  // `existing` was read for every kind, so the tables the target has are already in hand:
-  // an index whose table is not among them is one the run will skip, and saying so here is
-  // what lets the picker show it before anything is attempted rather than after.
+  // `existing` was read for every kind, so what the target has is already in hand: an index
+  // whose table is not among them — or a trigger whose table *and* view are not — is one the
+  // run will skip, and saying so here is what lets the picker show it before anything is
+  // attempted rather than after.
+  const baseKinds = copyBaseKinds(kind);
   const items: ObjectCopyItem[] = (names.get(kind) ?? []).map((name) => {
-    const base = baseTables.get(name);
+    const base = baseObjects.get(name);
+    const haveBase = !!base && baseKinds.some((k) => existing.has(`${k} ${base}`));
     return {
       name,
       existsInTarget: existing.has(`${kind} ${name}`),
-      ...(base && !existing.has(`tables ${base}`) ? { missingTable: base } : {}),
+      ...(base && !haveBase ? { missingBase: base } : {}),
     };
   });
 
@@ -4143,7 +4191,7 @@ async function oraObjectCopyPlan(
     items,
     total: items.length,
     conflicts: items.filter((i) => i.existsInTarget).length,
-    blocked: items.filter((i) => i.missingTable).length,
+    blocked: items.filter((i) => i.missingBase).length,
     cap: OBJECT_COPY_MAX_OBJECTS,
     overCap: items.length > OBJECT_COPY_MAX_OBJECTS,
     targetReadOnly: !!target.readOnly,
@@ -4194,10 +4242,11 @@ async function oraObjectCopy(
       // ten seconds turns that into one reported failure instead of a stalled request.
       await tgtConn.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
 
-      // A kind built on a table needs the target's tables read too — the same query with a
-      // second type in its IN list, which is what makes the check below cost nothing.
-      const present = await oraCopyExisting(tgtConn, spec.requiresTable ? [kind, "tables"] : [kind]);
-      const baseTables = spec.requiresTable ? await oraCopyBaseTables(srcConn, kind) : new Map<string, string>();
+      // A kind built on something needs the target read for that too — the same query with
+      // another type or two in its IN list, which is what makes the check below cost nothing.
+      const baseKinds = copyBaseKinds(kind);
+      const present = await oraCopyExisting(tgtConn, [kind, ...baseKinds]);
+      const baseObjects = baseKinds.length ? await oraCopyBaseObjects(srcConn, kind) : new Map<string, string>();
       const wanted = opts.names ? new Set(opts.names) : null;
       for (const name of await oraCopyList(srcConn, kind)) {
         if (wanted && !wanted.has(name)) continue;
@@ -4214,15 +4263,16 @@ async function oraObjectCopy(
           landed.add(name);
           continue;
         }
-        // An index cannot be created before its table is there. Oracle's own answer to that is
-        // ORA-00942 on the CREATE INDEX, which names neither the index nor the table it wanted;
-        // this names both and says what to do about it.
-        const baseTable = baseTables.get(name);
-        if (baseTable && !present.has(`tables ${baseTable}`)) {
+        // An index cannot be created before its table is there, and neither can a trigger
+        // before the table or view it fires for. Oracle's own answer to that is ORA-00942 on
+        // the CREATE, which names neither the object nor the one it wanted; this names both
+        // and says which run to do first.
+        const baseObject = baseObjects.get(name);
+        if (baseObject && !baseKinds.some((k) => present.has(`${k} ${baseObject}`))) {
           objects.push({
             ...base,
             status: "skipped",
-            reason: `${baseTable} is not in ${targetSchema} — copy the tables first, then run this again.`,
+            reason: `${baseObject} is not in ${targetSchema} — copy the ${copyBaseLabel(kind)} first, then run this again.`,
           });
           continue;
         }
@@ -4264,7 +4314,7 @@ async function oraObjectCopy(
         const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name)));
         for (const o of made) {
           if (!invalid.has(o.name)) continue;
-          o.warning = `Created, but ${targetSchema} cannot compile it — something it selects from is not there. Copy that across and Oracle compiles this the next time anything uses it.`;
+          o.warning = `Created, but ${targetSchema} cannot compile it — something it needs is not there. Copy that across and Oracle compiles this the next time anything uses it.`;
         }
       }
     } finally {
@@ -5387,7 +5437,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
   const picked = new Set(names ?? plan.items.map((i) => i.name));
   const total = picked.size;
   const conflicts = plan.items.filter((i) => picked.has(i.name) && i.existsInTarget).length;
-  const blocked = plan.items.filter((i) => picked.has(i.name) && i.missingTable).length;
+  const blocked = plan.items.filter((i) => picked.has(i.name) && i.missingBase).length;
 
   if (total > plan.cap) {
     return res.status(400).json({
@@ -5421,7 +5471,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
     // of what you just asked for": an index whose table is not there yet is reported, not
     // created, and the dialog is the last place to say so before it happens.
     const blockedLine = blocked
-      ? ` ${blocked} of them are built on a table ${plan.targetSchema} does not have and will be skipped — copy those tables first if you want them.`
+      ? ` ${blocked} of them are built on something ${plan.targetSchema} does not have and will be skipped — copy the ${copyBaseLabel(kind)} first if you want them.`
       : "";
     // The tablespace is worth a sentence either way round: preserved, it is the clause that
     // fails the whole copy on a target laid out differently; not preserved, the objects land

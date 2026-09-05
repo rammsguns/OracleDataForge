@@ -234,16 +234,18 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are five of them: sequences, tables, indexes, views and
-  materialized views.** They are listed in the order they have to be copied in — a column
-  default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there, an
-  index cannot be created before its table, a view over a table that has not arrived is created
-  invalid, and a materialized view over one fails outright, which is why the kind that cannot
-  recover is offered after the kind that can. Nothing enforces that order: each run is confirmed
-  and reported on its own, and running them out of order simply reports the outcome. Code
-  objects, triggers and synonyms are not copied at all yet. Nothing outside the schema — grants,
-  roles, quotas, profiles, database links, directories — is copied, and nothing that lives in a
-  DBA view the connection cannot read.
+- **One object type per run, and there are six of them: sequences, tables, indexes, views,
+  materialized views and triggers.** They are listed in the order they have to be copied in — a
+  column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there,
+  an index cannot be created before its table, a view over a table that has not arrived is
+  created invalid, and a materialized view over one fails outright, which is why the kind that
+  cannot recover is offered after the kind that can. Triggers come last of all, because one
+  stands on both the object it fires for and everything its body calls. Nothing enforces that
+  order: each run is confirmed and reported on its own, and running them out of order simply
+  reports the outcome. Code objects — packages, procedures, functions, types — and synonyms are
+  not copied at all yet. Nothing outside the schema — grants, roles, quotas, profiles, database
+  links, directories — is copied, and nothing that lives in a DBA view the connection cannot
+  read.
 - **A sequence arrives at the number the source has reached, not the number it started from.**
   That is what stops a copy handing out values the source has already used, and it is what
   makes replacing an existing sequence the dangerous choice: a target sequence that has gone
@@ -288,10 +290,10 @@ replacement for Data Pump.
   grants on it and the views built on it survive — which is the one kind where "replace" costs
   nothing but the definition itself. Anything selecting from the old view sees the source's
   columns from that moment on.
-- **A view from a newer database can fail on an older one.** `GET_DDL` emits the `EDITIONABLE`
-  keyword on 12.1 and later, which 11g does not accept; a view copied backwards across that
-  line fails with Oracle's own syntax error, reported per view, and the rest of the run
-  continues.
+- **A view or a trigger from a newer database can fail on an older one.** `GET_DDL` emits the
+  `EDITIONABLE` keyword on 12.1 and later, which 11g does not accept; either copied backwards
+  across that line fails with Oracle's own syntax error, reported per object, and the rest of
+  the run continues.
 - **A materialized view is the one kind that moves data.** Oracle builds it the way the source
   wrote it, and that is almost always `BUILD IMMEDIATE`: the `CREATE` runs the view's query
   against the *target's* tables and fills the container table before it returns. So the rows
@@ -303,7 +305,7 @@ replacement for Data Pump.
   reported as a failure with that error while the run continues. Copy the tables and the views
   first — which is the order the types are offered in.
 - **`REFRESH FAST` needs materialized view logs the copy does not bring.** The logs are not
-  copied (they are not one of the five types), so a materialized view that refreshes fast on a
+  copied (they are not one of the six types), so a materialized view that refreshes fast on a
   base table without one fails with ORA-23413 at creation. `ENABLE QUERY REWRITE` similarly
   needs the privilege on the target. Both are reported per object, with Oracle's error.
 - **The container table is not offered as a table, and its index is not offered as an index.** A
@@ -318,6 +320,34 @@ replacement for Data Pump.
   MATERIALIZED VIEW` takes the container table with it, so the replacement is a full rebuild
   from the target's tables — and anything querying it in between finds it missing rather than
   stale.
+- **A trigger fires for a table or a view, and that object has to be in the target first.**
+  Oracle refuses `CREATE TRIGGER` on an object it cannot find (ORA-00942), so the run looks for
+  the base object among the target's tables *and* views before it tries — an `INSTEAD OF`
+  trigger's base object is a view — and a missing one is a skip naming it and naming the runs to
+  do first. Copy the tables and the views, then the triggers.
+- **What a trigger's body calls is not checked, and one that cannot compile is still created.**
+  The base object is the only thing pre-checked; a trigger whose body calls a package,
+  sequence or table the target has not got is created and left INVALID, and reported as created
+  with the sentence saying it does not work yet. Nothing has to be re-run to fix one — copy what
+  it needs and Oracle compiles the trigger the next time anything writes to the table. Whether
+  such a create comes back clean (and the invalid check reports it) or comes back as the
+  driver's ORA-24344 "success with compilation error" (in which case it is reported as a failure
+  and the invalid trigger is in the target all the same) has **not** been checked against a live
+  database — it is the first thing to look at when one is available.
+- **Triggers on the schema or the database are not offered.** A DDL, logon or servererror
+  trigger is a rule about the account rather than one of its objects, and recreating it in the
+  target would change what that account is allowed to do; only triggers on a table or a view are
+  listed. Nor are the triggers Oracle keeps on its own tables (a materialized view log, a
+  materialized view's container, a Text index table), the ones it named itself, or triggers on
+  another schema's table.
+- **Replacing a trigger swaps what it does at that moment.** Its own `CREATE OR REPLACE` lands
+  on the old one, so nothing is dropped and the table is never briefly without a trigger — but
+  from then on every insert, update and delete on that table runs the source's code rather than
+  the target's, and there is no way back to the old definition from here.
+- **A trigger arrives enabled or disabled the way the source has it.** `GET_DDL` answers with
+  the `CREATE OR REPLACE` and an `ALTER TRIGGER … ENABLE` (or `DISABLE`), and the copy runs
+  both. A trigger somebody turned off in the source stays off in the target, which is usually
+  what is wanted and is worth knowing when it is not.
 - **A foreign key pointing outside the copy is reported, not created.** One that references a
   table the run did not bring across cannot be added until that table is in the target; the
   result names it and the reason. Copy the missing table and run the copy again — the second
@@ -332,8 +362,9 @@ replacement for Data Pump.
   Oracle built for a constraint refuses to be dropped at all (ORA-02429), which is reported as
   the failure it is rather than worked around.
 - **The tablespace is a choice for the kinds that occupy one, and not offered for the rest.** A
-  sequence is a row in the dictionary and a view is text, so neither lives in a segment: the
-  checkbox is not shown for them and the confirmation dialog says nothing about tablespaces.
+  sequence is a row in the dictionary, and a view and a trigger are text, so none of them lives
+  in a segment: the checkbox is not shown for them and the confirmation dialog says nothing
+  about tablespaces.
   For tables and indexes: left off — the
   default — the segment clause is suppressed and objects land on the target's default
   tablespace, which is what lets a production schema land on a laptop. Turned on, each object

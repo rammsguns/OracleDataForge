@@ -13,9 +13,9 @@ Dates are the date the change landed on `main`.
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are five of them: **sequences**, **tables**, **indexes**, **views** and
-  **materialized views**, offered in that order because it is the order they have to be copied
-  in. Reading both
+  run, and there are six of them: **sequences**, **tables**, **indexes**, **views**,
+  **materialized views** and **triggers**, offered in that order because it is the order they
+  have to be copied in. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a
@@ -84,6 +84,27 @@ Dates are the date the change landed on `main`.
   `MATERIALIZED_VIEW`, so kinds now carry both names — the listing, the existence check and the
   `DROP` take the dictionary's, `GET_DDL` takes the other, and passing the wrong one earns an
   ORA-31600 that names the parameter rather than the mistake.
+  A trigger run copies the trigger's PL/SQL as the source wrote it, onto the table or view it
+  fires for, enabled or disabled the way the source has it — Oracle answers `GET_DDL` for a
+  trigger with two statements, the `CREATE OR REPLACE` and an `ALTER TRIGGER … ENABLE`, and the
+  copy runs both, so a trigger somebody turned off in the source does not start firing in the
+  target. Triggers are offered last, after everything else, because one stands on more than any
+  other type does: the table or view it fires for has to exist or Oracle refuses the `CREATE`,
+  and its body can call any sequence, table, view or package in the schema. That second half is
+  not pre-checked and does not have to be — a trigger whose body calls something the target has
+  not got is created and left invalid, and is reported as created *with the sentence saying it
+  does not work yet*, the same second pass the views got. The first half is pre-checked, the
+  way an index's table is, with one difference worth having: a trigger's base object can be a
+  table **or** a view, since an `INSTEAD OF` trigger is how a view is written to at all, so the
+  target is searched for both and the sentence about what to copy first names both runs rather
+  than always saying "tables". Replacing a trigger is the other replacement that drops nothing:
+  its own `CREATE OR REPLACE` lands on the old one, so the table is never briefly running
+  without a trigger — though what it does changes at that moment, which is what the type says
+  under the replace choice. Triggers on the schema or the database itself are not offered:
+  a DDL or logon trigger is a rule about the account rather than one of its objects. Neither are
+  the ones Oracle keeps on its own tables — a materialized view log, a container table, a Text
+  index table — nor triggers on another schema's table, the same exclusion the index listing
+  makes.
   **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
   suppressed entirely and objects land in the target's default tablespace — which is what lets a
   production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
@@ -95,7 +116,7 @@ Dates are the date the change landed on `main`.
   them, and is presented as the destructive operation it is — the confirmation dialog counts them
   and adds the sentence belonging to the kind being copied, since a dropped table takes its rows
   with it, a dropped index is a rebuild, a dropped sequence hands out numbers it has already
-  given away, and a view is not dropped at all. A
+  given away, and neither a view nor a trigger is dropped at all. A
   failure does not stop the run: unlike a table migration script, this is hundreds of independent
   objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
   the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
@@ -108,7 +129,7 @@ Dates are the date the change landed on `main`.
   preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
   block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
   `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
-  `server/objectCopy.ts` with 71 tests, because each is a mistake that looks like a success
+  `server/objectCopy.ts` with 82 tests, because each is a mistake that looks like a success
   rather than an error. Caps and what the copy deliberately leaves out are in
   [known_limitations.md](known_limitations.md#copying-objects-between-connections).
 

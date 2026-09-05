@@ -19,6 +19,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   ALL_COPY_KINDS,
+  copyBaseKinds,
+  copyBaseLabel,
   copyCountLabel,
   copyIdent,
   copyKindSpec,
@@ -38,7 +40,7 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews", "triggers"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -52,6 +54,11 @@ describe("OBJECT_COPY_KINDS", () => {
     // and the kind that cannot recover goes after the kind that can: a view missing something
     // is created anyway and compiles itself later, a materialized view missing something fails
     assert.ok(ALL_COPY_KINDS.indexOf("views") < ALL_COPY_KINDS.indexOf("mviews"));
+    // triggers after everything: one stands on the table or view it fires for *and* on
+    // whatever its body calls, which is more than any other kind asks of the target
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "triggers")) {
+      assert.ok(ALL_COPY_KINDS.indexOf(kind) < ALL_COPY_KINDS.indexOf("triggers"), kind);
+    }
   });
 
   it("gives every kind a distinct label and a spec that can be looked up", () => {
@@ -104,6 +111,8 @@ describe("OBJECT_COPY_KINDS", () => {
     // out for it rather than shown and quietly ignored — and the dialog drops the sentence too
     assert.equal(copyKindSpec("sequences").hasTablespace, false);
     assert.equal(copyKindSpec("views").hasTablespace, false);
+    // and a trigger is PL/SQL in the dictionary, which occupies no segment either
+    assert.equal(copyKindSpec("triggers").hasTablespace, false);
     assert.equal(copyKindSpec("tables").hasTablespace, true);
     assert.equal(copyKindSpec("indexes").hasTablespace, true);
     // a materialized view keeps its rows in a container table, which is a segment like any other
@@ -123,7 +132,10 @@ describe("OBJECT_COPY_KINDS", () => {
     // on it and the validity of every view built on it, to make room for a statement that was
     // going to overwrite it anyway
     assert.equal(copyKindSpec("views").replaceInPlace, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views")) {
+    // a trigger is the same statement and the same reasoning: dropping it first would leave
+    // the table unguarded for as long as the create takes, for no gain at all
+    assert.equal(copyKindSpec("triggers").replaceInPlace, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers")) {
       assert.equal(copyKindSpec(kind).replaceInPlace, false, kind);
     }
   });
@@ -132,7 +144,10 @@ describe("OBJECT_COPY_KINDS", () => {
     // a view is created FORCE — it lands whether or not the target has what it selects from,
     // so without the check a run reports "created" for a view that raises ORA-04063
     assert.equal(copyKindSpec("views").compiled, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views")) {
+    // a trigger lands the same way when its body calls something the target has not got: it
+    // exists, it is invalid, and the first insert on the table is what finds out
+    assert.equal(copyKindSpec("triggers").compiled, true);
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers")) {
       assert.equal(copyKindSpec(kind).compiled, false, kind);
     }
   });
@@ -157,6 +172,14 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.equal(copyKindSpec("tables").requiresTable, false);
   });
 
+  it("marks triggers as built on something, and on either of two kinds", () => {
+    // an INSTEAD OF trigger is how a view is written to at all, so a run that looked only
+    // among the target's tables would report every one of them as blocked by a view that is
+    // sitting right there
+    assert.equal(copyKindSpec("triggers").requiresTable, true);
+    assert.deepEqual(copyKindSpec("triggers").baseKinds, ["tables", "views"]);
+  });
+
   it("says what each kind carries and what replacing one costs", () => {
     // both are shown to the user verbatim — the note in the type list and in the confirmation
     // dialog, the replace note under the "drop and recreate" choice
@@ -177,12 +200,16 @@ describe("normalizeKind", () => {
     assert.equal(normalizeKind("views"), "views");
     assert.equal(normalizeKind("mviews"), "mviews");
     assert.equal(normalizeKind(" MVIEWS "), "mviews");
+    assert.equal(normalizeKind("triggers"), "triggers");
+    assert.equal(normalizeKind(" TRIGGERS "), "triggers");
   });
 
   it("falls back to the default rather than passing an unknown kind through", () => {
     // the value reaches a listing query that has no entry for it, so it must not survive
     assert.equal(normalizeKind("grants"), DEFAULT_COPY_KIND);
-    assert.equal(normalizeKind("triggers"), DEFAULT_COPY_KIND);
+    // a kind this app does not copy is not a kind, however plausible it sounds
+    assert.equal(normalizeKind("procedures"), DEFAULT_COPY_KIND);
+    assert.equal(normalizeKind("synonyms"), DEFAULT_COPY_KIND);
   });
 
   it("falls back for anything that is not a string at all", () => {
@@ -376,6 +403,39 @@ describe("copyStatements", () => {
       ["CREATE OR REPLACE TRIGGER bi BEFORE INSERT ON t BEGIN NULL; END;"]
     );
   });
+
+  it("splits the trigger DDL Oracle emits into the create and the enable", () => {
+    // GET_DDL answers for a trigger with two statements: the trigger itself, terminated by
+    // the SQL*Plus slash because it is PL/SQL, and an ALTER carrying the enabled or disabled
+    // state the source has it in. Both have to run, and they cannot run together.
+    const ddl = [
+      '  CREATE OR REPLACE EDITIONABLE TRIGGER "ORDERS_BI" ',
+      'BEFORE INSERT ON "ORDERS"',
+      "FOR EACH ROW",
+      "BEGIN",
+      "  IF :new.id IS NULL THEN",
+      "    :new.id := ORDER_SEQ.NEXTVAL;",
+      "  END IF;",
+      "END;",
+      "/",
+      'ALTER TRIGGER "ORDERS_BI" ENABLE;',
+      "",
+    ].join("\n");
+    const stmts = copyStatements(ddl);
+    assert.equal(stmts.length, 2);
+    // the block keeps its own END; — stripping it is PLS-00103 on end-of-file
+    assert.ok(stmts[0].startsWith('CREATE OR REPLACE EDITIONABLE TRIGGER "ORDERS_BI"'), stmts[0]);
+    assert.ok(stmts[0].endsWith("END;"), stmts[0]);
+    // the ALTER is plain SQL, so its semicolon is a terminator and the driver must not see it
+    assert.equal(stmts[1], 'ALTER TRIGGER "ORDERS_BI" ENABLE');
+  });
+
+  it("keeps a disabled trigger disabled, because that is what the source says", () => {
+    // the state is carried by the second statement rather than by anything this app decides,
+    // so a trigger somebody turned off in the source does not start firing in the target
+    const stmts = copyStatements('CREATE OR REPLACE TRIGGER "T" BEFORE INSERT ON "X" BEGIN NULL; END;\n/\nALTER TRIGGER "T" DISABLE;\n');
+    assert.equal(stmts[1], 'ALTER TRIGGER "T" DISABLE');
+  });
 });
 
 describe("retargetSchema", () => {
@@ -456,6 +516,25 @@ describe("retargetSchema", () => {
     assert.ok(out.includes("'sent to HR.OLD_QUEUE'"), out);
     assert.ok(out.includes("-- was HR.ORDERS_OLD until the rename"), out);
   });
+
+  it("repoints what a trigger body calls, and leaves its messages alone", () => {
+    // a trigger is the other place a hand-written qualifier hides, and the consequence is
+    // worse than a view's: an un-repointed one has the target's inserts calling the source's
+    // sequence and raising the source's errors
+    const ddl = [
+      'CREATE OR REPLACE EDITIONABLE TRIGGER "ORDERS_BI"',
+      'BEFORE INSERT ON "ORDERS"',
+      "FOR EACH ROW",
+      "BEGIN",
+      "  :new.id := HR.ORDER_SEQ.NEXTVAL;",
+      '  HR.AUDIT_PKG.note(:new.id, \'raised in HR.ORDERS\');',
+      "END;",
+    ].join("\n");
+    const out = retargetSchema(ddl, "HR", "STAGE");
+    assert.ok(out.includes("STAGE.ORDER_SEQ.NEXTVAL"), out);
+    assert.ok(out.includes("STAGE.AUDIT_PKG.note"), out);
+    assert.ok(out.includes("'raised in HR.ORDERS'"), out);
+  });
 });
 
 describe("copyIdent", () => {
@@ -510,6 +589,12 @@ describe("dropStatement", () => {
     assert.equal(dropStatement("mviews", "SALES_MV"), 'DROP MATERIALIZED VIEW "SALES_MV"');
   });
 
+  it("spells the drop for a trigger it will not use either", () => {
+    // replaced in place like a view, for the stronger reason: a dropped trigger is a table
+    // running unguarded until the create lands
+    assert.equal(dropStatement("triggers", "ORDERS_BI"), 'DROP TRIGGER "ORDERS_BI"');
+  });
+
   it("refuses a name no object could have", () => {
     assert.equal(dropStatement("tables", "   "), null);
     assert.equal(dropStatement("tables", "A".repeat(129)), null);
@@ -538,5 +623,47 @@ describe("copyCountLabel", () => {
     assert.equal(copyCountLabel("sequences", 3), "3 Sequences");
     assert.equal(copyCountLabel("views", 7), "7 Views");
     assert.equal(copyCountLabel("mviews", 2), "2 Materialized Views");
+    assert.equal(copyCountLabel("triggers", 9), "9 Triggers");
+  });
+});
+
+describe("copyBaseKinds", () => {
+  it("is empty for a kind that stands on its own, so nothing is looked up for it", () => {
+    // the run reads the target for these kinds and skips the base-object query entirely
+    for (const kind of ["sequences", "tables", "views", "mviews"] as const) {
+      assert.deepEqual(copyBaseKinds(kind), []);
+    }
+  });
+
+  it("is the table alone for an index", () => {
+    assert.deepEqual(copyBaseKinds("indexes"), ["tables"]);
+  });
+
+  it("is the table or the view for a trigger", () => {
+    // the whole reason this is a list: an INSTEAD OF trigger's base object is a view, and
+    // searching the target's tables for it would call a view that is there a missing table
+    assert.deepEqual(copyBaseKinds("triggers"), ["tables", "views"]);
+  });
+
+  it("names only kinds the copy actually knows how to list", () => {
+    // a base kind is put straight into the target's existence query, so one that is not a
+    // real kind would be a type this app never asks Oracle about
+    for (const kind of ALL_COPY_KINDS) {
+      for (const base of copyBaseKinds(kind)) assert.ok(ALL_COPY_KINDS.includes(base), `${kind} → ${base}`);
+    }
+  });
+});
+
+describe("copyBaseLabel", () => {
+  it("names the run to do first, the way the type list names it", () => {
+    // it lands in "copy the tables first, then run this again" and in the confirmation
+    // dialog, so it has to read as the name of a run rather than as a type of object
+    assert.equal(copyBaseLabel("indexes"), "tables");
+    assert.equal(copyBaseLabel("triggers"), "tables and views");
+  });
+
+  it("is empty for a kind that is built on nothing", () => {
+    assert.equal(copyBaseLabel("views"), "");
+    assert.equal(copyBaseLabel("sequences"), "");
   });
 });
