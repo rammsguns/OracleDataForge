@@ -29,6 +29,7 @@ import {
   copyCountLabel,
   copyKindSpec,
   copyMetadataType,
+  copyStatusTypes,
   copyStatements,
   copyTransforms,
   dropStatement,
@@ -3820,6 +3821,10 @@ interface ObjectCopyResult {
  * only needs the name added to its own copy of the union.
  */
 const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
+  types: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'TYPE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  packages: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PACKAGE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  procedures: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PROCEDURE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  functions: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'FUNCTION' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
   // The sequence behind an identity column is Oracle's, not the user's: it is created with the
   // table, dropped with it, named ISEQ$_<object id>_<column> and refuses to be dropped on its
   // own (ORA-32794). `user_objects.generated` is Oracle's own answer to "did a human name
@@ -3939,7 +3944,7 @@ const OBJECT_COPY_BASE_SQL: Partial<Record<CopyKind, string>> = {
  * Which parameters and why is `copyTransforms` in `server/objectCopy.ts`; this is the half
  * that talks to Oracle. Each parameter is set on its own and its failure ignored: the set is
  * version-dependent, and an older database refusing one of them (ORA-31604) must not cost the
- * copy the other seven.
+ * copy the other parameters.
  */
 async function oraCopyPrepareMetadata(conn: oracledb.Connection, preserveTablespace: boolean): Promise<void> {
   for (const [name, value] of copyTransforms(preserveTablespace)) {
@@ -4003,7 +4008,7 @@ async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Pr
  * it. Asking this question of the synonyms anyway costs one query and turns a dangling one
  * into a reported warning wherever the target marks it INVALID — the case that matters most
  * for this kind, since a synonym for a package or a database link is dangling by construction
- * here, neither being something the copy moves. What is *not* established is whether Oracle
+ * when the dependency has not been copied. What is *not* established is whether Oracle
  * marks a never-resolvable synonym at all; where it does not, this finds nothing and the
  * synonym is reported as the plain "created" it also is.
  *
@@ -4015,8 +4020,8 @@ async function oraCopyInvalid(conn: oracledb.Connection, kind: CopyKind, names: 
   if (!names.size) return new Set();
   const rows = await oraExecRows(
     conn,
-    `SELECT object_name AS "name" FROM user_objects WHERE object_type = :t AND status <> 'VALID'`,
-    { t: copyKindSpec(kind).objectType }
+    `SELECT object_name AS "name" FROM user_objects WHERE object_type IN (:t, :body) AND status <> 'VALID'`,
+    { t: copyStatusTypes(kind)[0], body: copyStatusTypes(kind)[1] ?? copyStatusTypes(kind)[0] }
   );
   return new Set(rows.map((r) => String(r.name)).filter((n) => names.has(n)));
 }
@@ -4327,7 +4332,7 @@ async function oraObjectCopy(
         const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name)));
         for (const o of made) {
           if (!invalid.has(o.name)) continue;
-          o.warning = `Created, but ${targetSchema} cannot compile it — something it needs is not there. Copy that across and Oracle compiles this the next time anything uses it.`;
+          o.warning = `Created, but ${targetSchema} reports invalid compilation (including any package or type body). Check compilation errors and dependencies, then recompile.`;
         }
       }
     } finally {

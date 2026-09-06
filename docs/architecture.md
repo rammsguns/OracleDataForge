@@ -29,7 +29,7 @@ server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora
 server/oracleWallet.test.ts      its tests, run by the same `npm test`
 server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
 server/connectionRole.test.ts    its tests, run by the same `npm test`
-server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews, synonyms, triggers), name whitelist, transform params, statement prep
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews, synonyms, packages, procedures, functions, types, triggers), name whitelist, transform params, statement prep
 server/objectCopy.test.ts        its tests, run by the same `npm test`
 src/                             the entire frontend
 data/                            runtime state, gitignored
@@ -186,14 +186,10 @@ connection being written to — so `requireFullAccess`, the read-only refusal, t
 Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
 set of rules; the source arrives as a parameter and is only ever read.
 
-One run copies one kind of object — **sequences**, **tables**, **indexes**, **views**,
-**materialized views**, **synonyms** or **triggers**, listed in that order because it is the
-order they have to be copied in, with the kind that cannot recover from a missing dependency
-after the kind that can, synonyms before the triggers because a trigger body can call a synonym
-and no synonym can name a trigger, and triggers last because one stands on more than any other
-kind does — so what it
-did is legible from
-the result rather than having to be untangled from it. Which kinds exist, how a DBMS_METADATA answer becomes runnable
+One run copies one kind: sequences, types, tables, indexes, views, materialized views,
+synonyms, packages, procedures, functions or triggers. Types precede tables and routines
+precede triggers, but the catalogue is not a dependency sort. Cross-kind or cyclic
+dependencies can require more runs and recompilation. Which kinds exist, how a DBMS_METADATA answer becomes runnable
 statements, and how DDL written for one schema is pointed at another live in
 `server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
 mistake that looks like a success — a qualifier left pointing at the source is a VALID object
@@ -235,11 +231,11 @@ would be reported blocked by something sitting in the target already.
 A kind that occupies no segment — sequences, views, synonyms and triggers — does not offer the
 tablespace choice at all, in the panel or in the sentence the confirmation dialog writes about
 it, rather than offering it and quietly ignoring it. A kind whose own DDL is a `CREATE OR
-REPLACE` — views, synonyms and triggers — is replaced without being dropped, because dropping it
+REPLACE` — views, synonyms, triggers and PL/SQL code — is replaced without being dropped, because dropping it
 first would cost the grants on a view and the validity of everything built on it, and would
 leave a table running unguarded until the new trigger landed, to make room for a statement that
 was going to overwrite it anyway; the panel names that choice after what it does. And a kind
-that is *compiled* — views and triggers again, and synonyms with them — gets a second pass of
+that is *compiled* — views, triggers, synonyms and PL/SQL code — gets a second pass of
 its own after the loop: a view is created
 `FORCE`, which is what makes the order views are copied in irrelevant, and the cost of that bet
 is that one whose tables are missing is created INVALID rather than refused. A trigger reaches
@@ -362,3 +358,8 @@ type-checks only `src` — an inconsistency worth being aware of, though harmles
 - [performance.md](performance.md) — limits, pooling, and caching behavior
 - [known_limitations.md](known_limitations.md) — what this design does not do
 - [deployment.md](deployment.md) — running it
+
+Package and type metadata includes specifications and optional bodies, executed in emitted
+order as one logical picker item. Compilation checks include PACKAGE BODY and TYPE BODY,
+so a valid specification cannot hide an invalid body. Types use CREATE OR REPLACE without
+DROP or FORCE fallback; dependent types or tables may prevent replacement.

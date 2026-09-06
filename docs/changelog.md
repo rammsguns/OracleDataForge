@@ -10,12 +10,17 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- Object copy now includes packages, standalone procedures, functions and types. Package/type
+  bodies travel with their specifications and participate in compilation warnings. Replacement
+  stays in place, without destructive fallback for dependent types. PL/SQL literals and
+  comments are preserved during schema rewriting and slash-delimited statement splitting.
+
 - **Copy objects from one connection to another.** The Migration tab now opens on a choice —
   **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
   and target and recreates the source schema's objects of one type in the target. One type per
-  run, and there are seven of them: **sequences**, **tables**, **indexes**, **views**,
-  **materialized views**, **synonyms** and **triggers**, offered in that order because it is the
-  order they have to be copied in. Reading both
+  run, and there are eleven of them: **sequences**, **types**, **tables**, **indexes**, **views**,
+  **materialized views**, **synonyms**, **packages**, **procedures**, **functions** and
+  **triggers**, offered in a suggested dependency order. Reading both
   dictionaries first shows how many there are and which of them the target already has.
   Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
   source has on the left, everything this run will copy on the right, arrows between them, and a

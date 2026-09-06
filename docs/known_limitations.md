@@ -234,21 +234,22 @@ reported as informational with no DDL generated.
 The Migration tab's **Copy objects** is a working copy of a development schema, not a
 replacement for Data Pump.
 
-- **One object type per run, and there are seven of them: sequences, tables, indexes, views,
-  materialized views, synonyms and triggers.** They are listed in the order they have to be
-  copied in — a column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence
-  is not there, an index cannot be created before its table, a view over a table that has not
-  arrived is created invalid, and a materialized view over one fails outright, which is why the
-  kind that cannot recover is offered after the kind that can. Synonyms sit between the
-  materialized views and the triggers on a weaker argument than the rest: nothing makes a synonym
-  fail, whatever it points at, but a trigger's body can call a synonym and no synonym can name a
-  trigger, so the one dependency there is runs that way round. Triggers come last of all, because
-  one stands on both the object it fires for and everything its body calls. Nothing enforces that
-  order: each run is confirmed and reported on its own, and running them out of order simply
-  reports the outcome. Code objects — packages, procedures, functions, types — are not copied at
-  all yet. Nothing outside the schema — grants, roles, quotas, profiles, database
-  links, directories — is copied, and nothing that lives in a DBA view the connection cannot
-  read.
+- **One object type per run: sequences, types, tables, indexes, views, materialized views,
+  synonyms, packages, procedures, functions and triggers.** Packages and types include their
+  specification and optional body as one picker item. Procedures and functions are standalone;
+  packaged routines belong to their package. Generated and secondary code objects are excluded.
+  The suggested order is not dependency sorting. Copy dependencies and recompile invalid
+  objects afterwards; compilation warnings do not necessarily mean a dependency is missing.
+  Grants, roles, quotas, profiles, database links and directories are not copied.
+- **PL/SQL replacement is in place and DDL is not transactional.** Existing grants survive,
+  but dependents can become invalid and active package state can be discarded. A body failure
+  can leave the new specification applied. A source without a body does not remove an existing
+  target body. Type replacement may be refused when it has dependents; there is no DROP or
+  FORCE fallback. Skip leaves the whole existing logical object alone.
+- **Schema rewriting handles identifiers, not dynamic SQL.** Literals (including alternative
+  quoting) and comments are preserved. Schema names in dynamic SQL strings or wrapped code
+  cannot be retargeted automatically; review those before copying. Source OIDs are omitted so Oracle assigns target identities.
+  Same-database type copying, dependent-type replacement, wrapped code and body compilation need live Oracle validation.
 - **A sequence arrives at the number the source has reached, not the number it started from.**
   That is what stops a copy handing out values the source has already used, and it is what
   makes replacing an existing sequence the dangerous choice: a target sequence that has gone
@@ -342,7 +343,7 @@ replacement for Data Pump.
   against a live database, and where it does not, such a synonym is reported as the plain
   "created" it also is. That is the first thing to look at when a database is available.
 - **A synonym over a database link lands, and the link does not.** Database links are not one of
-  the seven types and are not copied — nor are the credentials stored in one. A synonym naming
+  the eleven types and are not copied — nor are the credentials stored in one. A synonym naming
   `TABLE@LINK` is offered and created anyway, on the grounds that a target which already has the
   link needs the synonym and dropping the object silently would be worse; on a target without
   the link it is one more synonym that does not resolve.
@@ -356,7 +357,7 @@ replacement for Data Pump.
   take effect.** Its own `CREATE OR REPLACE` lands on the old one, so nothing is dropped and the
   grants on the name survive — but from that moment every query in the target that goes through
   the name reads whatever the source's synonym pointed at, which may be a different table or
-  another schema entirely. It is the quietest replacement of the seven types: no error, no
+  another schema entirely. It is the quietest replacement of the eleven types: no error, no
   invalid object, and a different table behind the same name.
 - **A trigger fires for a table or a view, and that object has to be in the target first.**
   Oracle refuses `CREATE TRIGGER` on an object it cannot find (ORA-00942), so the run looks for

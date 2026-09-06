@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "triggers";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -39,6 +39,8 @@ export interface CopyKindSpec {
    * down here once instead of being discovered per kind. Absent means the two agree.
    */
   metadataType?: string;
+  /** Body included in metadata and compilation checks. */
+  bodyType?: string;
   /**
    * Objects of this kind can own foreign keys, so the run adds them in a second pass once
    * every object it is copying exists. Only tables can, but the flag is what keeps the pass
@@ -111,24 +113,9 @@ export interface CopyKindSpec {
  * schema is then several runs in the order the kinds are listed here, each one confirmed and
  * reported on its own.
  *
- * **The order is the order they have to be copied in**, which is why it is worth stating: a
- * column default calling `ORDER_SEQ.NEXTVAL` fails with ORA-02289 if the sequence is not there
- * yet, an index cannot be created before its table, and a view over a table that has not
- * arrived is created invalid. Materialized views come after the views: a view that is missing
- * something is created anyway and compiles itself later, while a materialized view that is
- * missing something fails outright, so the kind that cannot recover goes after the kind that
- * can. Synonyms come after all of those and before the triggers, and theirs is the one
- * placement here that is not about a `CREATE` failing: Oracle creates a synonym whatever it
- * points at, so nothing forces one later. What settles it is that the dependency runs only
- * one way — a trigger's body can call a synonym, and no synonym can name a trigger at all —
- * so the synonyms go first and the triggers land on names that already resolve. Triggers come
- * last of everything, because a trigger stands on more than any other kind does — the table or
- * view it fires for has to exist or the `CREATE` is refused, and its body can call any
- * sequence, table, view, synonym or package in the schema. Copied last, it lands on a schema
- * that is already whole.
- *
- * Sequences, then tables, then indexes, then views, then materialized views, then synonyms,
- * then triggers. Someone working down the list in order gets a schema that comes out whole.
+ * Types precede tables that may use them; routines precede triggers that may call them.
+ * This is a suggested order, not a dependency sort: cross-kind and cyclic references may
+ * require additional runs and recompilation after dependencies arrive.
  */
 export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
   {
@@ -143,6 +130,14 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The sequence and the number it has reached in the source, so the copy carries on from there rather than starting again at 1. Not the tables, defaults or triggers that use it.",
     replaceNote:
       "Each existing sequence is dropped and recreated at the source's number. A target sequence that has gone further will hand out numbers it has already given away, which is a duplicate key waiting to happen.",
+  },
+  {
+    kind: "types", label: "Types", objectType: "TYPE",
+    bodyType: "TYPE BODY",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The specification and body, when present. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected. Oracle may refuse replacement of a type with dependents. No DROP or FORCE fallback is attempted.",
   },
   {
     kind: "tables",
@@ -209,6 +204,28 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The name and what it points at — repointed at the target where the source's synonym named one of its own objects, and left alone where it named a third schema, which is the difference that decides whether the copy reads the target or the source from then on. Not the object itself: a synonym is only a name, so one for a table, package or database link the target has not got is created all the same and answers ORA-00980 the first time anything uses it. Public synonyms belong to the database rather than to this schema and are not offered.",
     replaceNote:
       "Each existing synonym is replaced in place rather than dropped, so the grants on it survive. What the name means changes at that moment though, and nothing in the target has to be recompiled for it to: every query that goes through the name reads whatever the source's synonym pointed at, which may be another table or another schema entirely.",
+  },
+  {
+    kind: "packages", label: "Packages", objectType: "PACKAGE",
+    bodyType: "PACKAGE BODY",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The specification and body, when present. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
+  },
+  {
+    kind: "procedures", label: "Procedures", objectType: "PROCEDURE",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The standalone PL/SQL definition; packaged routines arrive with their package. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
+  },
+  {
+    kind: "functions", label: "Functions", objectType: "FUNCTION",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The standalone PL/SQL definition; packaged routines arrive with their package. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
   },
   {
     kind: "triggers",
@@ -309,6 +326,10 @@ export function normalizeNames(value: unknown, available: string[]): string[] | 
 export function copyTransforms(preserveTablespace: boolean): [string, boolean][] {
   return [
     ["EMIT_SCHEMA", false],
+    // Explicit on pooled sessions: include both code parts and let Oracle assign new OIDs.
+    ["SPECIFICATION", true],
+    ["BODY", true],
+    ["OID", false],
     ["SEGMENT_ATTRIBUTES", preserveTablespace],
     ["STORAGE", false],
     ["TABLESPACE", preserveTablespace],
@@ -325,13 +346,27 @@ export function copyTransforms(preserveTablespace: boolean): [string, boolean][]
  * `GET_DDL` returns some objects as more than one statement, separated by the SQL*Plus slash
  * on a line of its own — one CLOB holding statements the driver can only run one at a time.
  * Splitting on that line is the whole job: a slash anywhere else (a division, a path inside a
- * string) is not alone on its line and is left where it is.
+ * string) is left where it is. Slash-only lines inside literals and comments are also kept.
  */
 export function splitDdl(ddl: string): string[] {
-  return ddl
-    .split(/^[ \t]*\/[ \t]*\r?$/m)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const parts: string[] = [];
+  let start = 0;
+  for (let i = 0; i < ddl.length;) {
+    const end = copyTextEnd(ddl, i);
+    if (end !== null) { i = end; continue; }
+    if (ddl[i] === '/' && /^[ \t]*$/.test(ddl.slice(ddl.lastIndexOf('\n', i - 1) + 1, i))) {
+      const tail = ddl.slice(i).match(/^\/[ \t]*(?:\r?\n|$)/);
+      if (tail) {
+        parts.push(ddl.slice(start, i).trim());
+        i += tail[0].length;
+        start = i;
+        continue;
+      }
+    }
+    i++;
+  }
+  parts.push(ddl.slice(start).trim());
+  return parts.filter(Boolean);
 }
 
 /**
@@ -386,28 +421,13 @@ export function retargetSchema(ddl: string, from: string, to: string): string {
   let out = "";
   let i = 0;
   while (i < ddl.length) {
+    const protectedEnd = copyTextEnd(ddl, i);
+    if (protectedEnd !== null && ddl[i] !== '"') {
+      out += ddl.slice(i, protectedEnd);
+      i = protectedEnd;
+      continue;
+    }
     const ch = ddl[i];
-    // string literal — copied through untouched, doubled quotes included
-    if (ch === "'") {
-      const end = skipQuoted(ddl, i + 1, "'");
-      out += ddl.slice(i, end);
-      i = end;
-      continue;
-    }
-    if (ch === "-" && ddl[i + 1] === "-") {
-      const nl = ddl.indexOf("\n", i);
-      const end = nl === -1 ? ddl.length : nl;
-      out += ddl.slice(i, end);
-      i = end;
-      continue;
-    }
-    if (ch === "/" && ddl[i + 1] === "*") {
-      const close = ddl.indexOf("*/", i + 2);
-      const end = close === -1 ? ddl.length : close + 2;
-      out += ddl.slice(i, end);
-      i = end;
-      continue;
-    }
     // "HR". — a quoted identifier is a schema only when a dot and a name follow it
     if (ch === '"') {
       const end = skipQuoted(ddl, i + 1, '"');
@@ -563,4 +583,32 @@ export function dropStatement(kind: CopyKind, name: string): string | null {
 /** "12 Tables" — how a count of one kind is named in a confirmation dialog. */
 export function copyCountLabel(kind: CopyKind, count: number): string {
   return `${count.toLocaleString("en-US")} ${copyKindSpec(kind).label}`;
+}
+
+/** Include bodies when checking a logical object for compilation failures. */
+export function copyStatusTypes(kind: CopyKind): string[] {
+  const spec = copyKindSpec(kind);
+  return [spec.objectType, ...(spec.bodyType ? [spec.bodyType] : [])];
+}
+
+/** Skip literals, quoted identifiers and comments without interpreting their contents. */
+function copyTextEnd(s: string, i: number): number | null {
+  if ((s[i] === 'q' || s[i] === 'Q') && s[i + 1] === "'" && !isIdentChar(s[i - 1] ?? '')) {
+    const delimiter = s[i + 2];
+    if (delimiter) {
+      const close = ({ '[': ']', '{': '}', '(': ')', '<': '>' } as Record<string, string>)[delimiter] ?? delimiter;
+      const end = s.indexOf(close + "'", i + 3);
+      return end < 0 ? s.length : end + 2;
+    }
+  }
+  if (s[i] === "'" || s[i] === '"') return skipQuoted(s, i + 1, s[i]);
+  if (s.startsWith('--', i)) {
+    const end = s.indexOf('\n', i + 2);
+    return end < 0 ? s.length : end;
+  }
+  if (s.startsWith('/*', i)) {
+    const end = s.indexOf('*/', i + 2);
+    return end < 0 ? s.length : end + 2;
+  }
+  return null;
 }
