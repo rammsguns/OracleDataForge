@@ -25,6 +25,7 @@ import {
   copyIdent,
   copyKindSpec,
   copyMetadataType,
+  copyStatusTypes,
   copyStatements,
   copyTransforms,
   DEFAULT_COPY_KIND,
@@ -40,7 +41,7 @@ import {
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "tables", "indexes", "views", "mviews", "synonyms", "triggers"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "types", "tables", "indexes", "views", "mviews", "synonyms", "packages", "procedures", "functions", "triggers"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -145,7 +146,7 @@ describe("OBJECT_COPY_KINDS", () => {
     // and so is a synonym: GET_DDL emits CREATE OR REPLACE for one, and dropping it first
     // would throw away the grants on the name for no gain
     assert.equal(copyKindSpec("synonyms").replaceInPlace, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers" && k !== "synonyms")) {
+    for (const kind of ALL_COPY_KINDS.filter((k) => !["views", "triggers", "synonyms", "packages", "procedures", "functions", "types"].includes(k))) {
       assert.equal(copyKindSpec(kind).replaceInPlace, false, kind);
     }
   });
@@ -162,7 +163,7 @@ describe("OBJECT_COPY_KINDS", () => {
     // the target afterwards is the one that catches a synonym for a package or a database
     // link, neither of which this copies and both of which therefore land dangling.
     assert.equal(copyKindSpec("synonyms").compiled, true);
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "views" && k !== "triggers" && k !== "synonyms")) {
+    for (const kind of ALL_COPY_KINDS.filter((k) => !["views", "triggers", "synonyms", "packages", "procedures", "functions", "types"].includes(k))) {
       assert.equal(copyKindSpec(kind).compiled, false, kind);
     }
   });
@@ -235,8 +236,8 @@ describe("normalizeKind", () => {
     // the value reaches a listing query that has no entry for it, so it must not survive
     assert.equal(normalizeKind("grants"), DEFAULT_COPY_KIND);
     // a kind this app does not copy is not a kind, however plausible it sounds
-    assert.equal(normalizeKind("procedures"), DEFAULT_COPY_KIND);
-    assert.equal(normalizeKind("packages"), DEFAULT_COPY_KIND);
+    assert.equal(normalizeKind("database_links"), DEFAULT_COPY_KIND);
+    assert.equal(normalizeKind("package_bodies"), DEFAULT_COPY_KIND);
   });
 
   it("falls back for anything that is not a string at all", () => {
@@ -285,6 +286,14 @@ describe("copyTransforms", () => {
   it("never emits the source schema, whatever else it is asked for", () => {
     // the one that decides whether the copy creates its objects in the target or in the source
     for (const preserve of [true, false]) assert.equal(paramsOf(preserve).EMIT_SCHEMA, false);
+  });
+
+  it("includes code specifications and bodies without reusing source object IDs", () => {
+    for (const preserve of [true, false]) {
+      assert.equal(paramsOf(preserve).SPECIFICATION, true);
+      assert.equal(paramsOf(preserve).BODY, true);
+      assert.equal(paramsOf(preserve).OID, false);
+    }
   });
 
   it("keeps a table's own constraints and leaves its foreign keys out", () => {
@@ -734,5 +743,49 @@ describe("copyBaseLabel", () => {
     assert.equal(copyBaseLabel("sequences"), "");
     // and for the one that is built on anything at all but has nothing pre-checked for it
     assert.equal(copyBaseLabel("synonyms"), "");
+  });
+});
+
+
+describe("PL/SQL object copy", () => {
+  it("offers standalone code with safe replacement and compilation reporting", () => {
+    for (const kind of ["packages", "procedures", "functions", "types"] as const) {
+      assert.equal(normalizeKind(kind.toUpperCase()), kind);
+      assert.equal(copyKindSpec(kind).replaceInPlace, true);
+      assert.equal(copyKindSpec(kind).compiled, true);
+      assert.equal(copyKindSpec(kind).hasTablespace, false);
+      assert.deepEqual(copyBaseKinds(kind), []);
+      assert.equal(copyMetadataType(kind), copyKindSpec(kind).objectType);
+    }
+    assert.deepEqual(copyStatusTypes("packages"), ["PACKAGE", "PACKAGE BODY"]);
+    assert.deepEqual(copyStatusTypes("types"), ["TYPE", "TYPE BODY"]);
+    assert.deepEqual(copyStatusTypes("functions"), ["FUNCTION"]);
+  });
+
+  it("keeps specifications before bodies and preserves their semicolons", () => {
+    for (const type of ["PACKAGE", "TYPE"]) {
+      const spec = type === "PACKAGE" ? 'PROCEDURE run; END demo;' : 'AS OBJECT (id NUMBER, MEMBER PROCEDURE run);';
+      const ddl = 'CREATE OR REPLACE ' + type + ' HR.demo ' + spec + '\n/\n' +
+        'CREATE OR REPLACE ' + type + ' BODY HR.demo AS PROCEDURE run IS BEGIN HR.work; END; END demo;\n/\n';
+      const statements = copyStatements(retargetSchema(ddl, 'HR', 'DEST'));
+      assert.equal(statements.length, 2);
+      assert.ok(statements[0].startsWith('CREATE OR REPLACE ' + type + ' DEST.demo'));
+      assert.ok(statements[1].includes('BEGIN DEST.work;'));
+      for (const sql of statements) assert.ok(sql.endsWith(';'));
+    }
+  });
+
+  it("does not split or rewrite slash lines inside PL/SQL literals and comments", () => {
+    const ddl = "CREATE OR REPLACE PROCEDURE HR.p AS BEGIN x := q'[it's HR.data\n/\n]'; y := 'HR.data\n/\n'; /* HR.data\n/\n*/ HR.work; END;\n/\n";
+    const statements = copyStatements(retargetSchema(ddl, 'HR', 'DEST'));
+    assert.equal(statements.length, 1);
+    assert.ok(statements[0].includes("q'[it's HR.data\n/\n]'"));
+    assert.ok(statements[0].includes("'HR.data\n/\n'"));
+    assert.ok(statements[0].includes('/* HR.data\n/\n*/ DEST.work;'));
+  });
+
+  it("supports a specification without a body and standalone functions", () => {
+    assert.deepEqual(copyStatements('CREATE OR REPLACE PACKAGE p AS n NUMBER; END;\n/'), ['CREATE OR REPLACE PACKAGE p AS n NUMBER; END;']);
+    assert.deepEqual(copyStatements('CREATE OR REPLACE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;\n/'), ['CREATE OR REPLACE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;']);
   });
 });
