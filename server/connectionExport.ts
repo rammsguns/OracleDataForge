@@ -35,7 +35,14 @@ export const IMPORT_MAX_ENTRIES = 500;
  * parameters still opens, narrow enough that no file can dictate a multi-gigabyte allocation
  * in this process. Checked before a key is derived, never after.
  */
-export const IMPORT_KDF_LIMITS = { minN: 1 << 12, maxN: 1 << 20, maxR: 16, maxP: 4 } as const;
+export const IMPORT_KDF_LIMITS = {
+  minN: 1 << 12, maxN: 1 << 20, maxR: 16, maxP: 4,
+  maxMemoryBytes: 64 * 1024 * 1024, // main working buffer: 128 * N * r
+  maxWork: 524288, // N * r * p: at most twice the current export's work
+} as const;
+// Fixed native allocation ceiling, including 1 MiB for scrypt's auxiliary buffers.
+// Never increase this ceiling based on values supplied by an uploaded file.
+const IMPORT_MAXMEM = IMPORT_KDF_LIMITS.maxMemoryBytes + 1024 * 1024;
 
 export interface ConnectionExportFile {
   format: typeof EXPORT_FORMAT;
@@ -127,6 +134,9 @@ export async function decryptExport(raw: unknown, passphrase: string): Promise<u
     Number.isInteger(p) && p >= 1 && p <= IMPORT_KDF_LIMITS.maxP &&
     keylen === 32;
   if (!sane) throw new Error("The export file asks for key-derivation parameters outside the supported range.");
+  if (128 * N * r > IMPORT_KDF_LIMITS.maxMemoryBytes || N * r * p > IMPORT_KDF_LIMITS.maxWork) {
+    throw new Error("The export file asks for key-derivation parameters outside the supported range (memory or computation limit).");
+  }
 
   const salt = boundedB64(kdf.salt, 64);
   const iv = boundedB64(file.iv, 16);
@@ -134,7 +144,7 @@ export async function decryptExport(raw: unknown, passphrase: string): Promise<u
   const data = boundedB64(file.data, 8 * 1024 * 1024);
   if (!salt || !iv || !tag || !data) throw new Error("The export file is missing or has a malformed salt, IV, tag or payload.");
 
-  const key = await scryptWithParams(passphrase, salt, keylen, { N, r, p, maxmem: maxmemFor(N, r) });
+  const key = await scryptWithParams(passphrase, salt, keylen, { N, r, p, maxmem: IMPORT_MAXMEM });
   let plain: string;
   try {
     const decipher = createDecipheriv("aes-256-gcm", key, iv);

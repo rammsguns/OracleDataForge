@@ -1,5 +1,7 @@
 import express from "express";
 import compression from "compression";
+import { AuthConcurrency } from "./authConcurrency.ts";
+import { loadUserStore, type Role, type StoredUser } from "./userStore.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { isIPv4, isIPv6 } from "node:net";
@@ -349,26 +351,14 @@ function pruneWallets() {
  * (via POST /api/users, open to everyone until one exists) switches the whole server over
  * to requiring HTTP Basic auth with a real username/password on every request.
  */
-type Role = "Administrator" | "Developer" | "Analyst" | "Viewer";
 const ROLES: Role[] = ["Administrator", "Developer", "Analyst", "Viewer"];
 const FULL_ACCESS_ROLES: Role[] = ["Administrator", "Developer"];
 
-interface StoredUser {
-  id: string;
-  name: string;
-  email: string; // lowercase; doubles as the HTTP Basic auth username
-  role: Role;
-  status: "Active" | "Suspended";
-  mfa: boolean; // stored, not enforced — see docs/security.md
-  salt: string; // base64
-  hash: string; // base64 scrypt hash
-  createdAt: string;
-}
 type PublicUser = Omit<StoredUser, "salt" | "hash">;
 const toPublicUser = ({ salt: _salt, hash: _hash, ...rest }: StoredUser): PublicUser => rest;
 
 const USERS_FILE = path.join(DATA_DIR, "users.json");
-const users = new Map<string, StoredUser>(); // keyed by lowercase email
+const users = loadUserStore(USERS_FILE); // keyed by lowercase email; load errors abort startup
 
 /** scrypt needs no extra dependency and (unlike a plain hash) is deliberately slow to brute-force. */
 function hashPassword(password: string, salt: Buffer = randomBytes(16)) {
@@ -445,6 +435,7 @@ const AUTH_FAILURE_WINDOW_MS = 60_000;
 const AUTH_COOLDOWN_MS = 60_000;
 const AUTH_FAILURE_MAX_TRACKED = 1000;
 const authFailures = new Map<string, { count: number; since: number; until: number }>();
+const authConcurrency = new AuthConcurrency();
 function authCooldownRemaining(ip: string): number {
   return Math.max(0, (authFailures.get(ip)?.until ?? 0) - Date.now());
 }
@@ -478,14 +469,6 @@ function recordAuthFailure(ip: string, username: string) {
   }
 }
 
-function loadUsers() {
-  try {
-    const arr = JSON.parse(fs.readFileSync(USERS_FILE, "utf8")) as StoredUser[];
-    for (const u of arr) users.set(u.email.toLowerCase(), u);
-  } catch {
-    /* no accounts yet — the server stays wide open, as documented above */
-  }
-}
 function saveUsers() {
   authCache.clear(); // a changed, suspended or deleted account must not ride a cached verification
   try {
@@ -495,7 +478,6 @@ function saveUsers() {
     console.error("Could not persist users:", e);
   }
 }
-loadUsers();
 
 /**
  * True once changing (or removing, via `statusOverride: "Suspended"`) `targetId` would
@@ -4561,19 +4543,16 @@ app.use((req, res, next) => {
   }
 
   const user = users.get(username.toLowerCase());
-  if (!user || user.status !== "Active") {
-    // Same derivation cost as a real wrong-password check below, against a fixed dummy pair
-    // rather than a real one — see the comment on DUMMY_CREDENTIAL. Its own result is never
-    // checked; the only thing that matters here is the wall-clock time it consumes.
-    verifyPassword(password, DUMMY_CREDENTIAL.salt, DUMMY_CREDENTIAL.hash).then(() => {
-      recordAuthFailure(req.ip ?? "", username);
-      challenge();
-    }, next);
-    return;
+  const active = user?.status === "Active";
+  const { salt, hash } = active ? user : DUMMY_CREDENTIAL;
+  const verification = authConcurrency.run(req.ip ?? "", () => verifyPassword(password, salt, hash));
+  if (!verification) {
+    res.setHeader("Retry-After", "1");
+    return res.status(429).json({ error: "Too many sign-in checks in progress. Try again shortly." });
   }
-  const { salt, hash } = user;
-  verifyPassword(password, salt, hash).then((ok) => {
-    if (!ok) {
+  verification.then((ok) => {
+    // Unknown and suspended accounts use the same bounded derivation as active accounts.
+    if (!active || !ok) {
       recordAuthFailure(req.ip ?? "", username);
       return challenge();
     }

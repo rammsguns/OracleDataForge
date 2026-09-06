@@ -235,8 +235,11 @@ Entries pointing somewhere new are always added. Nothing is ever deleted by an i
 An uploaded envelope is attacker-shaped data even when it arrives from a colleague, so the
 backend checks it before it acts on it: the format, version and cipher must be the ones this
 build knows; the scrypt parameters are read from the file (an export made with different ones
-still has to open) but **range-checked** first, since a file claiming `N` of 2^30 would
-otherwise size an allocation on this server; salt, IV, tag and payload are bounded; a file is
+can open within supported costs) but **range-checked** first. Combined costs are capped at
+64 MiB for the main working buffer (`128 * N * r`) and 524,288 work units (`N * r * p`,
+twice the current export cost), before key derivation starts. The native allocation ceiling
+is fixed at 65 MiB, including auxiliary buffers; uploaded parameters cannot raise it.
+Salt, IV, tag and payload are bounded; a file is
 capped at 500 connections; and every decrypted entry goes through the same field-by-field
 `pickConfig`/`validate` path as a connection typed into the wizard, so an entry with a bogus
 port or a missing service name is rejected rather than saved.
