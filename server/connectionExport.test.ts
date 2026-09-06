@@ -177,6 +177,21 @@ describe("decryptExport: the KDF parameters are checked before any key is derive
     await rejects(fileWith(file, { kdf: { ...file.kdf, N: IMPORT_KDF_LIMITS.maxN * 2 } }), PASS, out);
   });
 
+  it("rejects combined memory and work costs before inspecting the encrypted payload", async () => {
+    for (const params of [
+      { N: 1 << 20, r: 16, p: 4 }, // formerly accepted: 2 GiB working buffer
+      { N: 1 << 17, r: 8, p: 1 }, // individually valid, exceeds memory ceiling
+      { N: 1 << 15, r: 8, p: 4 }, // memory fits, computation exceeds ceiling
+    ]) {
+      const file = {
+        format: EXPORT_FORMAT, version: 1, cipher: "aes-256-gcm",
+        kdf: { name: "scrypt", keylen: 32, ...params },
+        get data() { throw new Error("Payload must not be inspected for excessive costs"); },
+      };
+      await rejects(file, PASS, /memory or computation limit/);
+    }
+  });
+
   it("refuses a cost factor below the floor, or one that is not a power of two", async () => {
     const file = await encryptExport(CONNECTIONS, PASS);
     await rejects(fileWith(file, { kdf: { ...file.kdf, N: 2 } }), PASS, out);
@@ -195,24 +210,30 @@ describe("decryptExport: the KDF parameters are checked before any key is derive
   it("still opens a file written with different but supported parameters", async () => {
     // an export re-tuned later, or by another install, has to keep opening — this is why the
     // parameters are read from the file at all rather than hard-coded on the way in
-    const kdf = { name: "scrypt" as const, N: 1 << 14, r: 4, p: 1, keylen: 32 };
-    const salt = randomBytes(16);
-    const iv = randomBytes(12);
-    const key = scryptSync(PASS, salt, kdf.keylen, { N: kdf.N, r: kdf.r, p: kdf.p, maxmem: 128 * kdf.N * kdf.r * 2 });
-    const cipher = createCipheriv("aes-256-gcm", key, iv);
-    const data = Buffer.concat([cipher.update(JSON.stringify(CONNECTIONS), "utf8"), cipher.final()]);
-    const file = {
-      format: EXPORT_FORMAT,
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      count: CONNECTIONS.length,
-      cipher: "aes-256-gcm",
-      kdf: { ...kdf, salt: salt.toString("base64") },
-      iv: iv.toString("base64"),
-      tag: cipher.getAuthTag().toString("base64"),
-      data: data.toString("base64"),
-    };
-    assert.deepEqual(await decryptExport(file, PASS), CONNECTIONS);
+    for (const params of [
+      { N: 1 << 14, r: 4, p: 1 },
+      { N: 1 << 16, r: 8, p: 1 }, // exactly the memory and computation ceilings
+      { N: 1 << 15, r: 8, p: 2 }, // computation ceiling with a smaller working buffer
+    ]) {
+      const kdf = { name: "scrypt" as const, ...params, keylen: 32 };
+      const salt = randomBytes(16);
+      const iv = randomBytes(12);
+      const key = scryptSync(PASS, salt, kdf.keylen, { N: kdf.N, r: kdf.r, p: kdf.p, maxmem: 128 * kdf.N * kdf.r * 2 });
+      const cipher = createCipheriv("aes-256-gcm", key, iv);
+      const data = Buffer.concat([cipher.update(JSON.stringify(CONNECTIONS), "utf8"), cipher.final()]);
+      const file = {
+        format: EXPORT_FORMAT,
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        count: CONNECTIONS.length,
+        cipher: "aes-256-gcm",
+        kdf: { ...kdf, salt: salt.toString("base64") },
+        iv: iv.toString("base64"),
+        tag: cipher.getAuthTag().toString("base64"),
+        data: data.toString("base64"),
+      };
+      assert.deepEqual(await decryptExport(file, PASS), CONNECTIONS);
+    }
   });
 });
 

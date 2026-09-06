@@ -95,6 +95,12 @@ several of those at once. Counting them would let an ordinary first visit trip i
 cooldown before anyone could type anything, so a credential-less request always gets a clean
 401 challenge, even mid-cooldown. It costs nothing to serve: no derivation runs on that path.
 
+Password checks also have a concurrency ceiling: four per source address and eight across the
+server. Capacity is reserved before starting a derivation; excess requests receive `429` with
+`Retry-After: 1` without queuing work. Capacity is released when the derivation settles, including
+errors, rather than when a client disconnects. Unknown and suspended accounts share these limits.
+This bounds bursts that arrive before failed checks finish and trigger the cooldown.
+
 The cooldown is checked *after* the cache, so a browser whose credential is already warm keeps
 working while a guesser from the same address is being throttled.
 
@@ -199,6 +205,10 @@ the server must be able to decrypt to actually connect). `GET/POST/PUT/DELETE /a
 Administrator-only, and a change that would leave **zero active Administrators** — suspending,
 demoting, or removing the last one — is rejected outright, so an operator can't accidentally
 lock themselves out short of deleting `data/users.json` on disk.
+
+Account loading fails closed: only a missing `users.json` enables first-run setup. An unreadable,
+corrupt, empty, or invalid account store aborts startup instead of disabling authentication.
+All records are validated before use, including duplicate IDs and case-insensitive emails.
 
 Creating the very first account is deliberately unauthenticated — until one exists, every
 caller is already treated as Administrator, so `POST /api/users` from that state is how a fresh
