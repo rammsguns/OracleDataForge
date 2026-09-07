@@ -1,4 +1,5 @@
 /** Thin client for the local Oracle DataForge backend. */
+import type { StorageChange } from "./dbaSql";
 
 /**
  * How a connection reaches Oracle: `basic` is host/port/service over TCP, `wallet` is an
@@ -152,6 +153,10 @@ export interface SchemaGroupResult {
   rowCounts?: Record<string, number>;
 }
 
+export interface DbaManagementReport {
+  capturedAt: string;
+  sections: Record<string, { rows: Record<string, string | number | null>[]; error?: string; truncated?: boolean }>;
+}
 export interface DbaMetric { name: string; value: number; unit: string; }
 export interface DbaWaitEvent { event: string; waits: number; timeS: number; avgMs: number; waitClass: string; }
 export interface DbaTopSql { sqlId: string; elapsedS: number; executions: number; perExecMs: number; sqlText: string; }
@@ -875,6 +880,9 @@ export const api = {
   /** re-read a single group of the tree (Procedures, Packages, …) instead of the whole catalog */
   schemaGroup: (id: string, label: string) =>
     request<SchemaGroupResult>(`/api/connections/${id}/schema/group?label=${encodeURIComponent(label)}`),
+  dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`),
+  dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),
+  dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`),
   dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`),
   perf: (id: string) => request<PerfReport>(`/api/connections/${id}/perf`),
   deps: (id: string, name: string) => request<DepsReport>(`/api/connections/${id}/deps?name=${encodeURIComponent(name)}`),

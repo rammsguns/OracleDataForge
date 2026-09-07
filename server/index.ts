@@ -1,4 +1,7 @@
 import express from "express";
+import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
+import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
+import { selectManagementQueries } from "./dbaManagement.ts";
 import compression from "compression";
 import { AuthConcurrency } from "./authConcurrency.ts";
 import { loadUserStore, type Role, type StoredUser } from "./userStore.ts";
@@ -5523,6 +5526,75 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
   }
 });
 
+const DBA_AUDIT_FILE = path.join(DATA_DIR, "dba-audit.jsonl");
+app.get("/api/connections/:id/dba-audit", requireFullAccess, (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  try { res.json({ entries: readDbaAudit(DBA_AUDIT_FILE, connKey(c)) }); }
+  catch { res.status(500).json({ error: "Cannot read the server audit log." }); }
+});
+app.post("/api/connections/:id/dba-storage", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.readOnly) return res.status(403).json({ error: "This connection is read-only." });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "Oracle is required." });
+  let sql: string;
+  const change = req.body as StorageChange;
+  try { sql = storageChangeSql(change); }
+  catch (e) { return res.status(400).json({ error: errMsg(e) }); }
+  const operationLabel: Record<string, string> = { create: "Create tablespace", add: "Add file", resize: "Resize file", autoextend: "Change automatic growth", readOnly: "Make tablespace read-only", readWrite: "Allow tablespace writes", drop: "Delete tablespace" };
+  const warning: Record<string, string> = { create: "Creates a tablespace and allocates storage.", add: "Allocates another file on the database server.", resize: "Changes the file’s total size. A smaller value shrinks it; Oracle may reject shrinking if data occupies the end of the file.", autoextend: "Changes automatic storage consumption. Disabling growth or choosing a low limit can cause future allocations to fail.", readOnly: "Blocks writes to this tablespace and may wait for active transactions.", readWrite: "Enables writes to this tablespace." };
+  if (!acknowledged(req)) return res.status(409).json({ error: "Confirmation required", code: "CONFIRM_REQUIRED", confirmation: describeOperation({
+    level: "destructive", verb: change.action, target: change.name || change.path,
+    title: `${operationLabel[change.action]} on ${c.name}?`,
+    body: `${sql}\n\n${change.action === "drop" ? `All objects in this tablespace will be permanently deleted, including their dependent segments in other tablespaces. ${change.deleteFiles ? "Physical files will also be deleted." : "Physical files will be kept."}` : warning[change.action]} Oracle DDL commits implicitly and cannot be rolled back. The attempt and outcome are recorded in the server audit log.`,
+    confirmLabel: change.action === "drop" ? "Delete tablespace" : "Apply change",
+  }) });
+  if (change.action === "drop" && req.body.typedName !== change.name) return res.status(400).json({ error: "Type the exact tablespace name to confirm deletion." });
+  const event = { id: randomBytes(16).toString("hex"), connection: connKey(c), connectionName: c.name, actor: res.locals.userEmail ?? res.locals.userName ?? res.locals.role, databaseUser: c.user, action: change.action, target: change.name || change.path, sql };
+  try { appendDbaAudit(DBA_AUDIT_FILE, { ...event, outcome: "attempt" }); }
+  catch { return res.status(503).json({ error: "Audit log is unavailable. No change was executed." }); }
+  let failure: unknown;
+  let succeeded = false;
+  let conn: oracledb.Connection | undefined;
+  try {
+    conn = await getOraConn(c);
+    await conn.execute(oraPrepare(sql), [], { autoCommit: true });
+    succeeded = true;
+  } catch (e) { failure = e; }
+  finally { if (conn) await conn.close().catch(() => {}); }
+  try { appendDbaAudit(DBA_AUDIT_FILE, { ...event, outcome: succeeded ? "success" : "failed", ...(failure ? { error: errMsg(failure) } : {}) }); }
+  catch { return res.status(500).json({ error: `Database outcome: ${succeeded ? "change succeeded" : "failed or uncertain"}. Audit completion could not be saved. Do not retry without checking the database. Audit ID: ${event.id}` }); }
+  if (!succeeded) return res.status(500).json({ error: `${errMsg(failure)} (Audit ID: ${event.id})` });
+  res.json({ ok: true, auditId: event.id });
+});
+
+app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "DBA Manager requires Oracle." });
+  let queries;
+  try { queries = selectManagementQueries(req.query.sections); }
+  catch (error) { return res.status(400).json({ error: errMsg(error) }); }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      const sections: Record<string, { rows: Row[]; error?: string; truncated?: boolean }> = {};
+      // One session, sequential reads; missing grants affect only that section.
+      for (const [name, sql] of queries) {
+        try {
+          const result = await conn.execute(sql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 501 });
+          const rows = result.rows as Record<string, unknown>[] ?? [];
+          sections[name] = { truncated: rows.length > 500, rows: rows.slice(0, 500).map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, mapVal(value)]))) };
+        } catch (error) {
+          sections[name] = { rows: [], error: errMsg(error) };
+        }
+      }
+      res.json({ sections, capturedAt: new Date().toISOString() });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
 app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
@@ -7205,8 +7277,16 @@ app.post("/api/connections/:id/query", async (req, res) => {
       confirmation,
     });
   }
+  const queryAudit = cls.level === "read" ? null : { id: randomBytes(16).toString("hex"), connection: connKey(c), connectionName: c.name, actor: res.locals.userEmail ?? res.locals.userName ?? res.locals.role, databaseUser: c.user, action: cls.verb, target: cls.target, source: "worksheet", sqlHash: createHash("sha256").update(sql).digest("hex") };
+  if (queryAudit) {
+    try { appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "attempt" }); }
+    catch { return res.json({ columns: [], rows: [], durationMs: 0, rowsReturned: 0, error: { message: "Audit log unavailable. No statement was executed.", line: 1, code: "AUDIT-UNAVAILABLE" } }); }
+  }
+  let querySucceeded = false;
   try {
     const out = await oraQuery(c, sql);
+    querySucceeded = true;
+    if (queryAudit) appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "success" });
     // auto-version code objects on success — must never break the query path
     let versioned: VersionedInfo | null = null;
     try {
@@ -7218,6 +7298,11 @@ app.post("/api/connections/:id/query", async (req, res) => {
   } catch (e) {
     const err = e as { code?: string; errorNum?: number };
     const code = err.errorNum ? `ORA-${String(err.errorNum).padStart(5, "0")}` : err.code ?? "SQL-ERROR";
+    if (queryAudit && !querySucceeded) {
+      try { appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "failed-or-unknown", errorCode: code }); }
+      catch { console.error(`Audit completion unavailable: ${queryAudit.id}`); }
+    }
+    if (querySucceeded) return res.json({ columns: [], rows: [], durationMs: Date.now() - started, rowsReturned: 0, error: { message: `Statement succeeded, but audit completion could not be saved. Do not rerun. Audit ID: ${queryAudit?.id}`, line: 1, code: "AUDIT-INCOMPLETE" } });
     const { message, helpUrl } = splitHelpUrl(withNetworkHint(errMsg(e), c.host));
     res.json({
       columns: [], rows: [],

@@ -29,6 +29,7 @@ import QueryHistory from "./QueryHistory";
 import PerformanceMonitor from "./PerformanceMonitor";
 import MigrationAssistant from "./MigrationAssistant";
 import DbaAdvisor from "./DbaAdvisor";
+import DbaManager from "./DbaManager";
 import DependencyExplorer from "./DependencyExplorer";
 import VersionHistory from "./VersionHistory";
 import RoutineRunner from "./RoutineRunner";
@@ -49,6 +50,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   perf: <Activity size={12} />,
   migration: <GitCompareArrows size={12} />,
   dba: <Gauge size={12} />,
+  dbamanager: <Hammer size={12} />,
   deps: <Waypoints size={12} />,
   versions: <History size={12} />,
   compile: <Hammer size={12} />,
@@ -62,6 +64,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "history", title: "Query History", label: "History" },
   { kind: "perf", title: "Performance", label: "Performance" },
   { kind: "dba", title: "DBA Advisor", label: "DBA Advisor" },
+  { kind: "dbamanager", title: "DBA Manager", label: "DBA Manager" },
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
@@ -149,6 +152,7 @@ export default function Workspace() {
         {active.kind === "perf" && <PerformanceMonitor />}
         {active.kind === "migration" && <MigrationAssistant />}
         {active.kind === "dba" && <DbaAdvisor />}
+        {active.kind === "dbamanager" && <DbaManager />}
         {active.kind === "deps" && <DependencyExplorer key={active.id} initialObject={active.payload} />}
         {active.kind === "versions" && <VersionHistory key={active.id} />}
         {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}

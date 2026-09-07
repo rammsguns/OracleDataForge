@@ -16,7 +16,7 @@ executes arbitrary SQL. It assumes:
 - The Oracle account it connects with already has whatever privileges it has — the app never
   elevates.
 
-It is **not** a multi-tenant service and has no audit trail. The removed control plane from the
+It is **not** a multi-tenant service. DBA storage actions and worksheet writes have a local audit log (see [DBA Manager](dba-manager.md)); other management endpoints are not covered by this log. The removed control plane from the
 original suite is not coming back by accident. An optional, lightweight identity/role layer
 exists (see [Workspace roles](#workspace-roles) below) for the case of a few trusted people
 sharing one instance — it is not a tenant system, and every account still shares the same
