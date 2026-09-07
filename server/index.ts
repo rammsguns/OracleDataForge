@@ -6307,6 +6307,7 @@ interface RoutineParam {
 }
 
 interface RoutineMember {
+  returnFields?: { name: string; dataType: string; bindKind: RoutineBindKind | null }[];
   name: string;
   kind: "PROCEDURE" | "FUNCTION";
   overload: string | null;
@@ -6413,6 +6414,13 @@ async function oraRoutineMeta(c: LiveConnection, rawName: string): Promise<Routi
         m.returnType = display;
         m.returnBindKind = dt ? ROUTINE_BIND_KINDS[dt] ?? null : null;
         m.returnDeclType = declType;
+        if (dt === 'PL/SQL RECORD' && r.TYPE_SUBNAME && r.TYPE_NAME) {
+          const attrs = await oraRows(conn, `SELECT attr_name, attr_type_name, attr_type_package FROM all_plsql_type_attrs
+            WHERE owner = :owner AND package_name = :pkg AND type_name = :typ ORDER BY attr_no`,
+          { owner: str(r.TYPE_OWNER) ?? c.user, pkg: String(r.TYPE_NAME), typ: String(r.TYPE_SUBNAME) });
+          m.returnFields = attrs.map(a => ({ name: String(a.ATTR_NAME), dataType: String(a.ATTR_TYPE_NAME),
+            bindKind: a.ATTR_TYPE_PACKAGE ? null : ROUTINE_BIND_KINDS[String(a.ATTR_TYPE_NAME)] ?? null }));
+        }
         continue;
       }
       if (r.ARGUMENT_NAME == null && dt == null) continue; // old-style "no arguments" placeholder row
@@ -6772,6 +6780,9 @@ async function oraRoutineRunBlock(
     } else if (member?.kind === "FUNCTION" && member.returnBindKind && (n === "RESULT" || n === "RETURN_VALUE")) {
       kind = member.returnBindKind;
       dataType = member.returnType ?? "";
+    } else if (/^DF_RECORD_\d+$/.test(n)) {
+      const field = member?.returnFields?.[Number(n.slice('DF_RECORD_'.length)) - 1];
+      if (field?.bindKind) { kind = field.bindKind; dataType = field.dataType; }
     }
     binds[n] = { dir: oracledb.BIND_OUT, type: oraBindType(kind), ...(kind === "string" ? { maxSize: 32767 } : {}) };
     outs.push({ name: n, dataType, kind });

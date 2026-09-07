@@ -240,6 +240,7 @@ export interface RoutineParam {
 }
 
 export interface RoutineMember {
+  returnFields?: { name: string; dataType: string; bindKind: RoutineBindKind | null }[];
   name: string;
   kind: "PROCEDURE" | "FUNCTION";
   overload: string | null;
