@@ -241,8 +241,7 @@ export function StatusBar() {
           Last run: {s.result.rowsReturned} rows / {s.result.durationMs} ms
         </span>
       )}
-      {/* the backend runs every statement with autoCommit: true — don't claim otherwise */}
-      <span className="ml-auto hidden sm:inline">UTF-8 · Autocommit on</span>
+      <span className="ml-auto hidden sm:inline">UTF-8 · Worksheet auto-commit {s.autoCommit ? 'on' : 'off'}</span>
       <span className="tabular-nums">Ln {s.sql.split("\n").length}</span>
     </footer>
   );

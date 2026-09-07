@@ -651,6 +651,7 @@ export interface RowEditColumn {
 }
 
 export interface TableRowsResult {
+  manualTransaction?: boolean;
   table: string;
   columns: RowEditColumn[];
   rows: (string | number | null)[][];
@@ -801,12 +802,12 @@ export class ConfirmRequiredError extends Error {
   }
 }
 
-async function request<T>(url: string, body?: unknown, method?: string): Promise<T> {
-  const res = await fetch(url, body === undefined && !method
+async function request<T>(url: string, body?: unknown, method?: string, headers?: Record<string, string>): Promise<T> {
+  const res = await fetch(url, body === undefined && !method && !headers
     ? undefined
     : {
-        method: method ?? "POST",
-        headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...headers },
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
   const data = await res.json().catch(() => ({}));
@@ -931,7 +932,8 @@ export const api = {
    * Mutating calls carry `confirm` — false (the default) makes the backend describe the
    * change instead of running it. Only pass true right after a user confirmed *this* action.
    */
-  query: (id: string, sql: string, confirm = false) => request<LiveQueryResult>(`/api/connections/${id}/query`, { sql, confirm }),
+  startWorksheetSession: (id: string) => request<{ transactionId: string }>(`/api/connections/${id}/worksheet-session`, {}),
+  query: (id: string, sql: string, confirm = false, transactionId?: string, closeTransaction = false) => request<LiveQueryResult>(`/api/connections/${id}/query`, { sql, confirm, transactionId, closeTransaction }),
   explain: (id: string, sql: string) => request<ExplainResult>(`/api/connections/${id}/explain`, { sql }),
   importData: (id: string, req: ImportRequest, confirm = false) =>
     request<ImportResult>(`/api/connections/${id}/import`, { ...req, confirm }),
@@ -939,10 +941,14 @@ export const api = {
   applyTableDdl: (id: string, statements: string[], confirm = false) =>
     request<ApplyTableResult>(`/api/connections/${id}/table/apply`, { statements, confirm }),
   /** Rows of a table plus their ROWIDs — the Data Browser edit-mode read (any browsing role). */
-  tableRows: (id: string, name: string) => request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`),
+  tableRows: async (id: string, name: string, transactionId?: string) => {
+    const result = await request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`, undefined, undefined, transactionId ? { 'X-Dataforge-Transaction': transactionId } : undefined);
+    if (transactionId && result.manualTransaction !== true) throw new Error('The API needs a restart to support table transactions. Commit or roll back existing worksheet work before restarting it. No row changes were sent.');
+    return result;
+  },
   /** Insert / update / delete one row. Unacknowledged calls come back as ConfirmRequiredError. */
-  changeTableRow: (id: string, req: RowChangeRequest, confirm = false) =>
-    request<RowChangeResult>(`/api/connections/${id}/table/rows`, { ...req, confirm }),
+  changeTableRow: (id: string, req: RowChangeRequest, confirm = false, transactionId?: string) =>
+    request<RowChangeResult>(`/api/connections/${id}/table/rows`, { ...req, confirm, transactionId }),
   tableStats: (id: string, name: string) => request<TableStats>(`/api/connections/${id}/table/stats?name=${encodeURIComponent(name)}`),
   tableStatsAction: (id: string, name: string, action: StatsAction, confirm = false) =>
     request<{ ok: boolean; action: StatsAction }>(`/api/connections/${id}/table/stats`, { name, action, confirm }),
