@@ -41,13 +41,16 @@ export default function SqlWorksheet() {
     window.addEventListener("pointerup", up);
   }, []);
 
-  const errorLine = s.result?.error?.line ?? null;
+  const statementOffset = s.result?.statement ? s.sql.indexOf(s.result.statement) : -1;
+  const errorLine = s.result?.error && statementOffset >= 0
+    ? s.result.error.line + s.sql.slice(0, statementOffset).split("\n").length - 1
+    : null;
 
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
-        <Btn variant="primary" onClick={() => s.runSql()} title="Run statement (Ctrl+Enter)" disabled={s.running}>
+        <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running}>
           <Play size={12} fill="currentColor" />
           Run
         </Btn>
@@ -84,7 +87,7 @@ export default function SqlWorksheet() {
       {/* editor */}
       <div className="flex flex-col flex-1 min-h-0">
         <div style={{ height: `${editorPct}%` }} className="min-h-24">
-          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onRun={() => s.runSql()} />
+          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={() => s.runSql()} />
         </div>
 
         {/* splitter */}
@@ -164,7 +167,7 @@ export default function SqlWorksheet() {
                 <div className="border border-err/40 bg-err/8 rounded-lg p-3.5 max-w-2xl">
                   <div className="flex items-center gap-2 text-err font-semibold text-[13px]">
                     <CircleAlert size={15} />
-                    {s.result.error.code} — statement failed at line {s.result.error.line}
+                    {s.result.error.code} — statement failed at line {errorLine ?? s.result.error.line}
                   </div>
                   <div className="mt-1.5 text-[12.5px] text-ink font-mono">{s.result.error.message}</div>
                   {s.result.error.helpUrl && (

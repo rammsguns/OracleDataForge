@@ -1,3 +1,4 @@
+import { useCodeCompletion } from "./useCodeCompletion";
 import {
   forwardRef,
   useEffect,
@@ -54,6 +55,7 @@ const CodeEditor = forwardRef<
   }
 >(function CodeEditor({ value, onChange, readOnly, errorLine, onCompile, ariaLabel }, ref) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const completion = useCodeCompletion(taRef, value, onChange, readOnly);
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const findRef = useRef<HTMLInputElement>(null);
@@ -286,6 +288,7 @@ const CodeEditor = forwardRef<
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (completion.onKeyDown(e)) return;
     if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "h")) {
       e.preventDefault();
       setFr((f) => ({ ...f, withReplace: e.key === "h" && !readOnly }));
@@ -474,15 +477,17 @@ const CodeEditor = forwardRef<
           ref={taRef}
           value={value}
           readOnly={readOnly}
-          onChange={(e) => onChange(e.target.value)}
+          {...completion.inputProps}
           onKeyDown={onKeyDown}
           onSelect={syncActiveFromCaret}
-          onScroll={syncScroll}
+          onScroll={() => { syncScroll(); completion.close(); }}
           spellCheck={false}
           aria-label={ariaLabel ?? "Code editor"}
+          title="Code suggestions: Ctrl+Space"
           className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-auto"
           style={sharedStyle}
         />
+        {completion.popup}
         </div>
       </div>
     </div>

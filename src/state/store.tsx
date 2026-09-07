@@ -1,3 +1,4 @@
+import { worksheetStatement } from "../utils/worksheetStatement";
 import {
   createContext,
   useCallback,
@@ -81,6 +82,7 @@ interface Store {
 
   sql: string;
   setSql: (s: string) => void;
+  setSqlSelection: (start: number, end: number) => void;
   running: boolean;
   result: ResultSet | null;
   runSql: (override?: string) => void;
@@ -263,6 +265,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [selectedObject, setSelectedObject] = useState<string | null>(null);
   const [editDataRequest, setEditDataRequest] = useState<string | null>(null);
 
+  const sqlSelection = useRef({ start: 0, end: 0, source: sql });
+  const setSqlSelection = useCallback((start: number, end: number) => { sqlSelection.current = { start, end, source: sqlRef.current }; }, []);
   const sqlRef = useRef(sql);
   sqlRef.current = sql;
   const tabsRef = useRef(tabs);
@@ -532,7 +536,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const runSql = useCallback(
     (override?: string) => {
-      const statement = override ?? sqlRef.current;
+      let statement = override;
+      if (statement === undefined) {
+        const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
+        try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
+        catch (error) { toast("warning", (error as Error).message); return; }
+      }
+      if (!statement.trim()) { toast("info", "Place the cursor inside a statement to run it."); return; }
       if (accessRole === "Analyst") {
         toast("warning", "Analyst access is limited to table data");
         return;
@@ -570,7 +580,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const runExplain = useCallback(() => {
     const conn = activeConnRef.current;
-    const statement = sqlRef.current.trim();
+    let statement: string;
+    const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
+    try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
+    catch (error) { toast("warning", (error as Error).message); return; }
+    if (!statement) return;
     if (!conn?.live) {
       setPlan({
         engine: "oracle", plan: null, totalCost: 0,
@@ -754,6 +768,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setSql,
       running,
       result,
+      setSqlSelection,
       runSql,
       doFormat,
       planVisible,
