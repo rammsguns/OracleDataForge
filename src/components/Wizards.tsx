@@ -805,7 +805,7 @@ export function ConfirmDialog() {
   const c = s.confirm;
   return (
     <Modal title={c.title} onClose={s.closeConfirm} width={460}>
-      <p className="text-[12.5px] text-soft leading-relaxed">{c.body}</p>
+      <p className="text-[12.5px] text-soft leading-relaxed whitespace-pre-wrap break-words">{c.body}</p>
       <div className="flex justify-end gap-2 mt-5">
         <Btn variant="ghost" onClick={s.closeConfirm}>Cancel</Btn>
         <Btn

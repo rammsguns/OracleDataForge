@@ -94,6 +94,7 @@ export type TabKind =
   | "perf"
   | "migration"
   | "dba"
+  | "dbamanager"
   | "deps"
   | "versions"
   | "compile"

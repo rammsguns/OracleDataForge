@@ -18,6 +18,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 - Oracle Table Designer, indexes, constraints, statistics, storage, advisor, maintenance, and schema comparison
 - Dependency explorer and ER diagram from Oracle metadata
 - DBA advisor and performance monitor
+- DBA Manager: SQL Developer-style connection tree with 11 modules and 24 pages for configuration, status, Data Pump, performance, RMAN history, Resource Manager, translation profiles, Scheduler, security, storage, and tuning; SQL previews for storage and memory changes
 - Automatic local version history for code objects
 - CSV/JSON import and Oracle-to-Oracle migration assistant
 - Object copy from one connection to another — sequences, tables, indexes, views, materialized views, synonyms, packages, procedures, functions, types or triggers, picked object by object, tablespace optional
