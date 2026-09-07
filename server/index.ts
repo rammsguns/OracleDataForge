@@ -1,4 +1,5 @@
 import express from "express";
+import { WorksheetSessions } from "./worksheetSessions.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
 import { selectManagementQueries } from "./dbaManagement.ts";
@@ -502,7 +503,7 @@ function wouldOrphanAdministrators(targetId: string, roleOverride?: Role, status
  * uses it to tell "disconnected" from "already disconnected".
  */
 async function closePools(c: LiveConnection): Promise<boolean> {
-  let wasOpen = false;
+  let wasOpen = await worksheetSessions.closeDatabase(c.id);
   if (c.oraPool) {
     wasOpen = true;
     try {
@@ -2920,13 +2921,16 @@ function oraPrepare(sql: string): string {
   return sql.replace(/;\s*$/, "");
 }
 
-async function oraQuery(c: LiveConnection, sql: string): Promise<QueryOutcome> {
-  const conn = await getOraConn(c);
+const worksheetSessions = new WorksheetSessions<oracledb.Connection>();
+setInterval(() => { void worksheetSessions.expire(); }, 60_000).unref();
+
+async function oraQuery(c: LiveConnection, sql: string, session?: oracledb.Connection): Promise<QueryOutcome> {
+  const conn = session ?? await getOraConn(c);
   try {
     const result = await conn.execute(oraPrepare(sql), [], {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
       maxRows: MAX_ROWS + 1,
-      autoCommit: true,
+      autoCommit: !session,
     });
     if (result.rows) {
       return {
@@ -2943,7 +2947,7 @@ async function oraQuery(c: LiveConnection, sql: string): Promise<QueryOutcome> {
       rowsReturned: affected,
     };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
@@ -3425,9 +3429,9 @@ async function oraRowColumns(conn: oracledb.Connection, table: string): Promise<
 }
 
 /** Read a page of rows together with the ROWID that identifies each one. */
-async function oraTableRows(c: LiveConnection, name: string, limit: number): Promise<TableRowsResult> {
+async function oraTableRows(c: LiveConnection, name: string, limit: number, session?: oracledb.Connection): Promise<TableRowsResult> {
   const lim = Math.min(MAX_ROWS, Math.max(1, limit));
-  const conn = await getOraConn(c);
+  const conn = session ?? await getOraConn(c);
   try {
     const table = await oraResolveTable(conn, name);
     if (!table) {
@@ -3460,13 +3464,13 @@ async function oraTableRows(c: LiveConnection, name: string, limit: number): Pro
       ...(editable ? {} : { reason: `No column of ${table} holds a type the data grid can write back.` }),
     };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
 /** Apply one row change. Identifiers come from the dictionary, values are always binds. */
-async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<RowChangeResult | { error: string }> {
-  const conn = await getOraConn(c);
+async function oraRowChange(c: LiveConnection, body: RowChangeBody, session?: oracledb.Connection): Promise<RowChangeResult | { error: string }> {
+  const conn = session ?? await getOraConn(c);
   try {
     const table = await oraResolveTable(conn, body.table);
     if (!table) return { error: `${body.table} is not a table in this schema — rows can only be edited on tables.` };
@@ -3478,7 +3482,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     if (body.action === "delete") {
       if (!body.rowId) return { error: "The row to delete could not be identified. Refresh the grid and try again." };
       const sql = `DELETE FROM ${quoteIdent(table)} WHERE ROWID = :rid${match.sql}`;
-      const r = await conn.execute(sql, { ...match.binds, rid: body.rowId }, { autoCommit: true });
+      const r = await conn.execute(sql, { ...match.binds, rid: body.rowId }, { autoCommit: !session });
       if (!r.rowsAffected) return { error: gone };
       return { ok: true, action: "delete", table, sql, rowId: null, row: null };
     }
@@ -3515,7 +3519,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
       const r = await conn.execute(
         sql,
         { ...binds, ...match.binds, rid: body.rowId, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
-        { autoCommit: true }
+        { autoCommit: !session }
       );
       if (!r.rowsAffected) return { error: gone };
       rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
@@ -3525,7 +3529,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
       const r = await conn.execute(
         sql,
         { ...binds, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
-        { autoCommit: true }
+        { autoCommit: !session }
       );
       rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
     }
@@ -3540,7 +3544,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     const row = back.rows?.[0] ? back.rows[0].map(mapVal) : null;
     return { ok: true, action: body.action, table, sql, rowId, row };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
@@ -5004,7 +5008,7 @@ app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
   if (refused) return res.status(400).json({ error: refused });
   const bad = validate(cfg);
   if (bad) return res.status(400).json({ error: bad });
-  await closePools(c);
+  try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
   registry.set(c.id, { ...cfg, id: c.id });
   saveRegistry();
   pruneWallets(); // the wallet this connection used to point at may now be unreferenced
@@ -5014,7 +5018,7 @@ app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
 app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (c) {
-    await closePools(c);
+    try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
     registry.delete(c.id);
     saveRegistry();
     pruneWallets();
@@ -5276,7 +5280,7 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
     }
     if (existing) {
       // the pooled sessions belong to the credentials being overwritten
-      await closePools(existing);
+      try { await closePools(existing); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
       registry.set(existing.id, { ...cfg, id: existing.id });
       replaced.push(cfg.name);
     } else {
@@ -5305,15 +5309,17 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
 app.post("/api/connections/:id/disconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  const wasOpen = await closePools(c);
-  res.json({ ok: true, wasOpen });
+  try {
+    const wasOpen = await closePools(c);
+    res.json({ ok: true, wasOpen });
+  } catch (e) { res.status(409).json({ error: errMsg(e) }); }
 });
 
 /** Reconnect: close whatever is open, then prove a fresh session can be established. */
 app.post("/api/connections/:id/reconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  await closePools(c);
+  try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
   const started = Date.now();
   try {
     const version = await oraTest(c);
@@ -6981,7 +6987,11 @@ app.get("/api/connections/:id/table/rows", async (req, res) => {
   if (!name) return res.status(400).json({ error: "Missing table name (?name=...)" });
   const limit = Number(req.query.limit) || MAX_ROWS;
   try {
-    res.json(await oraTableRows(c, name, limit));
+    const token = req.headers['x-dataforge-transaction'];
+    const out = token
+      ? await worksheetSessions.use(String(token), worksheetOwner(req), c.id, conn => oraTableRows(c, name, limit, conn))
+      : await oraTableRows(c, name, limit);
+    res.json({ ...out, manualTransaction: !!token });
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
   }
@@ -7015,7 +7025,9 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
       verb: action.toUpperCase(),
       target: table,
       title: action === "delete" ? `Delete this row from ${table}?` : action === "insert" ? `Insert a row into ${table}?` : `Save this row in ${table}?`,
-      body:
+      body: req.body?.transactionId
+        ? `Apply this ${action} to ${table} on "${c.name}"? It remains pending until you commit or roll back the shared worksheet/table transaction.`
+        :
         action === "delete"
           ? `The row is removed from ${table} on "${c.name}" and committed straight away — there is no undo.`
           : action === "insert"
@@ -7026,13 +7038,17 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
     }));
   }
   try {
-    const out = await oraRowChange(c, {
+    const body: RowChangeBody = {
       table,
       action,
       rowId: req.body?.rowId == null ? undefined : String(req.body.rowId),
       values: values as Record<string, string | number | null> | undefined,
       original: (original ?? undefined) as Record<string, string | number | null> | undefined,
-    });
+    };
+    const token = req.body?.transactionId;
+    const out = token
+      ? await worksheetSessions.use(String(token), worksheetOwner(req), c.id, conn => oraRowChange(c, body, conn))
+      : await oraRowChange(c, body);
     if ("error" in out) return res.status(400).json({ error: out.error });
     res.json(out);
   } catch (e) {
@@ -7238,6 +7254,23 @@ app.get("/api/connections/:id/job-runs/:logId/output", requireFullAccess, async 
   }
 });
 
+function worksheetOwner(req: express.Request): string {
+  return createHash('sha256').update(req.headers.authorization ?? '').digest('hex');
+}
+
+app.post("/api/connections/:id/worksheet-session", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Unknown connection' });
+  if (c.readOnly) return res.status(403).json({ error: 'This connection is read-only.' });
+  try {
+    const transactionId = await worksheetSessions.create(worksheetOwner(req), c.id, () => oracledb.getConnection({
+      user: c.user, password: c.password, connectString: oraConnectString(c),
+      ...oraWalletOptions(c), privilege: oraPrivilege(c), connectTimeout: 8,
+    }));
+    res.json({ transactionId });
+  } catch (e) { res.status(400).json({ error: errMsg(e) }); }
+});
+
 app.post("/api/connections/:id/query", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
@@ -7284,7 +7317,12 @@ app.post("/api/connections/:id/query", async (req, res) => {
   }
   let querySucceeded = false;
   try {
-    const out = await oraQuery(c, sql);
+    const transactionId = req.body?.transactionId;
+    const closeTransaction = req.body?.closeTransaction === true;
+    if (closeTransaction && !/^\s*(COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql)) throw new Error('Only COMMIT or ROLLBACK can close a worksheet session.');
+    const out = transactionId
+      ? await worksheetSessions.use(String(transactionId), worksheetOwner(req), c.id, conn => oraQuery(c, sql, conn), closeTransaction)
+      : await oraQuery(c, sql);
     querySucceeded = true;
     if (queryAudit) appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "success" });
     // auto-version code objects on success — must never break the query path

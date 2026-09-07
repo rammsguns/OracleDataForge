@@ -18,7 +18,7 @@ import type {
   TabKind,
   Toast,
 } from "../types";
-import { api, type ExplainResult, type SessionInfo } from "../utils/api";
+import { api, type ExplainResult, type SessionInfo, type RowChangeRequest, type RowChangeResult } from "../utils/api";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { destructiveCheck, formatSql, isReadOnlySql } from "../utils/sql";
@@ -84,6 +84,13 @@ interface Store {
   setSql: (s: string) => void;
   setSqlSelection: (start: number, end: number) => void;
   running: boolean;
+  autoCommit: boolean;
+  transactionBusy: boolean;
+  toggleAutoCommit: () => void;
+  finishTransaction: (action: 'COMMIT' | 'ROLLBACK', close?: boolean, id?: string) => Promise<void>;
+  getTransactionId: (id: string) => string | undefined;
+  isAutoCommit: (id: string) => boolean;
+  changeTableRow: (id: string, request: RowChangeRequest, confirmed?: boolean) => Promise<RowChangeResult>;
   result: ResultSet | null;
   runSql: (override?: string) => void;
   doFormat: () => void;
@@ -248,6 +255,26 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [activeTabId, setActiveTabId] = useState("t1");
   const [sql, setSql] = useState(INITIAL_SQL);
   const [running, setRunning] = useState(false);
+  const [transactions, setTransactions] = useState<Record<string, string>>(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('dataforge.worksheet.sessions') ?? '{}');
+      return saved && typeof saved === 'object' && !Array.isArray(saved)
+        ? Object.fromEntries(Object.entries(saved).filter(([, v]) => typeof v === 'string')) as Record<string, string> : {};
+    } catch { return {}; }
+  });
+  const transactionsRef = useRef(transactions);
+  transactionsRef.current = transactions;
+  const [transactionBusy, setTransactionBusy] = useState(false);
+  const worksheetBusy = useRef(false);
+  // A manual session is opened lazily on the first run. Absence of a session must
+  // never imply permission to auto-commit a new connection's worksheet.
+  const [autoCommitEnabled, setAutoCommitEnabled] = useState<Record<string, boolean>>({});
+  const autoCommitEnabledRef = useRef(autoCommitEnabled);
+  autoCommitEnabledRef.current = autoCommitEnabled;
+  const autoCommit = autoCommitEnabled[activeConnId] === true;
+  useEffect(() => {
+    try { sessionStorage.setItem('dataforge.worksheet.sessions', JSON.stringify(transactions)); } catch { /* unavailable */ }
+  }, [transactions]);
   const [result, setResult] = useState<ResultSet | null>(null);
   const [planVisible, setPlanVisible] = useState(false);
   const [plan, setPlan] = useState<ExplainResult | null>(null);
@@ -464,9 +491,76 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setHistory((h) => [entry, ...h].slice(0, HIST_MAX));
   }, []);
 
+  const getTransactionId = useCallback((id: string) => transactionsRef.current[id], []);
+  const isAutoCommit = useCallback((id: string) => autoCommitEnabledRef.current[id] === true, []);
+  const changeTableRow = useCallback(async (id: string, request: RowChangeRequest, confirmed = false) => {
+    if (worksheetBusy.current) throw new Error('Wait for the current transaction operation to finish.');
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      let token = transactionsRef.current[id];
+      if (!token && !autoCommitEnabledRef.current[id]) {
+        const session = await api.startWorksheetSession(id);
+        token = session.transactionId;
+        transactionsRef.current = { ...transactionsRef.current, [id]: token };
+        setTransactions(current => ({ ...current, [id]: session.transactionId }));
+        setConnStatus(id, 'connected');
+      }
+      // Refuse older API processes that ignore transaction tokens before sending a write.
+      if (token) await api.tableRows(id, request.table, token);
+      return await api.changeTableRow(id, request, confirmed, token);
+    } finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [setConnStatus]);
+
+  const finishTransaction = useCallback(async (action: 'COMMIT' | 'ROLLBACK', close = false, id = activeConnRef.current?.id) => {
+    if (!id || worksheetBusy.current) return;
+    const token = transactionsRef.current[id];
+    if (!token) { toast('info', 'No worksheet transaction has started yet.'); return; }
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      const res = await api.query(id, action, true, token, close);
+      if (res.error) {
+        if (close && res.error.code === 'TRANSACTION-EXPIRED') {
+          setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
+          setAutoCommitEnabled(current => ({ ...current, [id]: true }));
+        }
+        throw new Error(res.error.message);
+      }
+      if (close) {
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
+        setAutoCommitEnabled(current => ({ ...current, [id]: true }));
+      }
+      toast('success', `${action === 'COMMIT' ? 'Committed' : 'Rolled back'} worksheet transaction${close ? ' · Auto-commit on' : ''}`);
+      setSchemaBump(b => b + 1);
+    } catch (e) { toast('error', (e as Error).message); }
+    finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [toast]);
+
+  const toggleAutoCommit = useCallback(async () => {
+    const conn = activeConnRef.current;
+    if (!conn?.live || worksheetBusy.current) return;
+    if (transactionsRef.current[conn.id]) {
+      setConfirm({ title: 'Turn auto-commit on?', body: `This commits pending worksheet changes on "${conn.name}" and closes the manual session. To discard changes, cancel and use Rollback first.`, confirmLabel: 'Commit and turn on', onConfirm: () => { void finishTransaction('COMMIT', true, conn.id); } });
+      return;
+    }
+    if (!autoCommitEnabledRef.current[conn.id]) {
+      setAutoCommitEnabled(current => ({ ...current, [conn.id]: true }));
+      toast('info', 'Auto-commit on for this worksheet connection.');
+      return;
+    }
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      const res = await api.startWorksheetSession(conn.id);
+      setTransactions(current => ({ ...current, [conn.id]: res.transactionId }));
+      setAutoCommitEnabled(current => ({ ...current, [conn.id]: false }));
+      setConnStatus(conn.id, 'connected');
+      toast('info', 'Auto-commit off for this worksheet connection. Use Commit or Rollback.');
+    } catch (e) { toast('error', (e as Error).message); }
+    finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [toast, finishTransaction, setConnStatus]);
+
   const reallyRun = useCallback(
-    (statement: string, confirmed = false) => {
-      const conn = activeConnRef.current;
+    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? '']) => {
+      if (worksheetBusy.current) return;
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
         setResult({
@@ -480,10 +574,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("warning", "No connection selected");
         return;
       }
+      worksheetBusy.current = true;
       setRunning(true);
       setPlanVisible(false);
-      api
-        .query(conn.id, statement, confirmed)
+      (async () => {
+        if (!transactionId && !autoCommitEnabledRef.current[conn.id] && !conn.readOnly && ['Administrator', 'Developer'].includes(accessRole)) {
+          const session = await api.startWorksheetSession(conn.id);
+          transactionId = session.transactionId;
+          transactionsRef.current = { ...transactionsRef.current, [conn.id]: transactionId };
+          setTransactions(current => ({ ...current, [conn.id]: session.transactionId }));
+        }
+        return api.query(conn.id, statement, confirmed, transactionId);
+      })()
         .then((res) => {
           // the write guard held this statement back: nothing ran, so don't touch the
           // result grid or history — just ask, using the backend's own wording
@@ -494,7 +596,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
               body: g.body,
               confirmLabel: g.confirmLabel,
               danger: g.danger,
-              onConfirm: () => reallyRun(statement, true),
+              onConfirm: () => reallyRun(statement, true, conn, transactionId),
             });
             return;
           }
@@ -527,11 +629,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
             columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
             error: { message: err.message, line: 1, code: "BACKEND" },
           });
-          toast("error", "Backend unreachable — is the API server running?");
+          toast("error", err.message);
         })
-        .finally(() => setRunning(false));
+        .finally(() => { worksheetBusy.current = false; setRunning(false); });
     },
-    [toast, pushHistory, setConnStatus]
+    [accessRole, toast, pushHistory, setConnStatus]
   );
 
   const runSql = useCallback(
@@ -663,6 +765,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       if (!conn?.live) return;
       try {
         const r = await api.disconnect(id);
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         setConnStatus(id, "idle");
         setSchemaBump((b) => b + 1); // drop the cached catalog of the closed session
         toast("info", r.wasOpen ? `"${conn.name}" disconnected` : `"${conn.name}" had no open session`);
@@ -685,6 +788,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       open.map(async (c) => {
         try {
           await api.disconnect(c.id);
+          setTransactions(current => { const next = { ...current }; delete next[c.id]; return next; });
           setConnStatus(c.id, "idle");
           return null;
         } catch (e) {
@@ -705,6 +809,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       if (!conn?.live) return;
       try {
         const r = await api.reconnect(id);
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         if (!r.ok) {
           setConnStatus(id, "error");
           toast("error", `${conn.name}: ${r.error}`);
@@ -767,6 +872,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       sql,
       setSql,
       running,
+      autoCommit,
+      transactionBusy,
+      toggleAutoCommit,
+      finishTransaction,
+      getTransactionId,
+      isAutoCommit,
+      changeTableRow,
       result,
       setSqlSelection,
       runSql,
@@ -801,7 +913,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

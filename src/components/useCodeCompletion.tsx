@@ -13,11 +13,12 @@ export function useCodeCompletion(ref: RefObject<HTMLTextAreaElement>, value: st
     const result = getCompletions(source, ta.selectionStart, explicit);
     if (!result) return close();
     const lines = source.slice(0, ta.selectionStart).split('\n');
-    const y = lines.length * 20 + 10 - ta.scrollTop;
+    const metrics = getComputedStyle(ta);
+    const y = lines.length * parseFloat(metrics.lineHeight) + parseFloat(metrics.paddingTop) - ta.scrollTop;
     const height = Math.min(250, Math.max(60, ta.clientHeight - 16));
     setState({ ...result, source, caret: ta.selectionStart, selected: 0, height,
       top: Math.max(0, Math.min(y, ta.clientHeight - height)),
-      left: Math.max(0, Math.min((lines.at(-1)?.replace(/\t/g, '  ').length ?? 0) * 7.8 + 12 - ta.scrollLeft, ta.clientWidth - 340)) });
+      left: Math.max(0, Math.min((lines.at(-1)?.replace(/\t/g, '  ').length ?? 0) * parseFloat(metrics.fontSize) * 0.6 + parseFloat(metrics.paddingLeft) - ta.scrollLeft, ta.clientWidth - 340)) });
   };
   const apply = (item: Completion) => {
     const ta = ref.current;

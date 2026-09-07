@@ -50,7 +50,7 @@ export default function SqlWorksheet() {
     <div className="flex flex-col h-full min-h-0">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
-        <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running}>
+        <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
           <Play size={12} fill="currentColor" />
           Run
         </Btn>
@@ -82,6 +82,17 @@ export default function SqlWorksheet() {
           <span className="hidden md:inline -mx-1">+</span>
           <kbd className="hidden md:inline">Enter</kbd>
         </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-1 border-b border-bdrsoft text-[12px]">
+        <button type="button" role="switch" aria-checked={s.autoCommit} onClick={s.toggleAutoCommit}
+          disabled={s.running || s.transactionBusy || !s.activeConnId || !['Administrator', 'Developer'].includes(s.accessRole) || s.connections.find(c => c.id === s.activeConnId)?.readOnly}
+          className="rounded border border-bdr px-2 py-1 hover:bg-panel3 disabled:opacity-50">Auto-commit: {s.autoCommit ? 'On' : 'Off'}</button>
+        {!s.autoCommit && <>
+          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('COMMIT')}>Commit</Btn>
+          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('ROLLBACK')}>Rollback</Btn>
+        </>}
+        <span className="text-mute">Shared with table edits · DDL commits implicitly; explicit COMMIT still applies.</span>
+        {!s.autoCommit && <span className="text-warn">Manual sessions roll back on disconnect or after 30 minutes idle.</span>}
       </div>
 
       {/* editor */}

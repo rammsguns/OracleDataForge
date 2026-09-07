@@ -1,4 +1,5 @@
 import { useCodeCompletion } from "./useCodeCompletion";
+import { useEditorTools } from "./EditorTools";
 import { useEffect, useMemo, useRef, type CSSProperties } from "react";
 import { tokenize } from "../utils/sql";
 import { useHighlightWindow } from "../utils/highlightWindow";
@@ -14,7 +15,6 @@ const CLS: Record<string, string> = {
   ws: "",
 };
 
-const LINE_H = 20;
 
 export default function SqlEditor({
   value,
@@ -30,6 +30,8 @@ export default function SqlEditor({
   onSelectionChange?: (start: number, end: number) => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const editor = useEditorTools(value, taRef, errorLine);
+  const LINE_H = editor.lineHeight;
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const completion = useCodeCompletion(taRef, value, onChange);
@@ -72,7 +74,7 @@ export default function SqlEditor({
 
   const sharedStyle: CSSProperties = {
     fontFamily: "var(--font-mono)",
-    fontSize: 13,
+    fontSize: editor.fontSize,
     lineHeight: `${LINE_H}px`,
     tabSize: 2,
     padding: "10px 12px",
@@ -81,16 +83,18 @@ export default function SqlEditor({
   };
 
   return (
-    <div className="relative h-full flex bg-panel2 font-mono text-[13px] overflow-hidden">
+    <div className="relative h-full flex flex-col bg-panel2 font-mono text-[13px] overflow-hidden" style={editor.style}>
+      {editor.toolbar}
+      <div className="relative flex flex-1 min-h-0" style={{ background: 'var(--editor-bg, var(--panel2))' }}>
       {/* gutter */}
       <div
         ref={gutterRef}
         aria-hidden
         className="w-11 shrink-0 overflow-hidden text-right pr-2 select-none border-r border-bdrsoft bg-panel"
-        style={{ ...sharedStyle, padding: "10px 8px 10px 0" }}
+        style={{ ...sharedStyle, width: Math.max(44, String(lines.length).length * editor.fontSize * 0.65 + 16), padding: "10px 8px 10px 0" }}
       >
         {lines.map((_, i) => (
-          <div key={i} className={errorLine === i + 1 ? "text-err font-bold" : "text-mute"}>
+          <div key={i} className={editor.gutterClass(i + 1)}>
             {i + 1}
           </div>
         ))}
@@ -98,11 +102,11 @@ export default function SqlEditor({
 
       <div className="relative flex-1 min-w-0">
         {/* highlight layer */}
-        <pre ref={preRef} aria-hidden className="absolute inset-0 overflow-hidden m-0 pointer-events-none text-ink" style={sharedStyle}>
+        <pre ref={preRef} aria-hidden className="absolute inset-0 overflow-hidden m-0 pointer-events-none text-ink" style={{ ...sharedStyle, color: 'var(--editor-fg, var(--ink))' }}>
           {errorLine != null && (
             <div
               className="absolute left-0 right-0 bg-err/10 border-l-2 border-err"
-              style={{ top: (errorLine - 1) * 20 + 10, height: 20 }}
+              style={{ top: (errorLine - 1) * LINE_H + 10, height: LINE_H }}
             />
           )}
           <code>
@@ -142,6 +146,8 @@ export default function SqlEditor({
         />
         {completion.popup}
       </div>
+      </div>
+      {editor.problems}
     </div>
   );
 }
