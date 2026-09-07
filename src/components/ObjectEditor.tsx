@@ -281,7 +281,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
                 onClick={() => s.openTab("run", `${object} (Run)`, object)}
                 title={`Run ${object} with parameter values`}
               >
-                <Play size={15} className="text-ok" />
+                <Play size={15} className="text-ok" /> Test
               </Btn>
               {editable && <ToolbarSep />}
             </>

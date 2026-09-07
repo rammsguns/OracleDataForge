@@ -112,8 +112,17 @@ export function generateRoutineBlock(
   const back = used.filter((p) => p.direction !== "IN");
   if (back.length || isFn) {
     out.push("");
-    for (const p of back) out.push(`  :${p.name} := ${ident(p.name)};`);
-    if (isFn) out.push(`  :${resultBind} := ${resultVar};`);
+    for (const p of back) {
+      if (p.bindKind) out.push(`  :${p.name} := ${ident(p.name)};`);
+      else out.push(`  -- Inspect fields of ${ident(p.name)} with DBMS_OUTPUT.PUT_LINE; composite values cannot be bound directly.`);
+    }
+    if (isFn && member.returnBindKind) out.push(`  :${resultBind} := ${resultVar};`);
+    else if (isFn && member.returnFields?.length) {
+      member.returnFields.forEach((field, i) => {
+        if (field.bindKind && !taken.has(`DF_RECORD_${i + 1}`)) out.push(`  :DF_RECORD_${i + 1} := ${resultVar}.${ident(field.name)};  -- RETURN.${field.name.replace(/[\r\n]/g, ' ')}`);
+        else out.push(`  -- Inspect return field ${field.name.replace(/[\r\n]/g, ' ')} manually (unsupported type or bind name conflict).`);
+      });
+    } else if (isFn) out.push('  -- Inspect V_RESULT fields with DBMS_OUTPUT.PUT_LINE; this return type cannot be bound directly.');
   }
 
   out.push("");
