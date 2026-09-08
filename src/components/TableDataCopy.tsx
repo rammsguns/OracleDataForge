@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api, ConfirmRequiredError } from '../utils/api';
-import { tableDataSelection } from '../utils/tableDataDependencies';
+import { indexTableDependencies, tableDataSelection } from '../utils/tableDataDependencies';
 import { useStudio } from '../state/store';
 import { Btn, Spinner } from './ui';
 
@@ -38,10 +38,11 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     } finally { setBusy(false); }
   };
   const blocked = plan?.targetReadOnly || plan?.targetSystemSchema || plan?.sameSchema;
-  const eligibleNames = plan?.items.filter(table => table.existsInTarget).map(table => table.name) ?? [];
-  const selection = tableDataSelection(roots, eligibleNames, plan?.dependencies ?? []);
+  const eligibleNames = useMemo(() => plan?.items.filter(table => table.existsInTarget).map(table => table.name) ?? [], [plan?.items]);
+  const dependencyIndex = useMemo(() => indexTableDependencies(plan?.dependencies ?? []), [plan?.dependencies]);
+  const selection = useMemo(() => tableDataSelection(roots, eligibleNames, dependencyIndex), [roots, eligibleNames, dependencyIndex]);
   const names = selection.names;
-  const relevantDependencies = plan?.dependencies.filter(d => names.includes(d.table)) ?? [];
+  const relevantDependencies = useMemo(() => names.flatMap(name => dependencyIndex.get(name) ?? []), [names, dependencyIndex]);
   const selectableNames = eligibleNames.filter(name => plan?.sourceCounts[name] !== undefined && plan.sourceCounts[name] <= 100000);
   const invalidCounts = names.filter(name => plan?.sourceCounts[name] === undefined || plan.sourceCounts[name] > 100000);
   const sourceTotal = names.reduce((sum, name) => sum + (plan?.sourceCounts[name] ?? 0), 0);

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tableDataSelection, type TableDependency } from './tableDataDependencies';
+import { indexTableDependencies, tableDataSelection, type TableDependency } from './tableDataDependencies';
 
 const fk = (table: string, parent: string | null, local = true): TableDependency => ({ table, parent, local, parentSchema: local ? 'TARGET' : 'EXTERNAL', constraint: `FK_${table}_${parent}` });
 
@@ -17,6 +17,21 @@ test('shared parents appear once and selecting a parent does not select its chil
   assert.deepEqual(tableDataSelection(['A', 'B'], ['A', 'B', 'P'], deps).names, ['P', 'A', 'B']);
   assert.deepEqual(tableDataSelection(['P'], ['A', 'B', 'P'], deps).names, ['P']);
   assert.deepEqual(tableDataSelection([], ['A', 'B', 'P'], deps).names, []);
+});
+
+test('dependencies are indexed once instead of rescanned for every visited table', () => {
+  let tableReads = 0;
+  const countedFk = (table: string, parent: string | null) => {
+    const dependency = fk(table, parent);
+    Object.defineProperty(dependency, 'table', { enumerable: true, get: () => { tableReads++; return table; } });
+    return dependency;
+  };
+  const dependencies = [countedFk('A', 'B'), countedFk('B', 'C'), ...Array.from({ length: 100 }, (_, i) => countedFk(`X${i}`, null))];
+
+  const index = indexTableDependencies(dependencies);
+  assert.deepEqual(tableDataSelection(['A'], ['A', 'B', 'C'], index).names, ['C', 'B', 'A']);
+  assert.deepEqual(tableDataSelection(['B'], ['A', 'B', 'C'], index).names, ['C', 'B']);
+  assert.equal(tableReads, dependencies.length);
 });
 
 test('missing source parents and external or invisible parents generate actionable warnings', () => {

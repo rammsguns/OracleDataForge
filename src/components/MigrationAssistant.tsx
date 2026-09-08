@@ -5,7 +5,7 @@ import { api } from "../utils/api";
 import { compareTables, type TableComparison } from "../utils/tableCompare";
 import { tokenize } from "../utils/sql";
 import ObjectCopy from "./ObjectCopy";
-import TableDataCopy from './TableDataCopy';
+import TableDataCopy from "./TableDataCopy";
 import { Btn, Badge, Spinner } from "./ui";
 
 const CLS: Record<string, string> = {
