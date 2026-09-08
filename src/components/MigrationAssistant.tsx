@@ -5,6 +5,7 @@ import { api } from "../utils/api";
 import { compareTables, type TableComparison } from "../utils/tableCompare";
 import { tokenize } from "../utils/sql";
 import ObjectCopy from "./ObjectCopy";
+import TableDataCopy from './TableDataCopy';
 import { Btn, Badge, Spinner } from "./ui";
 
 const CLS: Record<string, string> = {
@@ -27,7 +28,7 @@ const CONCURRENCY = 4;
  * and its source and target pickers, because they are the same question at two different sizes
  * and whoever wants one regularly wants the other.
  */
-type Mode = "compare" | "copy";
+type Mode = "compare" | "copy" | "data";
 
 type TableStatus = "new" | "changed" | "same";
 interface TableResult {
@@ -180,6 +181,7 @@ export default function MigrationAssistant() {
         {([
           { id: "compare", label: "Compare tables", icon: <Diff size={12} /> },
           { id: "copy", label: "Copy objects", icon: <Copy size={12} /> },
+          { id: "data", label: "Copy table data", icon: <Copy size={12} /> },
         ] as const).map((m) => (
           <button
             key={m.id}
@@ -231,6 +233,7 @@ export default function MigrationAssistant() {
       )}
 
       {mode === "copy" && sourceId !== targetId && <ObjectCopy key={`${sourceId}>${targetId}`} sourceId={sourceId} targetId={targetId} />}
+      {mode === "data" && <TableDataCopy key={`${sourceId}>${targetId}`} sourceId={sourceId} targetId={targetId} />}
 
       {mode === "compare" && error && (
         <div className="border border-err/40 bg-err/8 rounded-lg p-3 text-[12.5px] text-ink mb-4">
