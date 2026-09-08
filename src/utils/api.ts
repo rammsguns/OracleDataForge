@@ -910,6 +910,12 @@ export const api = {
     request<ObjectCopyPlan>(
       `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
     ),
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, mode: 'append' | 'replace' = 'append') =>
+    request<{ tables: { name: string; rows: number }[]; totalRows: number; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, mode }),
+  checkTableData: (targetId: string, sourceId: string, names: string[]) =>
+    request<{ occupied: string[]; sourceCounts: Record<string, number>; sourceTotal: number }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, checkOnly: true }),
+  tableDataPlan: (targetId: string, sourceId: string) =>
+    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
   /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */
   objectCopy: (
     targetId: string,
