@@ -5,6 +5,7 @@ import { WorksheetSessions } from "./worksheetSessions.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
 import { selectManagementQueries } from "./dbaManagement.ts";
+import { globalSessionsSql, localSessionsSql, globalConnectInfoSql, localConnectInfoSql, killSessionSql, sessionIdentifier } from "./oracleSessions.ts";
 import compression from "compression";
 import { AuthConcurrency } from "./authConcurrency.ts";
 import { loadUserStore, type Role, type StoredUser } from "./userStore.ts";
@@ -48,6 +49,9 @@ import {
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
+// Thin mode sends this as V$SESSION.PROGRAM for every pool and standalone session.
+const appVersion = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+oracledb.program = `OracleDataForge/${appVersion}`;
 
 // node-oracledb exposes Lob at runtime, while the matching DefinitelyTyped
 // release models it only as an interface.
@@ -5654,6 +5658,88 @@ app.post("/api/connections/:id/dba-storage", requireFullAccess, async (req, res)
   catch { return res.status(500).json({ error: `Database outcome: ${succeeded ? "change succeeded" : "failed or uncertain"}. Audit completion could not be saved. Do not retry without checking the database. Audit ID: ${event.id}` }); }
   if (!succeeded) return res.status(500).json({ error: `${errMsg(failure)} (Audit ID: ${event.id})` });
   res.json({ ok: true, auditId: event.id });
+});
+
+/** Oracle can expose every RAC instance through GV$SESSION; a V$SESSION grant still
+ * gives a useful local-instance view when the global view is unavailable. */
+function sessionViewUnavailable(error: unknown): boolean {
+  return /ORA-(00942|01031)/.test(errMsg(error));
+}
+
+app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  try {
+    const conn = await getOraConn(c);
+    try {
+      let scope: "all-instances" | "local-instance" = "all-instances";
+      let result;
+      try { result = await conn.execute(globalSessionsSql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 }); }
+      catch (error) {
+        if (!sessionViewUnavailable(error)) throw error;
+        scope = "local-instance";
+        result = await conn.execute(localSessionsSql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 });
+      }
+      const sessions = (result.rows as Record<string, unknown>[] ?? []).map(row =>
+        Object.fromEntries(Object.entries(row).map(([key, value]) => [key, mapVal(value)]))
+      );
+      let clientDetailsAvailable = true;
+      try {
+        const info = await conn.execute(scope === "all-instances" ? globalConnectInfoSql : localConnectInfoSql,
+          [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 });
+        const bySession = new Map((info.rows as Record<string, unknown>[] ?? []).map(row => [
+          `${row.instance}:${row.sid}:${row.serial}`,
+          row,
+        ]));
+        for (const session of sessions) {
+          const infoRow = bySession.get(`${session.instance}:${session.sid}:${session.serial}`);
+          for (const field of ["clientDriver", "clientVersion", "clientConnection", "clientOciLibrary"] as const) {
+            session[field] = mapVal(infoRow?.[field]);
+          }
+        }
+      } catch {
+        // The connect-info view is optional. Keep the session list and its PROGRAM/MODULE
+        // values even when this database does not expose the driver metadata.
+        clientDetailsAvailable = false;
+      }
+      res.json({ sessions, scope, clientDetailsAvailable, capturedAt: new Date().toISOString() });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
+app.post("/api/connections/:id/sessions/kill", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.readOnly) return res.status(403).json({ error: "This connection is read-only. Edit it to allow killing sessions." });
+  let sid: number, serial: number, instance: number;
+  try {
+    sid = sessionIdentifier(req.body?.sid);
+    serial = sessionIdentifier(req.body?.serial);
+    instance = sessionIdentifier(req.body?.instance);
+  } catch (error) { return res.status(400).json({ error: errMsg(error) }); }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      let global = true;
+      let target;
+      try {
+        target = await conn.execute(
+          `SELECT username AS "username" FROM gv$session WHERE inst_id = :instance AND sid = :sid AND serial# = :serial AND type = 'USER'`,
+          { instance, sid, serial }, { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+      } catch (error) {
+        if (!sessionViewUnavailable(error)) throw error;
+        global = false;
+        target = await conn.execute(
+          `SELECT username AS "username" FROM v$session WHERE TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE')) = :instance AND sid = :sid AND serial# = :serial AND type = 'USER'`,
+          { instance, sid, serial }, { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+      }
+      if (!target.rows?.length) return res.status(404).json({ error: "Session no longer exists. Refresh the list." });
+      await conn.execute(killSessionSql(sid, serial, global ? instance : undefined));
+      res.json({ ok: true });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });
 
 app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, res) => {

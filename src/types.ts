@@ -95,6 +95,7 @@ export type TabKind =
   | "migration"
   | "dba"
   | "dbamanager"
+  | "sessions"
   | "deps"
   | "versions"
   | "compile"

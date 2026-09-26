@@ -6,6 +6,7 @@ import { dbaModules, type DbaPage } from "../utils/dbaModules";
 import DbaStorage from "./DbaStorage";
 import DbaAdvisor from "./DbaAdvisor";
 import PerformanceMonitor from "./PerformanceMonitor";
+import Sessions from "./Sessions";
 import { Badge, Btn, EmptyState, inputCls, Spinner } from "./ui";
 
 const icons = [Settings2, Database, ArchiveRestore, Activity, ArchiveRestore, SlidersHorizontal, FileCode2, CalendarClock, ShieldCheck, HardDrive, Gauge];
@@ -95,6 +96,7 @@ export default function DbaManager() {
           {!connected ? <EmptyState icon={<Database />} title={conn ? "Connection is offline" : "Select an Oracle connection"} hint="Connect through the Explorer to read DBA views. Modules use the selected Oracle user's privileges." action={<Btn variant="outline" onClick={() => s.setWizardOpen(true)}>New connection</Btn>} />
             : page.view === "storage" || page.view === "memory" ? <DbaStorage key={`${conn.id}:${page.id}`} page={page.view === "storage" ? "Storage" : "Memory"} />
             : page.view === "performance" ? <PerformanceMonitor key={conn.id} />
+            : page.view === "sessions" ? <Sessions key={conn.id} />
             : page.view === "advisor" ? <DbaAdvisor key={conn.id} />
             : <CatalogPage key={`${conn.id}:${page.id}`} connectionId={conn.id} page={page} />}
         </div>

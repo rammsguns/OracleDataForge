@@ -700,6 +700,10 @@ export default function Sidebar() {
                             action: () => { s.setActiveConnId(c.id); s.openTab("compile", `Compile: ${c.name}`, "schema"); },
                           }]
                         : []),
+                      ...(fullAccess && c.live ? [{
+                        label: "Sessions…",
+                        action: () => { s.setActiveConnId(c.id); s.openTab("sessions", "Sessions"); },
+                      }] : []),
                       { divider: true },
                       { label: "Edit connection…", action: startEdit },
                       // opens the dialog with every connection preselected, not just this

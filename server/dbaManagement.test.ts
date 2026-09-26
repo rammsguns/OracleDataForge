@@ -88,7 +88,7 @@ test("all eleven DBA modules resolve to implemented views or allowlisted queries
   const pages = dbaModules.flatMap(module => module.pages);
   assert.equal(new Set(pages.map(page => page.id)).size, pages.length);
   for (const page of pages) {
-    if (page.view) assert.ok(["memory", "storage", "performance", "advisor"].includes(page.view));
+    if (page.view) assert.ok(["memory", "storage", "performance", "advisor", "sessions"].includes(page.view));
     else {
       assert.ok(page.sections?.length);
       assert.equal(selectManagementQueries(page.sections!.map(([key]) => key).join(",")).length, page.sections!.length);
@@ -116,4 +116,3 @@ test("memory changes allow only known parameters, numeric sizes and valid scopes
   assert.throws(() => memorySql("sga_target", "100", "BOTH; SHUTDOWN"));
   assert.throws(() => memorySql("sga_target", "-1", "MEMORY"));
 });
-

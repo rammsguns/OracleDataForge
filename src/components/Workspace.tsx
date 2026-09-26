@@ -15,6 +15,7 @@ import {
   Table2,
   Terminal,
   UserCog,
+  Users,
   Waypoints,
   X,
 } from "lucide-react";
@@ -37,6 +38,7 @@ import CompileInvalid from "./CompileInvalid";
 import JobRunLog from "./JobRunLog";
 import UserAdmin from "./UserAdmin";
 import PlsqlRepository from "./PlsqlRepository";
+import Sessions from "./Sessions";
 import { EmptyState } from "./ui";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
@@ -51,6 +53,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   migration: <GitCompareArrows size={12} />,
   dba: <Gauge size={12} />,
   dbamanager: <Hammer size={12} />,
+  sessions: <Users size={12} />,
   deps: <Waypoints size={12} />,
   versions: <History size={12} />,
   compile: <Hammer size={12} />,
@@ -65,6 +68,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "perf", title: "Performance", label: "Performance" },
   { kind: "dba", title: "DBA Advisor", label: "DBA Advisor" },
   { kind: "dbamanager", title: "DBA Manager", label: "DBA Manager" },
+  { kind: "sessions", title: "Sessions", label: "Sessions" },
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
@@ -153,6 +157,7 @@ export default function Workspace() {
         {active.kind === "migration" && <MigrationAssistant />}
         {active.kind === "dba" && <DbaAdvisor />}
         {active.kind === "dbamanager" && <DbaManager />}
+        {active.kind === "sessions" && <Sessions />}
         {active.kind === "deps" && <DependencyExplorer key={active.id} initialObject={active.payload} />}
         {active.kind === "versions" && <VersionHistory key={active.id} />}
         {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}

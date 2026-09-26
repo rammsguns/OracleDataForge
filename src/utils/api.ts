@@ -157,6 +157,43 @@ export interface DbaManagementReport {
   capturedAt: string;
   sections: Record<string, { rows: Record<string, string | number | null>[]; error?: string; truncated?: boolean }>;
 }
+export interface OracleSession {
+  instance: number;
+  sid: number;
+  serial: number;
+  username: string | null;
+  status: string;
+  machine: string | null;
+  program: string | null;
+  module: string | null;
+  action: string | null;
+  osUser: string | null;
+  process: string | null;
+  terminal: string | null;
+  clientInfo: string | null;
+  clientDriver?: string | null;
+  clientVersion?: string | null;
+  clientConnection?: string | null;
+  clientOciLibrary?: string | null;
+  schemaName: string | null;
+  logonTime: string | null;
+  lastCallSeconds: number | null;
+  sqlId: string | null;
+  previousSqlId: string | null;
+  event: string | null;
+  waitClass: string | null;
+  waitState: string | null;
+  blockingSid: number | null;
+  clientIdentifier: string | null;
+  serviceName: string | null;
+}
+
+export interface OracleSessionsReport {
+  sessions: OracleSession[];
+  scope: "all-instances" | "local-instance";
+  clientDetailsAvailable: boolean;
+  capturedAt: string;
+}
 export interface DbaMetric { name: string; value: number; unit: string; }
 export interface DbaWaitEvent { event: string; waits: number; timeS: number; avgMs: number; waitClass: string; }
 export interface DbaTopSql { sqlId: string; elapsedS: number; executions: number; perExecMs: number; sqlText: string; }
@@ -883,6 +920,9 @@ export const api = {
   schemaGroup: (id: string, label: string) =>
     request<SchemaGroupResult>(`/api/connections/${id}/schema/group?label=${encodeURIComponent(label)}`),
   dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`),
+  sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`),
+  killSession: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
+    request<{ ok: boolean }>(`/api/connections/${id}/sessions/kill`, session),
   dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),
   dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`),
   dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`),

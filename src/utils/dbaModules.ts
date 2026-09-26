@@ -3,7 +3,7 @@ export interface DbaPage {
   label: string;
   description: string;
   sections?: [string, string][];
-  view?: "storage" | "memory" | "performance" | "advisor";
+  view?: "storage" | "memory" | "performance" | "advisor" | "sessions";
 }
 export interface DbaModule { id: string; label: string; pages: DbaPage[]; }
 export const dbaModules: DbaModule[] = [
@@ -22,7 +22,7 @@ export const dbaModules: DbaModule[] = [
   ] },
   { id: "performance", label: "Performance", pages: [
     { id: "monitor", label: "Performance Monitor", description: "Live metrics, waits, and database activity.", view: "performance" },
-    { id: "sessions", label: "Sessions", description: "User sessions, active SQL, wait events, and blocking session identifiers.", sections: [["sessions", "User sessions"]] },
+    { id: "sessions", label: "Sessions", description: "Inspect user connections, view session details, and kill sessions when permitted.", view: "sessions" },
   ] },
   { id: "rman", label: "RMAN Backup/Recovery", pages: [
     { id: "backups", label: "Backup Jobs", description: "Inspect RMAN backup history. Backup and restore commands must be run in an external RMAN client.", sections: [["backups", "Recent backup jobs"]] },
