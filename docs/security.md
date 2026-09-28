@@ -16,7 +16,7 @@ executes arbitrary SQL. It assumes:
 - The Oracle account it connects with already has whatever privileges it has — the app never
   elevates.
 
-It is **not** a multi-tenant service and has no audit trail. The removed control plane from the
+It is **not** a multi-tenant service. DBA storage actions and worksheet writes have a local audit log (see [DBA Manager](dba-manager.md)); other management endpoints are not covered by this log. The removed control plane from the
 original suite is not coming back by accident. An optional, lightweight identity/role layer
 exists (see [Workspace roles](#workspace-roles) below) for the case of a few trusted people
 sharing one instance — it is not a tenant system, and every account still shares the same
@@ -94,6 +94,12 @@ with nothing, takes the challenge, and retries with the password — and a page 
 several of those at once. Counting them would let an ordinary first visit trip its own
 cooldown before anyone could type anything, so a credential-less request always gets a clean
 401 challenge, even mid-cooldown. It costs nothing to serve: no derivation runs on that path.
+
+Password checks also have a concurrency ceiling: four per source address and eight across the
+server. Capacity is reserved before starting a derivation; excess requests receive `429` with
+`Retry-After: 1` without queuing work. Capacity is released when the derivation settles, including
+errors, rather than when a client disconnects. Unknown and suspended accounts share these limits.
+This bounds bursts that arrive before failed checks finish and trigger the cooldown.
 
 The cooldown is checked *after* the cache, so a browser whose credential is already warm keeps
 working while a guesser from the same address is being throttled.
@@ -199,6 +205,10 @@ the server must be able to decrypt to actually connect). `GET/POST/PUT/DELETE /a
 Administrator-only, and a change that would leave **zero active Administrators** — suspending,
 demoting, or removing the last one — is rejected outright, so an operator can't accidentally
 lock themselves out short of deleting `data/users.json` on disk.
+
+Account loading fails closed: only a missing `users.json` enables first-run setup. An unreadable,
+corrupt, empty, or invalid account store aborts startup instead of disabling authentication.
+All records are validated before use, including duplicate IDs and case-insensitive emails.
 
 Creating the very first account is deliberately unauthenticated — until one exists, every
 caller is already treated as Administrator, so `POST /api/users` from that state is how a fresh
@@ -355,11 +365,45 @@ reading files outside the versions directory.
 rather than an allowlist, so a field added to the config later cannot silently begin leaking:
 
 ```ts
-const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
 ```
 
 Result data is also shaped defensively: LOBs render as `[BLOB]`/`[CLOB]` placeholders rather
 than bytes, and raw buffers are truncated.
+
+The one deliberate exception is the **encrypted connection export**
+(`POST /api/connections/export`), and even it does not break the rule: the browser sends a
+passphrase and receives ciphertext. The server derives a key from that passphrase with scrypt
+and encrypts the selected connections — passwords included — with AES-256-GCM, so what
+reaches the page, and then the user's disk, is never readable plaintext. It is full-access
+only, the passphrase floor is 12 characters, and each export is logged to the server console.
+See [credentials.md](credentials.md#exporting-connections-to-an-encrypted-file).
+
+The **import** (`POST /api/connections/import/preview` and `/import`) runs the same way in
+reverse, and holds the line in both directions. Decryption happens server-side, so the preview
+it sends back describes the file — names, hosts, users — without a single password in it. The
+uploaded envelope is treated as untrusted input: format, version and cipher are checked, the
+scrypt parameters it carries are range-checked before any key is derived (a file must not be
+able to size an allocation here), the payload is bounded and capped at 500 entries, and every
+decrypted entry goes through the same `pickConfig`/`validate` path as a hand-typed connection.
+Both endpoints are full-access only, and an import is logged with what it added, replaced and
+skipped.
+
+## Uploaded Oracle Cloud wallets
+
+`POST /api/wallets` takes a file a user picked and writes parts of it to disk, so it is
+treated the way the connection import is. Full access only. The upload is capped at 2 MB
+before it is even decoded and each extracted file at 512 KB, with the inflate bounded so a
+decompression bomb fails rather than fills memory. Only two entries are kept — `ewallet.pem`
+and `tnsnames.ora` — matched on the **basename** of each zip entry and written under names
+from that whitelist, so an entry called `../../../../etc/ewallet.pem` is simply "the PEM":
+nothing an archive says ever becomes a path. Encrypted archives, zip64 and unknown
+compression methods are refused rather than half-read, and a zip whose PEM holds no private
+key is refused too. Wallet ids are server-issued (`w1`, `w2`, …) and every id arriving in a
+request is checked against that shape before it is joined to a path.
+
+Where the files then live, and what does and does not encrypt them, is in
+[credentials.md](credentials.md#oracle-cloud-wallets).
 
 ## Caps
 
@@ -374,6 +418,7 @@ Denial-of-service resistance is incidental rather than designed, but the limits 
 | Routine output lines | 1,000 |
 | PL/SQL block binds | 32 |
 | Request body | 16 MB |
+| Wallet zip upload / extracted file | 2 MB / 512 KB |
 | Failed sign-ins per address | 10 per minute, then a 60 s cooldown |
 | Verified-credential cache | 5 minutes, 500 entries |
 

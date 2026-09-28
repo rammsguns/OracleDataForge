@@ -23,7 +23,7 @@ than by building an allowlist by hand, so a field added to the config later cann
 begin leaking through that endpoint:
 
 ```ts
-const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
 ```
 
 Credentials go browser → backend once when you create or edit a connection, and never come
@@ -107,6 +107,170 @@ sensitivity lives in `data/versions/`, unencrypted, for as long as the version h
 kept. Excluding `data/` from sync (the same fix as above) covers this too — there is no
 separate exclusion needed.
 
+## Oracle Cloud wallets
+
+A connection created with **Oracle Cloud wallet** carries a second secret: the wallet itself.
+The uploaded zip is unpacked on the backend into `data/wallets/<id>/`, and the connection
+stores only that directory's id.
+
+Two of the zip's files are kept — `ewallet.pem` and `tnsnames.ora` — and the rest are
+discarded. `cwallet.sso`, `ewallet.p12` and the Java keystores are the same private key in
+formats node-oracledb's Thin mode cannot read, and an unused secret is still a secret to
+lose. The directory is created `0700` and the files `0600`, with the same Windows caveat as
+above.
+
+**`DATAFORGE_ENCRYPTION_KEY` does not cover `data/wallets/`.** That key encrypts the
+connection registry; the wallet files are written as they came out of the zip. What is
+encrypted with the registry is the **wallet password** — the one you set when downloading the
+wallet from Oracle Cloud, which the PEM key is encrypted under, and which the backend supplies
+to the driver on every connection. So a stolen `data/wallets/` directory alone does not open a
+database, and the sync-root advice above applies to it exactly as it does to
+`connections.json`.
+
+Wallets are reference-counted rather than owned by one connection: pointing three connections
+at the `_high`, `_medium` and `_low` services of the same Autonomous Database uses one wallet.
+A wallet directory nothing points at any more is deleted the next time a connection is saved,
+edited, deleted or imported, once it is an hour old — which also sweeps up a wallet uploaded
+into a wizard that was then cancelled. The hour is what keeps a wallet uploaded in one browser
+tab from being collected by a registry change made in another before the connection using it
+has been saved.
+
+## Exporting connections to an encrypted file
+
+`data/connections.json` is only a backup of the registry for as long as the machine holding
+`DATAFORGE_ENCRYPTION_KEY` survives — the file alone, copied elsewhere, decrypts to nothing.
+The **export** is the portable form. In the Explorer, the lock icon beside **Connections**
+(or **Export connections…** in a connection's context menu) asks for a passphrase and
+downloads `dataforge-connections-<date>.json`.
+
+What that file holds is the **Oracle username and password** of every connection you picked,
+encrypted under that passphrase and nothing else. Treat it exactly as you would treat the
+passwords themselves.
+
+A wallet connection carries its **whole wallet** inside the same envelope — `ewallet.pem`,
+`tnsnames.ora` and the wallet password — because `walletId` names a directory on the machine
+that wrote the file and would restore to a connection pointing at nothing. The export list
+marks those entries *wallet included*. One consequence is worth stating plainly: such a file
+is a complete, self-contained credential for an Autonomous Database, and the passphrase is
+the only thing protecting it. If a wallet is no longer on this server, the export is refused
+rather than written without it.
+
+- The browser never assembles it. Passwords do not live there, so the encryption happens
+  server-side and the browser only receives, and saves, ciphertext.
+- **Full access only** (Administrator or Developer), the same bar as every other route that
+  reads or writes the registry.
+- The passphrase must be **at least 12 characters** — a higher floor than a workspace account
+  password, because an account password is guessed online against a server that rate-limits
+  and logs, while an export file is guessed offline, as fast as the attacker's hardware
+  allows, for as long as they care to keep trying.
+- **There is no recovery.** Lose the passphrase and the file is unreadable; the connections
+  themselves are still in the app, so re-export rather than go looking for a way in.
+- Each export is logged to the server console (`Exported N saved connection(s) …`), since
+  credentials leaving the machine is worth a line in the operator's log.
+
+### The file format
+
+A single JSON object. `data` is the encrypted array of connections; everything else is what a
+reader needs to derive the same key:
+
+```json
+{
+  "format": "oracle-dataforge-connections",
+  "version": 1,
+  "exportedAt": "2026-09-03T21:16:17.424Z",
+  "count": 2,
+  "cipher": "aes-256-gcm",
+  "kdf": { "name": "scrypt", "salt": "…base64…", "N": 32768, "r": 8, "p": 1, "keylen": 32 },
+  "iv": "…base64…",
+  "tag": "…base64…",
+  "data": "…base64 ciphertext…"
+}
+```
+
+The scrypt parameters are deliberately expensive (N=2^15, r=8 → roughly 32 MB and ~100 ms per
+guess) so that offline guessing has to pay for every attempt. The GCM tag authenticates the
+ciphertext: a wrong passphrase, or an edited file, fails to decrypt rather than returning
+plausible-looking rubbish.
+
+## Importing an export back
+
+**Import connections…** (the ⬆ icon beside **Connections**, or the same entry in a connection's
+context menu) is the way back in: pick the file, type its passphrase, and the connections
+inside it become saved connections here. It is full-access only, like the export.
+
+The browser cannot open the file — the passphrase-derived key never exists there — so the
+envelope is uploaded and the backend decrypts it. That happens in two steps, and **nothing is
+written by the first one**:
+
+1. **Unlock file** decrypts and lists what is inside: name, server, port, user, service and
+   read-only flag for every entry. Passwords stay on the server even here — the preview is
+   metadata, the same rule `GET /api/connections` follows.
+2. **Import** writes the entries you ticked into the registry, which persists them to
+   `data/connections.json` under `DATAFORGE_ENCRYPTION_KEY` (or in clear text, if no key is
+   configured — the plaintext default above applies to imported credentials exactly as it does
+   to typed ones).
+
+A wallet entry restores its wallet as part of step 2: the files inside the envelope are
+written to a fresh `data/wallets/<id>/` on this server and the connection is pointed at that,
+never at the id the file carried. The preview marks those entries *restores its wallet*, and
+an entry whose wallet is missing from the file is refused rather than imported as a broken
+connection.
+
+### Connections you already have
+
+An entry is treated as one you already have when its **engine, host, port, user and service
+name** all match a saved connection — for a wallet connection, the host, port and alias its
+wallet resolved to, since the wallet's own id differs on every machine. The preview marks
+those **ALREADY SAVED**, and offers a choice:
+
+| | |
+| --- | --- |
+| **Keep what is here** (default) | The saved connection and its password are left alone. |
+| **Replace with the file** | The saved entry is overwritten in place — name, password and read-only flag come from the file. Its id is kept, so open tabs still point at it, and its pooled sessions are closed first. |
+
+Entries pointing somewhere new are always added. Nothing is ever deleted by an import.
+
+### The file is untrusted input
+
+An uploaded envelope is attacker-shaped data even when it arrives from a colleague, so the
+backend checks it before it acts on it: the format, version and cipher must be the ones this
+build knows; the scrypt parameters are read from the file (an export made with different ones
+can open within supported costs) but **range-checked** first. Combined costs are capped at
+64 MiB for the main working buffer (`128 * N * r`) and 524,288 work units (`N * r * p`,
+twice the current export cost), before key derivation starts. The native allocation ceiling
+is fixed at 65 MiB, including auxiliary buffers; uploaded parameters cannot raise it.
+Salt, IV, tag and payload are bounded; a file is
+capped at 500 connections; and every decrypted entry goes through the same field-by-field
+`pickConfig`/`validate` path as a connection typed into the wizard, so an entry with a bogus
+port or a missing service name is rejected rather than saved.
+
+A wrong passphrase and an altered file both fail the GCM authentication tag, so the error says
+both — that is the honest answer, not a vague one.
+
+The envelope code lives in `server/connectionExport.ts`, apart from the rest of the backend so
+it can be tested directly: `npm test` covers the round trip, the rejection paths above, and
+the fact that no plaintext survives anywhere in a written file.
+
+### Reading one by hand
+
+The import above is the easy path; the file is also readable without this app, which is what
+makes it a real backup. Decrypt it with Node:
+
+```bash
+node -e '
+const fs=require("fs"),c=require("crypto");
+const f=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+const k=c.scryptSync(process.argv[2],Buffer.from(f.kdf.salt,"base64"),f.kdf.keylen,
+  {N:f.kdf.N,r:f.kdf.r,p:f.kdf.p,maxmem:128*f.kdf.N*f.kdf.r*2});
+const d=c.createDecipheriv(f.cipher,k,Buffer.from(f.iv,"base64"));
+d.setAuthTag(Buffer.from(f.tag,"base64"));
+console.log(Buffer.concat([d.update(Buffer.from(f.data,"base64")),d.final()]).toString());
+' dataforge-connections-2026-09-03.json 'your passphrase'
+```
+
+Note `maxmem`: at these parameters scrypt needs more than Node's 32 MB default and throws
+without it. That is by design — the cost is the point.
+
 ## Migrating an existing plaintext registry
 
 The server reads a plaintext registry on loopback so an existing install keeps working, and
@@ -137,8 +301,11 @@ password** to mean *keep the stored one*, so you are not forced to retype it to 
 unrelated field.
 
 That convenience is deliberately constrained. A stored password may only be replayed to the
-exact endpoint it was saved against — engine, host, port, user, **and service name** must all
-still match. The code is explicit about why:
+exact endpoint it was saved against — engine, host, port, user, **service name**, and (for a
+wallet connection) **the wallet itself** must all still match. Swapping in a different wallet
+points the same alias at a different Autonomous Database, which is precisely the substitution
+this rule exists to stop. The saved **wallet password** is replayed on the same terms. The
+code is explicit about why:
 
 > point a saved connection at a rogue server, and the backend dials out and authenticates with
 > the real password
@@ -161,8 +328,12 @@ The server, port, user or engine changed — re-enter the password for the new d
 - **Use a distinct low-privilege Oracle account** where the work allows it. Read-only mode and
   the write guards reduce accidents, but they are application-level controls and are not a
   substitute for Oracle privileges.
-- **`SYS` connects as `SYSDBA` automatically.** Be deliberate about saving a `SYS` password at
-  all.
+- **`SYS` connects as `SYSDBA` automatically**, whatever the connection's role says. Be
+  deliberate about saving a `SYS` password at all.
+- **Pick the narrowest role that does the job.** `SYSDBA` is unrestricted and bypasses the
+  schema privileges the account otherwise has; `SYSBACKUP`, `SYSDG`, `SYSKM` and `SYSASM`
+  exist so backup, Data Guard, key management and ASM work does not need it. The role is saved
+  with the connection and travels inside an export like every other field.
 
 ## See also
 

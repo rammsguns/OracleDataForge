@@ -1,23 +1,39 @@
 # Architecture
 
 Oracle DataForge is a two-process application: a React single-page frontend and an Express
-backend that owns every Oracle session. About 16,900 lines of TypeScript across `src/` and
+backend that owns every Oracle session. About 24,200 lines of TypeScript across `src/` and
 `server/`.
 
-The shape is deliberately flat. There is no router, no state-management library, no ORM, no
-service layer, and no test suite. The backend is a **single file**.
+The shape is deliberately flat. There is no router, no state-management library, no ORM and
+no service layer. The backend is **one file plus four modules**: `server/index.ts` holds every
+route, while `server/connectionExport.ts` (the encrypted-export envelope),
+`server/oracleWallet.ts` (reading an Oracle Cloud wallet zip and its `tnsnames.ora`),
+`server/connectionRole.ts` (a connection's Oracle privilege) and `server/objectCopy.ts` (what a
+copy may move and what its DDL is turned into) sit apart — the pieces of backend logic pure
+enough to test without a server around them, and the pieces whose input is untrusted: a file
+someone uploaded, a role name from a request body or an older registry, a list of object names
+from a browser.
+They are also all the test suite covers; the rest of the backend is still verified by hand.
 
 ## Layout
 
 ```text
-index.html            SPA entry; mounts #root, loads src/main.tsx
-vite.config.ts        dev server, /api proxy, watch-ignore rules
-tsconfig.json         app config (src/)
-tsconfig.server.json  server config (server/)
-server/index.ts       the entire backend — 4,727 lines
-src/                  the entire frontend
-data/                 runtime state, gitignored
-dist/                 built SPA, served by the backend in production
+index.html                       SPA entry; mounts #root, loads src/main.tsx
+vite.config.ts                   dev server, /api proxy, watch-ignore rules
+tsconfig.json                    app config (src/)
+tsconfig.server.json             server config (server/)
+server/index.ts                  the backend: routes, registry, guards — 7,282 lines
+server/connectionExport.ts       the encrypted-export envelope, kept pure so it can be tested
+server/connectionExport.test.ts  its tests — `npm test`, node:test, no framework
+server/oracleWallet.ts           Oracle Cloud wallet zip reader and tnsnames.ora parser
+server/oracleWallet.test.ts      its tests, run by the same `npm test`
+server/connectionRole.ts         the connection role → Oracle privilege whitelist and mapping
+server/connectionRole.test.ts    its tests, run by the same `npm test`
+server/objectCopy.ts             object-copy kinds (sequences, tables, indexes, views, mviews, synonyms, packages, procedures, functions, types, triggers), name whitelist, transform params, statement prep
+server/objectCopy.test.ts        its tests, run by the same `npm test`
+src/                             the entire frontend
+data/                            runtime state, gitignored
+dist/                            built SPA, served by the backend in production
 ```
 
 ## The two processes
@@ -98,7 +114,8 @@ lookup and 404.
 | Health | `GET /api/health` |
 | Session | `GET /api/session` — the role the server authenticated this caller as; `POST /api/session/password` — change your own password (any role) |
 | Users | list, create, update, `:id/status`, delete — Administrator-only |
-| Connections | list, test, test-existing, create, update, delete, disconnect, reconnect |
+| Connections | list, test, test-existing, create, update, delete, disconnect, reconnect; `POST /api/connections/export`, `POST /api/connections/import/preview`, `POST /api/connections/import` — passphrase-encrypted backup and restore of the saved connections (full access only) |
+| Wallets | `POST /api/wallets` — unpack an uploaded Oracle Cloud wallet zip and list the services in it; `GET /api/wallets/:id` — the services of one already stored (both full access only) |
 | Schema | `GET …/schema`, `GET …/schema/group?label=` |
 | Query | `POST …/query`, `POST …/explain` |
 | Compile | `POST …/compile`, `GET …/compile/invalid`, `POST …/compile/invalid` |
@@ -126,7 +143,29 @@ The driver is `oracledb` 7 in **Thin mode** — pure JavaScript, no Instant Clie
 `connectTimeout: 8`). The pool handle lives inside the registry entry, so pools are
 process-wide and per-connection. Every call site closes its connection in a `finally`.
 
-**`SYS` bypasses the pool entirely** and gets a standalone `SYSDBA` connection per use.
+**Role.** A connection carries the administrative privilege its sessions open with —
+SQL Developer's *Role* dropdown, and the same list: `default`, `SYSDBA`, `SYSOPER`,
+`SYSBACKUP`, `SYSDG`, `SYSKM`, `SYSASM`. Anything but `default` is passed to the driver as
+`privilege`. The whitelist and the mapping live in `server/connectionRole.ts`; an
+unrecognised value — an older registry entry, a hand-edited export — falls back to `default`
+rather than reaching the driver. `SYS` is given `SYSDBA` even at `default`, because Oracle rejects any other
+privilege for it (ORA-28009); that fallback is also what keeps connections saved before the
+field existed working. The role describes the session rather than the destination, so it is
+deliberately *not* part of the endpoint identity that guards a stored password
+([credentials.md](credentials.md)) — changing it does not require retyping the password.
+
+**Privileged connections bypass the pool entirely** and get a standalone connection per use:
+`createPool` takes no `privilege`, so the session has to be opened directly.
+
+**Two ways to reach a database**, carried on the connection's `authMode`. A `basic`
+connection dials the `host:port/service` connect string. A `wallet` connection connects
+through an Oracle Cloud wallet instead: `database` holds a `tnsnames.ora` alias rather than a
+service name, and the driver is handed `configDir` (so the alias resolves) and
+`walletLocation` / `walletPassword` (so mutual TLS completes), all pointing at
+`data/wallets/<id>/`. Thin mode reads the PEM wallet, which is why the uploaded zip's
+`cwallet.sso` and `ewallet.p12` are discarded and its `ewallet.pem` is required. The host and
+port stored on a wallet connection are what its alias resolved to when it was saved — they
+are what the UI shows and what duplicate detection compares, never what is dialled.
 
 **The registry** is an in-memory `Map` persisted to `data/connections.json`, in one of two
 formats: a plain array, or an AES-256-GCM envelope. Plaintext is refused outright when `HOST`
@@ -140,6 +179,76 @@ reopen a pool for a connection the user set to idle.
 
 **Rows.** `MAX_ROWS` is 1000; the server fetches 1001 to detect truncation and flags it.
 Statements that return no result set produce a synthetic one-column "N row(s) affected".
+
+**Copying objects** is the only operation that holds two connections at once. Both endpoints
+(`GET`/`POST /api/connections/:id/objects/copy`) are addressed by the **target** — the
+connection being written to — so `requireFullAccess`, the read-only refusal, the
+Oracle-maintained-schema refusal and the confirmation guard all apply to it without a second
+set of rules; the source arrives as a parameter and is only ever read.
+
+One run copies one kind: sequences, types, tables, indexes, views, materialized views,
+synonyms, packages, procedures, functions or triggers. Types precede tables and routines
+precede triggers, but the catalogue is not a dependency sort. Cross-kind or cyclic
+dependencies can require more runs and recompilation. Which kinds exist, how a DBMS_METADATA answer becomes runnable
+statements, and how DDL written for one schema is pointed at another live in
+`server/objectCopy.ts`, apart from `index.ts` because they are pure and because each is a
+mistake that looks like a success — a qualifier left pointing at the source is a VALID object
+that reads the wrong database. So do the DBMS_METADATA transform parameters, including the two
+the tablespace choice moves together, and the whitelist that intersects the caller's chosen
+names with the source's own listing before any of them reaches `GET_DDL` or a `DROP`.
+`index.ts` keeps the Oracle half: the dictionary query that lists each kind, and the session
+that applies the parameters and runs the statements. The plan surveys every kind and marks the chosen
+one, so the browser renders the catalogue the server gave it rather than a copy that can drift,
+and adding a kind is an entry in `OBJECT_COPY_KINDS` and a listing query beside it — indexes,
+sequences, views, materialized views, triggers and synonyms were each added that way, plus the
+flags their kind of object needed. Materialized views and synonyms cost no change to the panel
+at all. Unlike
+`oraApplyTableDdl`, a failure does not stop the run: these are hundreds of independent objects,
+every one is attempted, and every outcome is reported.
+
+A kind also carries the two names Oracle has for it. `user_objects` says `MATERIALIZED VIEW`
+and `DBMS_METADATA` wants `MATERIALIZED_VIEW`, the way it wants `REF_CONSTRAINT` and `DB_LINK`,
+so every `GET_DDL` reads `copyMetadataType` while the listing, the existence check and the
+`DROP` read `objectType`. The difference is written down once rather than discovered per kind,
+because the dictionary's spelling reaches `GET_DDL` as an ORA-31600 naming the parameter.
+
+Five things follow from a kind rather than being written into the route. A kind that can own
+foreign keys gets a second pass after the object loop, which is why `REF_CONSTRAINTS` is left
+out of `CREATE TABLE` at all: a foreign key names a second table, and alphabetical order puts
+plenty of children before their parents. A kind that is *built on* a table — indexes — gets the
+opposite treatment, a check before the loop: the run reads which table each object belongs to
+and reports a missing one as a skip naming the table, because Oracle's own answer is an
+ORA-00942 that names neither the index nor the table it wanted. The plan runs the same check
+against the target's tables, so the picker marks those objects before anything is attempted.
+A trigger is built on something too, but on a table *or* a view — an `INSTEAD OF` trigger is
+how a view is written to at all — so the kind names which kinds its base object can be, the
+target is searched for both, and the sentence about what to copy first names those runs rather
+than always saying "tables". A synonym points at something too and is deliberately *not*
+pre-checked: Oracle creates one for an object that is not there rather than refusing it, so a
+check here would refuse objects the database was going to accept — and a synonym's target can
+be a package or a database link, neither of which is a kind this copies, so every one of those
+would be reported blocked by something sitting in the target already.
+A kind that occupies no segment — sequences, views, synonyms and triggers — does not offer the
+tablespace choice at all, in the panel or in the sentence the confirmation dialog writes about
+it, rather than offering it and quietly ignoring it. A kind whose own DDL is a `CREATE OR
+REPLACE` — views, synonyms, triggers and PL/SQL code — is replaced without being dropped, because dropping it
+first would cost the grants on a view and the validity of everything built on it, and would
+leave a table running unguarded until the new trigger landed, to make room for a statement that
+was going to overwrite it anyway; the panel names that choice after what it does. And a kind
+that is *compiled* — views, triggers, synonyms and PL/SQL code — gets a second pass of
+its own after the loop: a view is created
+`FORCE`, which is what makes the order views are copied in irrelevant, and the cost of that bet
+is that one whose tables are missing is created INVALID rather than refused. A trigger reaches
+the same place from the other side — its base table has to be there, but whatever its body
+calls need not be. One query afterwards asks the target which of the objects just created it
+cannot compile, and each of those is reported as created with the sentence saying it does not
+work yet — the alternative being a green result for a view that raises ORA-04063 the first time
+anybody selects from it, or a trigger that raises it on the first insert.
+A synonym is not compiled in that sense at all, and carries the flag for what the flag *does*:
+the same question asked of the target, at the cost of one query, catching the synonym for a
+package or a link that landed dangling. Whether Oracle marks a never-resolvable synonym INVALID
+is the one thing here that a real database has to answer; where it does not, the pass finds
+nothing and the synonym is reported as the plain "created" it also is.
 
 ## The write guard
 
@@ -249,3 +358,8 @@ type-checks only `src` — an inconsistency worth being aware of, though harmles
 - [performance.md](performance.md) — limits, pooling, and caching behavior
 - [known_limitations.md](known_limitations.md) — what this design does not do
 - [deployment.md](deployment.md) — running it
+
+Package and type metadata includes specifications and optional bodies, executed in emitted
+order as one logical picker item. Compilation checks include PACKAGE BODY and TYPE BODY,
+so a valid specification cannot hide an invalid body. Types use CREATE OR REPLACE without
+DROP or FORCE fallback; dependent types or tables may prevent replacement.

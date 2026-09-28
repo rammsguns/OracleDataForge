@@ -1,4 +1,22 @@
 /** Thin client for the local Oracle DataForge backend. */
+import type { StorageChange } from "./dbaSql";
+
+/**
+ * How a connection reaches Oracle: `basic` is host/port/service over TCP, `wallet` is an
+ * Oracle Cloud wallet (mutual TLS to Autonomous Database), where the endpoint comes from
+ * the wallet's tnsnames.ora and `database` names the service alias inside it.
+ */
+export type AuthMode = "basic" | "wallet";
+
+/**
+ * The Oracle administrative privilege a connection opens its sessions with — SQL Developer's
+ * "Role" dropdown. `default` is an ordinary session; the rest are password-file privileges,
+ * and are how accounts like SYS or an RMAN backup user connect at all.
+ */
+export type ConnectionRole = "default" | "SYSDBA" | "SYSOPER" | "SYSBACKUP" | "SYSDG" | "SYSKM" | "SYSASM";
+
+/** Every role the connection form offers, in SQL Developer's order. */
+export const CONNECTION_ROLES: ConnectionRole[] = ["default", "SYSDBA", "SYSOPER", "SYSBACKUP", "SYSDG", "SYSKM", "SYSASM"];
 
 export interface LiveConnConfig {
   name: string;
@@ -9,6 +27,12 @@ export interface LiveConnConfig {
   password: string;
   database: string;
   readOnly?: boolean;
+  role?: ConnectionRole;
+  authMode?: AuthMode;
+  /** wallet mode: the wallet uploaded through `uploadWallet` */
+  walletId?: string;
+  /** wallet mode: the password its PEM key is encrypted with; blank keeps the saved one */
+  walletPassword?: string;
 }
 
 /** A saved connection as the backend reports it — metadata only, never a password. */
@@ -21,8 +45,77 @@ export interface StoredConnection {
   user: string;
   database: string;
   readOnly: boolean;
+  role?: ConnectionRole;
+  authMode?: AuthMode;
+  walletId?: string;
 }
 
+/** One service from a wallet's tnsnames.ora — an alias and where it points. */
+export interface WalletService {
+  alias: string;
+  host: string;
+  port: number;
+  serviceName: string;
+}
+
+/** What the backend answers with after unpacking an uploaded wallet zip. */
+export interface WalletInfo {
+  walletId: string;
+  services: WalletService[];
+  /** the PEM inside is encrypted, so connecting needs the wallet password */
+  needsPassword: boolean;
+}
+
+
+/**
+ * A passphrase-encrypted connection export, exactly as it is written to disk. The
+ * connections — Oracle passwords included — live inside `data`, encrypted under a key the
+ * server derives from the user's passphrase with scrypt; nothing readable ever reaches
+ * the browser. See docs/credentials.md for how to decrypt one outside the app.
+ */
+export interface ConnectionExportFile {
+  format: "oracle-dataforge-connections";
+  version: 1;
+  exportedAt: string;
+  count: number;
+  cipher: "aes-256-gcm";
+  kdf: { name: "scrypt"; salt: string; N: number; r: number; p: number; keylen: number };
+  iv: string;
+  tag: string;
+  data: string;
+}
+
+/** One connection inside an uploaded export, as the preview describes it — no password. */
+export interface ImportPreviewEntry {
+  index: number;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  readOnly: boolean;
+  /** the privilege it connects with, so an `AS SYSDBA` import is visible before it lands */
+  role?: ConnectionRole;
+  /** `wallet` entries bring the Oracle Cloud wallet with them, inside the encrypted file */
+  authMode?: AuthMode;
+  /** set when this entry cannot be imported at all (e.g. no service name) */
+  error?: string;
+  /** set when a saved connection already points at the same server, port, user and service */
+  duplicateOfId?: string;
+  duplicateOfName?: string;
+}
+
+export interface ImportPreview {
+  exportedAt: string;
+  entries: ImportPreviewEntry[];
+}
+
+/** What an import did, by connection name, so the UI can say it rather than guess. */
+export interface ConnectionImportResult {
+  added: string[];
+  replaced: string[];
+  skipped: string[];
+}
 export interface TestResult {
   ok: boolean;
   version?: string;
@@ -60,6 +153,47 @@ export interface SchemaGroupResult {
   rowCounts?: Record<string, number>;
 }
 
+export interface DbaManagementReport {
+  capturedAt: string;
+  sections: Record<string, { rows: Record<string, string | number | null>[]; error?: string; truncated?: boolean }>;
+}
+export interface OracleSession {
+  instance: number;
+  sid: number;
+  serial: number;
+  username: string | null;
+  status: string;
+  machine: string | null;
+  program: string | null;
+  module: string | null;
+  action: string | null;
+  osUser: string | null;
+  process: string | null;
+  terminal: string | null;
+  clientInfo: string | null;
+  clientDriver?: string | null;
+  clientVersion?: string | null;
+  clientConnection?: string | null;
+  clientOciLibrary?: string | null;
+  schemaName: string | null;
+  logonTime: string | null;
+  lastCallSeconds: number | null;
+  sqlId: string | null;
+  previousSqlId: string | null;
+  event: string | null;
+  waitClass: string | null;
+  waitState: string | null;
+  blockingSid: number | null;
+  clientIdentifier: string | null;
+  serviceName: string | null;
+}
+
+export interface OracleSessionsReport {
+  sessions: OracleSession[];
+  scope: "all-instances" | "local-instance";
+  clientDetailsAvailable: boolean;
+  capturedAt: string;
+}
 export interface DbaMetric { name: string; value: number; unit: string; }
 export interface DbaWaitEvent { event: string; waits: number; timeS: number; avgMs: number; waitClass: string; }
 export interface DbaTopSql { sqlId: string; elapsedS: number; executions: number; perExecMs: number; sqlText: string; }
@@ -143,6 +277,7 @@ export interface RoutineParam {
 }
 
 export interface RoutineMember {
+  returnFields?: { name: string; dataType: string; bindKind: RoutineBindKind | null }[];
   name: string;
   kind: "PROCEDURE" | "FUNCTION";
   overload: string | null;
@@ -372,6 +507,113 @@ export interface CompileBatchResult {
   note?: string;
 }
 
+/**
+ * One kind of object a copy can move, as `server/objectCopy.ts` defines it.
+ *
+ * One kind per run. The names are the backend's whitelist, and they are all that is repeated
+ * here: every label, the note saying what a kind carries, the note saying what replacing one
+ * costs and all of the counts arrive on the plan (`ObjectCopyPlan.breakdown` covers every
+ * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
+ * contains. Adding a kind is a change to the server plus this one line.
+ */
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers";
+
+/** What a copy does with an object the target already has. */
+export type CopyExisting = "skip" | "replace";
+
+export interface ObjectCopyKindSummary {
+  kind: CopyKind;
+  label: string;
+  /** what this kind carries with it, and what it leaves behind */
+  note: string;
+  /** what replacing an existing one costs for this kind, in the backend's words */
+  replaceNote: string;
+  /** objects of this kind live in a tablespace — when false the choice is not offered at all */
+  hasTablespace: boolean;
+  /** replacing one is its own create statement, so nothing is dropped and the choice is not called that */
+  replaceInPlace: boolean;
+  /** what objects of this kind are built on — "tables", "tables and views" — empty when nothing */
+  baseLabel: string;
+  selected: boolean;
+  total: number;
+  /** how many of them the target already has */
+  conflicts: number;
+}
+
+export interface ObjectCopyItem {
+  name: string;
+  existsInTarget: boolean;
+  /** the object this one is built on and the target has not got — it would be skipped, not created */
+  missingBase?: string;
+}
+
+export interface ObjectCopyPlan {
+  sourceId: string;
+  sourceName: string;
+  sourceSchema: string;
+  targetId: string;
+  targetName: string;
+  targetSchema: string;
+  /** the kind this plan was costed for — `breakdown` covers all of them regardless */
+  kind: CopyKind;
+  label: string;
+  breakdown: ObjectCopyKindSummary[];
+  items: ObjectCopyItem[];
+  total: number;
+  conflicts: number;
+  /** how many of them name a table the target has not got */
+  blocked: number;
+  cap: number;
+  overCap: boolean;
+  targetReadOnly: boolean;
+  targetSystemSchema: boolean;
+  /** both connections resolve to the same schema on the same database */
+  sameSchema: boolean;
+  checkedAt: string;
+}
+
+export interface ObjectCopyObjectResult {
+  name: string;
+  status: "created" | "replaced" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+  /** created, and still not working — a view the target cannot compile yet */
+  warning?: string;
+  statements: number;
+}
+
+/** One foreign key of a copied table, added once every table in the run existed. */
+export interface ObjectCopyFkResult {
+  table: string;
+  name: string;
+  status: "created" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+}
+
+export interface ObjectCopyResult {
+  sourceName: string;
+  sourceSchema: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  existing: CopyExisting;
+  objects: ObjectCopyObjectResult[];
+  foreignKeys: ObjectCopyFkResult[];
+  created: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  /** how many of the created ones the target cannot compile — counted out of `created`, not beside it */
+  invalid: number;
+  fksCreated: number;
+  fksFailed: number;
+  timedOut: boolean;
+  elapsedMs: number;
+  note?: string;
+}
+
 export interface ObjectSource {
   name: string;
   type: string | null;
@@ -447,6 +689,7 @@ export interface RowEditColumn {
 }
 
 export interface TableRowsResult {
+  manualTransaction?: boolean;
   table: string;
   columns: RowEditColumn[];
   rows: (string | number | null)[][];
@@ -597,12 +840,12 @@ export class ConfirmRequiredError extends Error {
   }
 }
 
-async function request<T>(url: string, body?: unknown, method?: string): Promise<T> {
-  const res = await fetch(url, body === undefined && !method
+async function request<T>(url: string, body?: unknown, method?: string, headers?: Record<string, string>): Promise<T> {
+  const res = await fetch(url, body === undefined && !method && !headers
     ? undefined
     : {
-        method: method ?? "POST",
-        headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        method: method ?? (body === undefined ? 'GET' : 'POST'),
+        headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...headers },
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
   const data = await res.json().catch(() => ({}));
@@ -647,11 +890,27 @@ export const api = {
   /** test an existing connection — empty password means "use the stored one" */
   testExisting: (id: string, cfg: LiveConnConfig) => request<TestResult>(`/api/connections/${id}/test`, cfg),
   create: (cfg: LiveConnConfig) => request<{ id: string }>("/api/connections", cfg),
+  /** Unpack an Oracle Cloud wallet zip on the backend and list the services inside it. The
+   *  wallet files stay server-side; the browser only ever holds the id and the alias list. */
+  uploadWallet: (data: string) => request<WalletInfo>("/api/wallets", { data }),
+  /** The services of an already-uploaded wallet — how editing a wallet connection repopulates. */
+  wallet: (id: string) => request<WalletInfo>(`/api/wallets/${id}`),
   update: (id: string, cfg: LiveConnConfig) => request<{ ok: boolean }>(`/api/connections/${id}`, cfg, "PUT"),
   // through request(), not a bare fetch: fetch resolves on 4xx/5xx, so a failed DELETE
   // used to look like a success and the connection vanished from the UI while the
   // backend still held it — and its password
   remove: (id: string) => request<{ ok: boolean }>(`/api/connections/${id}`, undefined, "DELETE"),
+  /** Passphrase-encrypted export of saved connections (passwords included, encrypted
+   *  server-side). `ids` omitted means every saved connection. */
+  exportConnections: (password: string, ids?: string[]) =>
+    request<{ file: ConnectionExportFile; count: number }>("/api/connections/export", { password, ids }),
+  /** Decrypt an uploaded export and describe it — metadata only, nothing is written. */
+  previewConnectionImport: (file: unknown, password: string) =>
+    request<ImportPreview>("/api/connections/import/preview", { file, password }),
+  /** Apply an import. `indexes` picks entries from the file; `mode` decides what happens to
+   *  an entry that points where a saved connection already points. */
+  importConnections: (file: unknown, password: string, indexes: number[], mode: "skip" | "replace") =>
+    request<ConnectionImportResult>("/api/connections/import", { file, password, indexes, mode }),
   /** close the pooled sessions but keep the saved connection */
   disconnect: (id: string) => request<DisconnectResult>(`/api/connections/${id}/disconnect`, {}),
   /** close the pooled sessions and open a fresh one */
@@ -660,6 +919,12 @@ export const api = {
   /** re-read a single group of the tree (Procedures, Packages, …) instead of the whole catalog */
   schemaGroup: (id: string, label: string) =>
     request<SchemaGroupResult>(`/api/connections/${id}/schema/group?label=${encodeURIComponent(label)}`),
+  dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`),
+  sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`),
+  killSession: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
+    request<{ ok: boolean }>(`/api/connections/${id}/sessions/kill`, session),
+  dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),
+  dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`),
   dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`),
   perf: (id: string) => request<PerfReport>(`/api/connections/${id}/perf`),
   deps: (id: string, name: string) => request<DepsReport>(`/api/connections/${id}/deps?name=${encodeURIComponent(name)}`),
@@ -676,6 +941,34 @@ export const api = {
     request<InvalidReport>(`/api/connections/${id}/compile/invalid?${compileScopeQuery(ref)}`),
   compileInvalid: (id: string, ref: CompileScopeRef, confirm = false) =>
     request<CompileBatchResult>(`/api/connections/${id}/compile/invalid`, { ...ref, confirm }),
+  /**
+   * What copying `sourceId`'s objects of one kind into `targetId` would do — a read of both
+   * dictionaries that changes neither. Addressed by the **target**, which is the connection
+   * about to be written to and therefore the one the server's guards are about.
+   */
+  objectCopyPlan: (targetId: string, sourceId: string, kind: CopyKind) =>
+    request<ObjectCopyPlan>(
+      `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
+    ),
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, mode: 'append' | 'replace' = 'append') =>
+    request<{ tables: { name: string; rows: number }[]; totalRows: number; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, mode }),
+  checkTableData: (targetId: string, sourceId: string, names: string[]) =>
+    request<{ occupied: string[]; sourceCounts: Record<string, number>; sourceTotal: number }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, checkOnly: true }),
+  tableDataPlan: (targetId: string, sourceId: string) =>
+    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
+  /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */
+  objectCopy: (
+    targetId: string,
+    req: {
+      sourceId: string;
+      kind: CopyKind;
+      existing: CopyExisting;
+      /** the objects to copy; omitted (not empty) means every object of the kind */
+      names?: string[];
+      preserveTablespace: boolean;
+    },
+    confirm = false
+  ) => request<ObjectCopyResult>(`/api/connections/${targetId}/objects/copy`, { ...req, confirm }),
   versions: (id: string) => request<{ connKey: string; objects: VersionSummary[] }>(`/api/connections/${id}/versions`),
   versionsOf: (id: string, name: string, type: string) =>
     request<VersionFile>(`/api/connections/${id}/versions/object?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`),
@@ -686,7 +979,8 @@ export const api = {
    * Mutating calls carry `confirm` — false (the default) makes the backend describe the
    * change instead of running it. Only pass true right after a user confirmed *this* action.
    */
-  query: (id: string, sql: string, confirm = false) => request<LiveQueryResult>(`/api/connections/${id}/query`, { sql, confirm }),
+  startWorksheetSession: (id: string) => request<{ transactionId: string }>(`/api/connections/${id}/worksheet-session`, {}),
+  query: (id: string, sql: string, confirm = false, transactionId?: string, closeTransaction = false) => request<LiveQueryResult>(`/api/connections/${id}/query`, { sql, confirm, transactionId, closeTransaction }),
   explain: (id: string, sql: string) => request<ExplainResult>(`/api/connections/${id}/explain`, { sql }),
   importData: (id: string, req: ImportRequest, confirm = false) =>
     request<ImportResult>(`/api/connections/${id}/import`, { ...req, confirm }),
@@ -694,10 +988,14 @@ export const api = {
   applyTableDdl: (id: string, statements: string[], confirm = false) =>
     request<ApplyTableResult>(`/api/connections/${id}/table/apply`, { statements, confirm }),
   /** Rows of a table plus their ROWIDs — the Data Browser edit-mode read (any browsing role). */
-  tableRows: (id: string, name: string) => request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`),
+  tableRows: async (id: string, name: string, transactionId?: string) => {
+    const result = await request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`, undefined, undefined, transactionId ? { 'X-Dataforge-Transaction': transactionId } : undefined);
+    if (transactionId && result.manualTransaction !== true) throw new Error('The API needs a restart to support table transactions. Commit or roll back existing worksheet work before restarting it. No row changes were sent.');
+    return result;
+  },
   /** Insert / update / delete one row. Unacknowledged calls come back as ConfirmRequiredError. */
-  changeTableRow: (id: string, req: RowChangeRequest, confirm = false) =>
-    request<RowChangeResult>(`/api/connections/${id}/table/rows`, { ...req, confirm }),
+  changeTableRow: (id: string, req: RowChangeRequest, confirm = false, transactionId?: string) =>
+    request<RowChangeResult>(`/api/connections/${id}/table/rows`, { ...req, confirm, transactionId }),
   tableStats: (id: string, name: string) => request<TableStats>(`/api/connections/${id}/table/stats?name=${encodeURIComponent(name)}`),
   tableStatsAction: (id: string, name: string, action: StatsAction, confirm = false) =>
     request<{ ok: boolean; action: StatsAction }>(`/api/connections/${id}/table/stats`, { name, action, confirm }),

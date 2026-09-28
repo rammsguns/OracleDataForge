@@ -1,0 +1,614 @@
+/**
+ * Copying objects of one kind from one Oracle connection into another: the parts of it that
+ * are pure text, kept out of `index.ts` for the same reason `connectionRole.ts` and
+ * `oracleWallet.ts` are.
+ *
+ * Everything here decides what will be *run against a live database*, and every mistake it
+ * can make is quiet rather than loud. A statement whose terminator is stripped when it should
+ * not be fails with a syntax error naming a line the user never wrote; one whose terminator is
+ * *kept* when it should not be fails the same way. A schema qualifier left pointing at the
+ * source is worse still: the copied object is created, it is VALID, and it reads the source
+ * database forever.
+ *
+ * `index.ts` owns the Oracle side: which dictionary view lists a kind, how its DDL is read,
+ * and how the statements are applied and reported.
+ */
+
+/**
+ * One kind of object a copy can move.
+ *
+ * A union rather than a bare string, so the compiler points at every place a new kind has to
+ * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
+ * — for a kind built on a table — the query that says which table each one belongs to.
+ */
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers";
+
+export interface CopyKindSpec {
+  kind: CopyKind;
+  /** what the UI calls it — read as "12 Tables", so it is plural */
+  label: string;
+  /** USER_OBJECTS.object_type this kind lists, and the word a `DROP` for it uses */
+  objectType: string;
+  /**
+   * What DBMS_METADATA calls this kind, when that is not what the dictionary calls it.
+   *
+   * The two vocabularies agree for most objects and then do not: `user_objects` says
+   * `MATERIALIZED VIEW` and `GET_DDL` wants `MATERIALIZED_VIEW`, the same way it wants
+   * `REF_CONSTRAINT` and `DB_LINK`. Passing the dictionary's spelling to `GET_DDL` earns an
+   * ORA-31600 that names the parameter rather than the mistake, so the difference is written
+   * down here once instead of being discovered per kind. Absent means the two agree.
+   */
+  metadataType?: string;
+  /** Body included in metadata and compilation checks. */
+  bodyType?: string;
+  /**
+   * Objects of this kind can own foreign keys, so the run adds them in a second pass once
+   * every object it is copying exists. Only tables can, but the flag is what keeps the pass
+   * from running for a kind that has nothing to add.
+   */
+  foreignKeys: boolean;
+  /**
+   * Objects of this kind are built *on* something else, so one cannot land before that does.
+   * The run looks for the base object in the target first and reports a missing one as a skip
+   * that names it, rather than letting `CREATE` fail with an ORA-00942 that names nothing
+   * useful.
+   */
+  requiresTable: boolean;
+  /**
+   * What the base object can be, for a kind that has one — `copyBaseKinds` reads it.
+   *
+   * An index is built on a table and nothing else. A trigger is built on a table *or* a view,
+   * because an `INSTEAD OF` trigger is how a view is written to at all, and a run that looked
+   * only among the target's tables would report every one of those as blocked by a view that
+   * is sitting right there. Absent means the table alone, which is the older and commoner
+   * case; meaningless without `requiresTable`.
+   */
+  baseKinds?: CopyKind[];
+  /**
+   * Objects of this kind occupy a segment, so "keep the source tablespace" means something for
+   * them. A sequence is a row in the dictionary and lives nowhere, so the choice is not offered
+   * for it rather than offered and quietly ignored.
+   */
+  hasTablespace: boolean;
+  /**
+   * Replacing one of these *is* the create statement. DBMS_METADATA emits `CREATE OR REPLACE`
+   * for a view, so dropping it first would buy nothing and cost the grants on it along with
+   * the validity of everything selecting from it. The run lets the new definition land on the
+   * old one instead, and never asks for a `DROP` at all.
+   */
+  replaceInPlace: boolean;
+  /**
+   * Objects of this kind are compiled, so one can be created and still not work.
+   *
+   * A view arrives as `CREATE ... FORCE VIEW`, which is what makes the order views are copied
+   * in irrelevant — the same bet `REF_CONSTRAINTS=FALSE` makes for tables, since alphabetical
+   * order puts plenty of views before the views and tables they select from. The price is that
+   * one whose dependencies are not in the target is created INVALID rather than refused, so
+   * the run asks the target which of the ones it just created are invalid and says which.
+   * Without that a copy reports a green "created" for a view that raises ORA-04063 the first
+   * time anybody selects from it.
+   *
+   * A synonym is not compiled in that sense at all — it is a name and a target, and Oracle
+   * creates one for an object that is not there. The flag is set for it anyway because what
+   * it buys is the same question asked of the target afterwards, at the cost of one query:
+   * a dangling synonym the target marks INVALID is then reported as created-and-not-working
+   * rather than as a plain success. Whether Oracle marks one at all is the single thing here
+   * that a real database has to answer, and `docs/known_limitations.md` says so; a target
+   * that calls them all VALID makes this a query that finds nothing, which is a gap in the
+   * report rather than a wrong line in it.
+   */
+  compiled: boolean;
+  /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
+  note: string;
+  /** what replacing an existing one costs here — a table, an index and a view are three different bets */
+  replaceNote: string;
+}
+
+/**
+ * Every kind a copy can move, in the order the UI offers them.
+ *
+ * One kind is copied per run. That is the shape of the feature rather than a limitation of
+ * this array: a run reads one listing, one kind of DDL, and reports one kind of outcome, so
+ * what it did is legible from the result instead of having to be untangled from it. Copying a
+ * schema is then several runs in the order the kinds are listed here, each one confirmed and
+ * reported on its own.
+ *
+ * Types precede tables that may use them; routines precede triggers that may call them.
+ * This is a suggested order, not a dependency sort: cross-kind and cyclic references may
+ * require additional runs and recompilation after dependencies arrive.
+ */
+export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
+  {
+    kind: "sequences",
+    label: "Sequences",
+    objectType: "SEQUENCE",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: false,
+    compiled: false,
+    note: "The sequence and the number it has reached in the source, so the copy carries on from there rather than starting again at 1. Not the tables, defaults or triggers that use it.",
+    replaceNote:
+      "Each existing sequence is dropped and recreated at the source's number. A target sequence that has gone further will hand out numbers it has already given away, which is a duplicate key waiting to happen.",
+  },
+  {
+    kind: "types", label: "Types", objectType: "TYPE",
+    bodyType: "TYPE BODY",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The specification and body, when present. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected. Oracle may refuse replacement of a type with dependents. No DROP or FORCE fallback is attempted.",
+  },
+  {
+    kind: "tables",
+    label: "Tables",
+    objectType: "TABLE",
+    foreignKeys: true,
+    requiresTable: false,
+    hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
+    note: "Columns, defaults, constraints and, once every table is there, foreign keys. Not the rows or the indexes.",
+    replaceNote:
+      "Each existing table is dropped before it is recreated. A dropped table takes its rows with it and does not go to the recycle bin.",
+  },
+  {
+    kind: "indexes",
+    label: "Indexes",
+    objectType: "INDEX",
+    foreignKeys: false,
+    requiresTable: true,
+    hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
+    note: "The indexes someone created, on tables the target already has. Not the ones Oracle built for a primary or unique key — those arrive with the table.",
+    replaceNote:
+      "Each existing index is dropped before it is recreated. That costs the time to rebuild it and queries run without it in between, but no data goes with it.",
+  },
+  {
+    kind: "views",
+    label: "Views",
+    objectType: "VIEW",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The view's own SELECT as the source wrote it, with any schema qualifier inside it repointed at the target. Not the tables it reads: a view whose tables are not there yet is still created, and stays invalid until they are.",
+    replaceNote:
+      "Each existing view is replaced in place rather than dropped, so the grants on it and the views built on it survive. No data moves, but everything selecting from it sees the source's columns from that moment on.",
+  },
+  {
+    kind: "mviews",
+    label: "Materialized Views",
+    objectType: "MATERIALIZED VIEW",
+    metadataType: "MATERIALIZED_VIEW",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: true,
+    replaceInPlace: false,
+    compiled: false,
+    note: "The materialized view and its query — and, because Oracle builds it the way the source wrote it, the rows that query returns against the target's own tables. This is the one kind that moves data and the one that can take a while. Not the materialized view log, and not anything the source's refresh schedule depends on.",
+    replaceNote:
+      "Each existing materialized view is dropped and rebuilt from the target's tables, so the rows it is holding now are thrown away and computed again. That costs the build, and anything querying it in between finds it missing rather than stale.",
+  },
+  {
+    kind: "synonyms",
+    label: "Synonyms",
+    objectType: "SYNONYM",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The name and what it points at — repointed at the target where the source's synonym named one of its own objects, and left alone where it named a third schema, which is the difference that decides whether the copy reads the target or the source from then on. Not the object itself: a synonym is only a name, so one for a table, package or database link the target has not got is created all the same and answers ORA-00980 the first time anything uses it. Public synonyms belong to the database rather than to this schema and are not offered.",
+    replaceNote:
+      "Each existing synonym is replaced in place rather than dropped, so the grants on it survive. What the name means changes at that moment though, and nothing in the target has to be recompiled for it to: every query that goes through the name reads whatever the source's synonym pointed at, which may be another table or another schema entirely.",
+  },
+  {
+    kind: "packages", label: "Packages", objectType: "PACKAGE",
+    bodyType: "PACKAGE BODY",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The specification and body, when present. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
+  },
+  {
+    kind: "procedures", label: "Procedures", objectType: "PROCEDURE",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The standalone PL/SQL definition; packaged routines arrive with their package. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
+  },
+  {
+    kind: "functions", label: "Functions", objectType: "FUNCTION",
+    foreignKeys: false, requiresTable: false, hasTablespace: false,
+    replaceInPlace: true, compiled: true,
+    note: "The standalone PL/SQL definition; packaged routines arrive with their package. Source schema qualifiers are repointed at the target. Dependencies and grants are not copied; invalid compilation is reported.",
+    replaceNote: "Replaced in place with CREATE OR REPLACE, preserving grants. Dependencies can become invalid and active sessions can be affected.",
+  },
+  {
+    kind: "triggers",
+    label: "Triggers",
+    objectType: "TRIGGER",
+    foreignKeys: false,
+    requiresTable: true,
+    baseKinds: ["tables", "views"],
+    hasTablespace: false,
+    replaceInPlace: true,
+    compiled: true,
+    note: "The trigger's PL/SQL as the source wrote it, on the table or view it fires for, and enabled or disabled the way the source has it. Not what that code calls: a trigger whose packages or tables are not in the target is still created, and stays invalid until they are. Triggers on the schema or the database itself are not offered — those are not part of copying a schema's objects.",
+    replaceNote:
+      "Each existing trigger is replaced in place rather than dropped, so the table is never briefly without one. What it does changes at that moment though: from then on every insert, update and delete on that table runs the source's code rather than the target's.",
+  },
+];
+
+/** Canonical position of each kind — small, but consulted once per copied object. */
+const KIND_ORDER = new Map<CopyKind, number>(OBJECT_COPY_KINDS.map((k, i) => [k.kind, i]));
+
+export const copyKindSpec = (kind: CopyKind): CopyKindSpec => OBJECT_COPY_KINDS[KIND_ORDER.get(kind)!];
+
+/** Every kind there is, in the order they are offered. */
+export const ALL_COPY_KINDS: CopyKind[] = OBJECT_COPY_KINDS.map((k) => k.kind);
+
+/** What a copy moves when nothing is chosen. */
+export const DEFAULT_COPY_KIND: CopyKind = "tables";
+
+/**
+ * The kind an untrusted value asks for, or the default when it asks for nothing this app
+ * copies.
+ *
+ * A whitelist, like `normalizeRole`: the value arrives as a request body or a query string,
+ * and whatever survives it decides which DDL is read and run against a live database. An
+ * unrecognised kind falls back to the documented default rather than being passed through to
+ * a listing query that has no entry for it.
+ */
+export function normalizeKind(value: unknown): CopyKind {
+  if (typeof value !== "string") return DEFAULT_COPY_KIND;
+  const asked = value.trim().toLowerCase();
+  return ALL_COPY_KINDS.find((k) => k === asked) ?? DEFAULT_COPY_KIND;
+}
+
+/**
+ * The objects an untrusted list asks for, or null when it asks for none in particular.
+ *
+ * `available` is the source dictionary's own listing, and the answer is an intersection with
+ * it — which is the point. Names arrive in a request body and end up as the argument to
+ * `dbms_metadata.get_ddl` and inside a `DROP`, so a name that is not in the listing is dropped
+ * rather than passed through: what cannot be named cannot be read or dropped, whether it was
+ * mistyped, dropped since the plan was read, or made up.
+ *
+ * Null means the request named nothing at all, which the caller reads as "everything of this
+ * kind". An empty array is different, and deliberately so: the request *did* name objects and
+ * none of them exist, so the caller copies nothing and says so rather than falling back to
+ * copying the whole schema. Matching is exact, because the dictionary's spelling of a name is
+ * the object's actual name and case is part of it.
+ *
+ * The result is in `available` order, so a run walks the dictionary's order however the
+ * request happened to be sorted.
+ */
+export function normalizeNames(value: unknown, available: string[]): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const asked = new Set(value.filter((v): v is string => typeof v === "string").map((v) => v.trim()));
+  return available.filter((name) => asked.has(name));
+}
+
+/**
+ * The DBMS_METADATA transform parameters the *source* session reads DDL with.
+ *
+ * `EMIT_SCHEMA=FALSE` is the important one: without it every statement names the source
+ * schema and the copy recreates the source's objects, in the source, from the target's
+ * session. `CONSTRAINTS=TRUE` keeps the primary key, the unique keys and the check
+ * constraints, which belong to the table alone.
+ *
+ * `REF_CONSTRAINTS=FALSE` takes the foreign keys out of `CREATE TABLE` — not to drop them, but
+ * because one names a second table this run may not have copied yet, and alphabetical order
+ * puts plenty of children before their parents. They are added afterwards instead, by a second
+ * pass over the tables that landed, which is what makes the order they were created in
+ * irrelevant. Leaving them inside `CREATE TABLE` would fail every child copied before its
+ * parent, and those are the tables a copy is least able to retry.
+ *
+ * Both constraint parameters describe tables, and Oracle ignores them for a kind that has no
+ * constraints — which is why one set of parameters serves every kind rather than one per kind.
+ *
+ * The tablespace is the caller's choice, and the two parameters move together because Oracle
+ * makes them: `TABLESPACE=TRUE` emits nothing while `SEGMENT_ATTRIBUTES=FALSE` suppresses the
+ * whole segment clause the tablespace lives in. Off — the default — is what lets a production
+ * table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
+ * database that has no such tablespace. On is for a copy between two databases laid out the
+ * same way, where landing everything in the target's default tablespace would be the wrong
+ * answer.
+ *
+ * `STORAGE` stays off either way: `INITIAL`, `NEXT` and `MAXEXTENTS` sized for the source's
+ * data are not sizes for the target's, and preserving where a table lives is a different
+ * question from preserving how much room it was given.
+ */
+export function copyTransforms(preserveTablespace: boolean): [string, boolean][] {
+  return [
+    ["EMIT_SCHEMA", false],
+    // Explicit on pooled sessions: include both code parts and let Oracle assign new OIDs.
+    ["SPECIFICATION", true],
+    ["BODY", true],
+    ["OID", false],
+    ["SEGMENT_ATTRIBUTES", preserveTablespace],
+    ["STORAGE", false],
+    ["TABLESPACE", preserveTablespace],
+    ["REF_CONSTRAINTS", false],
+    ["CONSTRAINTS", true],
+    ["SQLTERMINATOR", true],
+    ["PRETTY", true],
+  ];
+}
+
+/**
+ * The statements inside one DBMS_METADATA answer.
+ *
+ * `GET_DDL` returns some objects as more than one statement, separated by the SQL*Plus slash
+ * on a line of its own — one CLOB holding statements the driver can only run one at a time.
+ * Splitting on that line is the whole job: a slash anywhere else (a division, a path inside a
+ * string) is left where it is. Slash-only lines inside literals and comments are also kept.
+ */
+export function splitDdl(ddl: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  for (let i = 0; i < ddl.length;) {
+    const end = copyTextEnd(ddl, i);
+    if (end !== null) { i = end; continue; }
+    if (ddl[i] === '/' && /^[ \t]*$/.test(ddl.slice(ddl.lastIndexOf('\n', i - 1) + 1, i))) {
+      const tail = ddl.slice(i).match(/^\/[ \t]*(?:\r?\n|$)/);
+      if (tail) {
+        parts.push(ddl.slice(start, i).trim());
+        i += tail[0].length;
+        start = i;
+        continue;
+      }
+    }
+    i++;
+  }
+  parts.push(ddl.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+/**
+ * Does this statement *contain* PL/SQL, and therefore end with a semicolon that belongs to it?
+ *
+ * `CREATE TABLE … ;` ends with a terminator the driver must never see. A PL/SQL block ends
+ * with `END;`, and stripping that semicolon yields `PLS-00103: Encountered the symbol
+ * "end-of-file"`. The two are indistinguishable from the end of the string, so the decision is
+ * taken from the front of it — which is what makes `prepareDdl` safe for DDL of any kind
+ * rather than only for the kinds copied today.
+ */
+export function isPlsqlDdl(sql: string): boolean {
+  return /^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?:PACKAGE|PROCEDURE|FUNCTION|TRIGGER|TYPE|LIBRARY)\b|DECLARE\b|BEGIN\b)/i.test(sql);
+}
+
+/**
+ * One statement, ready for `connection.execute`.
+ *
+ * The driver takes a single statement with no terminator, while DBMS_METADATA emits SQL*Plus
+ * script text: a trailing `/` on its own line for PL/SQL, a trailing `;` for everything else.
+ * Both go; the semicolon only when it is a terminator rather than the end of a block.
+ */
+export function prepareDdl(raw: string): string {
+  const sql = raw.replace(/\s*\r?\n[ \t]*\/[ \t]*$/, "").trim();
+  return (isPlsqlDdl(sql) ? sql : sql.replace(/;\s*$/, "")).trim();
+}
+
+/** A DBMS_METADATA answer as the runnable statements it holds, in order. */
+export function copyStatements(ddl: string): string[] {
+  return splitDdl(ddl).map(prepareDdl).filter(Boolean);
+}
+
+/**
+ * Point DDL written for one schema at another one.
+ *
+ * DBMS_METADATA is asked for unqualified DDL (`EMIT_SCHEMA=FALSE`), so most statements need
+ * nothing here. What is left is the qualification a *human* wrote — a column default calling
+ * `HR.ORDER_SEQ.NEXTVAL`, a check constraint naming `HR.SOMETHING`. Leaving those alone is the
+ * one failure mode of a copy that still looks like a success: the object is created, it is
+ * VALID, and it reads the source database.
+ *
+ * The scan skips string literals and comments, so `'Ask HR.'` in a message and a
+ * `-- HR.OLD_NAME` note are not identifiers and are not rewritten. Beyond that it is
+ * deliberately narrow: only `SOURCE.` immediately before a name is a schema qualifier, and a
+ * source and target that are the same schema make the whole pass a no-op.
+ */
+export function retargetSchema(ddl: string, from: string, to: string): string {
+  const src = from.trim().toUpperCase();
+  const dst = to.trim().toUpperCase();
+  if (!src || !dst || src === dst) return ddl;
+
+  let out = "";
+  let i = 0;
+  while (i < ddl.length) {
+    const protectedEnd = copyTextEnd(ddl, i);
+    if (protectedEnd !== null && ddl[i] !== '"') {
+      out += ddl.slice(i, protectedEnd);
+      i = protectedEnd;
+      continue;
+    }
+    const ch = ddl[i];
+    // "HR". — a quoted identifier is a schema only when a dot and a name follow it
+    if (ch === '"') {
+      const end = skipQuoted(ddl, i + 1, '"');
+      const word = ddl.slice(i + 1, end - 1);
+      const after = qualifierTail(ddl, end);
+      if (after !== null && word === src) {
+        out += `"${dst}".`;
+        i = after;
+        continue;
+      }
+      out += ddl.slice(i, end);
+      i = end;
+      continue;
+    }
+    // HR. — a bare identifier, matched only when nothing identifier-like precedes it
+    if (isIdentStart(ch) && !isIdentChar(ddl[i - 1] ?? "")) {
+      let j = i;
+      while (j < ddl.length && isIdentChar(ddl[j])) j++;
+      const word = ddl.slice(i, j);
+      const after = qualifierTail(ddl, j);
+      if (after !== null && word.toUpperCase() === src) {
+        out += `${dst}.`;
+        i = after;
+        continue;
+      }
+      out += word;
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Index just past the closing `quote`, treating a doubled one as an escape. */
+function skipQuoted(s: string, from: number, quote: string): number {
+  let i = from;
+  while (i < s.length) {
+    if (s[i] === quote) {
+      if (s[i + 1] === quote) {
+        i += 2;
+        continue;
+      }
+      return i + 1;
+    }
+    i++;
+  }
+  return s.length;
+}
+
+const isIdentStart = (c: string) => /[A-Za-z]/.test(c);
+const isIdentChar = (c: string) => /[A-Za-z0-9_$#]/.test(c);
+
+/**
+ * If the name ending at `end` is followed by `.` and another name, the index just past that
+ * dot — where a rewrite resumes. Otherwise null: it was not a schema qualifier.
+ */
+function qualifierTail(s: string, end: number): number | null {
+  let i = end;
+  while (i < s.length && /[ \t]/.test(s[i])) i++;
+  if (s[i] !== ".") return null;
+  let j = i + 1;
+  while (j < s.length && /[ \t]/.test(s[j])) j++;
+  return isIdentStart(s[j] ?? "") || s[j] === '"' ? j : null;
+}
+
+/**
+ * An Oracle identifier as a quoted literal, or null when it cannot be one at all.
+ *
+ * Names reaching this come from the source database's own dictionary rather than from a
+ * request, but they are still concatenated into a statement, so a double quote inside one is
+ * doubled rather than trusted — the same escaping `index.ts` applies to the names the row
+ * editor writes. Only a name that is empty or longer than Oracle allows is refused, because
+ * for those there is nothing to quote and no object to find; the caller reports that as a
+ * skip rather than guessing at a statement.
+ */
+export function copyIdent(name: string): string | null {
+  const n = name.trim();
+  if (!n || n.length > 128) return null;
+  return `"${n.replace(/"/g, '""')}"`;
+}
+
+/**
+ * What DBMS_METADATA calls this kind — which is not always what the dictionary calls it.
+ *
+ * Every `GET_DDL` goes through here rather than reading `objectType` directly, so a kind whose
+ * two names differ cannot be half-converted: the listing, the existence check and the `DROP`
+ * take the dictionary's word, and the metadata read takes this one.
+ */
+export const copyMetadataType = (kind: CopyKind): string => {
+  const spec = copyKindSpec(kind);
+  return spec.metadataType ?? spec.objectType;
+};
+
+/**
+ * The kinds this kind's objects are built on, and therefore the kinds the target is searched
+ * for one in. Empty for a kind that stands on its own.
+ *
+ * A trigger's base object is a table or a view, an index's is a table, and both are looked for
+ * in the same listing the run already reads — so this is what turns "is `ORDERS` in the
+ * target?" into a question with an answer, rather than a guess that would call an `INSTEAD OF`
+ * trigger's view a missing table.
+ */
+export function copyBaseKinds(kind: CopyKind): CopyKind[] {
+  const spec = copyKindSpec(kind);
+  if (!spec.requiresTable) return [];
+  return spec.baseKinds ?? ["tables"];
+}
+
+/**
+ * What to go and copy first when the base object is missing — "tables", "tables and views" —
+ * named the way the type list names those runs, because going and doing one of them is the
+ * whole point of the sentence this appears in.
+ */
+export function copyBaseLabel(kind: CopyKind): string {
+  const labels = copyBaseKinds(kind).map((k) => copyKindSpec(k).label.toLowerCase());
+  if (labels.length < 2) return labels.join("");
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
+
+/**
+ * The statement removing an object the target already has, when the copy replaces rather than
+ * skips it. Null when the name cannot be quoted safely.
+ *
+ * `CASCADE CONSTRAINTS` is what lets tables be replaced in any order — a table a foreign key
+ * points at cannot be dropped otherwise — and `PURGE` is what stops every replacement leaving
+ * a recycle-bin copy of the old table behind. Both are why "replace" is offered as the
+ * destructive choice it is rather than as a checkbox.
+ *
+ * Every other kind drops by name alone. `DROP INDEX "SALES_IX"` is a plain drop, and an index
+ * Oracle built for a constraint refuses it with ORA-02429 — which is the right answer, since
+ * that index belongs to the constraint and the copy has no business replacing it. `DROP
+ * SEQUENCE "ORDER_SEQ"` always succeeds, and leaves every default and trigger that called it
+ * invalid until the new one is there — which is why replacing a sequence says what it costs.
+ *
+ * `DROP MATERIALIZED VIEW "SALES_MV"` takes the container table and its rows with it, which is
+ * what replacing one costs and why the kind says so. The dictionary's spelling is the one a
+ * `DROP` wants, so this reads `objectType` rather than the DBMS_METADATA name beside it.
+ *
+ * A kind marked `replaceInPlace` never asks for one, because its own `CREATE OR REPLACE` is
+ * the replacement. The statement is spelled for it anyway, so this stays the single place the
+ * copy knows how to drop anything and no caller has to decide what a missing one meant.
+ */
+export function dropStatement(kind: CopyKind, name: string): string | null {
+  const spec = copyKindSpec(kind);
+  const ident = copyIdent(name);
+  if (!ident) return null;
+  if (kind === "tables") return `DROP TABLE ${ident} CASCADE CONSTRAINTS PURGE`;
+  return `DROP ${spec.objectType} ${ident}`;
+}
+
+/** "12 Tables" — how a count of one kind is named in a confirmation dialog. */
+export function copyCountLabel(kind: CopyKind, count: number): string {
+  return `${count.toLocaleString("en-US")} ${copyKindSpec(kind).label}`;
+}
+
+/** Include bodies when checking a logical object for compilation failures. */
+export function copyStatusTypes(kind: CopyKind): string[] {
+  const spec = copyKindSpec(kind);
+  return [spec.objectType, ...(spec.bodyType ? [spec.bodyType] : [])];
+}
+
+/** Skip literals, quoted identifiers and comments without interpreting their contents. */
+function copyTextEnd(s: string, i: number): number | null {
+  if ((s[i] === 'q' || s[i] === 'Q') && s[i + 1] === "'" && !isIdentChar(s[i - 1] ?? '')) {
+    const delimiter = s[i + 2];
+    if (delimiter) {
+      const close = ({ '[': ']', '{': '}', '(': ')', '<': '>' } as Record<string, string>)[delimiter] ?? delimiter;
+      const end = s.indexOf(close + "'", i + 3);
+      return end < 0 ? s.length : end + 2;
+    }
+  }
+  if (s[i] === "'" || s[i] === '"') return skipQuoted(s, i + 1, s[i]);
+  if (s.startsWith('--', i)) {
+    const end = s.indexOf('\n', i + 2);
+    return end < 0 ? s.length : end;
+  }
+  if (s.startsWith('/*', i)) {
+    const end = s.indexOf('*/', i + 2);
+    return end < 0 ? s.length : end + 2;
+  }
+  return null;
+}
