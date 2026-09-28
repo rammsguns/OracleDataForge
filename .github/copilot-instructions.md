@@ -22,7 +22,7 @@
 
 ## Verification and review
 - Use `npm run typecheck` and `npm run build` for implementation verification. Run existing relevant tests when testing is requested; do not execute SQL against a user's database merely to validate UI changes.
-- CI currently runs typecheck and build; do not describe passing CI as proof that the test suite passed.
+- CI runs typecheck, the existing test suite, and build. Report any additional targeted or browser verification separately.
 - For UI changes, report browser verification separately from compilation, including viewport and interaction checked.
 - Focus reviews on reproducible correctness, data loss, authorization, resource handling, and regressions. Include the file, relevant code, triggering scenario, and proposed correction.
 - Distinguish confirmed defects from suggestions. Avoid unrelated rewrites and unsupported findings.
