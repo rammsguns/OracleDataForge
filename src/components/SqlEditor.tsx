@@ -83,9 +83,9 @@ export default function SqlEditor({
   };
 
   return (
-    <div className="relative h-full flex flex-col bg-panel2 font-mono text-[13px] overflow-hidden" style={editor.style}>
+    <div className="relative h-full min-h-0 min-w-0 w-full flex flex-col bg-panel2 font-mono text-[13px] overflow-hidden" style={editor.style}>
       {editor.toolbar}
-      <div className="relative flex flex-1 min-h-0" style={{ background: 'var(--editor-bg, var(--panel2))' }}>
+      <div className="relative flex flex-1 min-h-0 min-w-0 overflow-hidden" style={{ background: 'var(--editor-bg, var(--panel2))' }}>
       {/* gutter */}
       <div
         ref={gutterRef}
@@ -138,10 +138,11 @@ export default function SqlEditor({
           onKeyDown={onKeyDown}
           onSelect={e => onSelectionChange?.(e.currentTarget.selectionStart, e.currentTarget.selectionEnd)}
           onScroll={() => { syncScroll(); completion.close(); }}
+          wrap="off"
           spellCheck={false}
           aria-label="SQL editor"
           title="Code suggestions: Ctrl+Space"
-          className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-auto"
+          className="worksheet-sql-input absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none"
           style={sharedStyle}
         />
         {completion.popup}

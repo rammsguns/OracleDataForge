@@ -1,6 +1,8 @@
 import { useCallback, useRef, useState } from "react";
 import {
   AlignLeft,
+  Maximize2,
+  Minimize2,
   CircleAlert,
   Clock,
   Database,
@@ -20,6 +22,7 @@ import { download } from "../utils/sql";
 
 export default function SqlWorksheet() {
   const s = useStudio();
+  const [expanded, setExpanded] = useState(false);
   const [editorPct, setEditorPct] = useState(46);
   const [view, setView] = useState<"results" | "plan">("results");
   const dragRef = useRef<HTMLDivElement>(null);
@@ -47,7 +50,7 @@ export default function SqlWorksheet() {
     : null;
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
         <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
@@ -96,13 +99,14 @@ export default function SqlWorksheet() {
       </div>
 
       {/* editor */}
-      <div className="flex flex-col flex-1 min-h-0">
-        <div style={{ height: `${editorPct}%` }} className="min-h-24">
+      <div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
+        <div hidden={expanded} style={{ height: `${editorPct}%` }} className="min-h-24 min-w-0 shrink-0 overflow-hidden">
           <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={() => s.runSql()} />
         </div>
 
         {/* splitter */}
         <div
+          hidden={expanded}
           ref={dragRef}
           role="separator"
           aria-orientation="horizontal"
@@ -117,7 +121,7 @@ export default function SqlWorksheet() {
         />
 
         {/* results area */}
-        <div className="flex-1 min-h-0 flex flex-col bg-panel">
+        <div className="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col bg-panel">
           <div className="flex items-center gap-0.5 border-b border-bdrsoft px-2 pt-1 shrink-0">
             {(["results", "plan"] as const).map((v) => (
               <button
@@ -132,6 +136,9 @@ export default function SqlWorksheet() {
                 {v === "results" ? "Query Result" : "Explain Plan"}
               </button>
             ))}
+            <button type="button" className="ml-2 flex items-center gap-1 rounded px-2 py-1 text-[11px] hover:bg-panel3" onClick={() => setExpanded((v) => !v)} aria-label={expanded ? "Restore editor" : "Expand results"} title={expanded ? "Restore editor" : "Expand results"}>
+              {expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}<span className="hidden sm:inline">{expanded ? "Restore" : "Expand"}</span>
+            </button>
             {/* execution details */}
             {s.result && !s.running && (
               <div className="ml-auto flex items-center gap-3 pr-2 pb-1 text-[11.5px] text-soft">
@@ -155,7 +162,7 @@ export default function SqlWorksheet() {
             )}
           </div>
 
-          <div className="flex-1 min-h-0">
+          <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
             {s.running ? (
               <div className="h-full flex items-center justify-center">
                 <Spinner label="Executing statement…" />

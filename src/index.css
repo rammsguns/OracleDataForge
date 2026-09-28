@@ -157,3 +157,29 @@ kbd {
   outline-offset: -1px;
   border-radius: 4px;
 }
+
+/* Keep horizontal navigation visible, including when the result viewport is tall. */
+.horizontal-scrollbar {
+  height: 18px;
+  overflow-x: scroll;
+  overflow-y: hidden;
+  scrollbar-width: auto;
+  scrollbar-color: var(--accent) var(--panel2);
+  background: var(--panel2);
+}
+.horizontal-scrollbar::-webkit-scrollbar { height: 16px; }
+.horizontal-scrollbar::-webkit-scrollbar-thumb { background-color: var(--accent); }
+.horizontal-scrollbar::-webkit-scrollbar-track { background: var(--panel2); }
+
+/* The worksheet uses the textarea's own scrollbar, so caret movement and
+   horizontal navigation always use the same scroll position. */
+.worksheet-sql-input {
+  overflow-x: scroll;
+  overflow-y: auto;
+  scrollbar-width: auto;
+  scrollbar-color: var(--accent) var(--panel2);
+  scrollbar-gutter: stable;
+}
+.worksheet-sql-input::-webkit-scrollbar { width: 16px; height: 16px; }
+.worksheet-sql-input::-webkit-scrollbar-thumb { background-color: var(--accent); }
+.worksheet-sql-input::-webkit-scrollbar-track { background: var(--panel2); }
