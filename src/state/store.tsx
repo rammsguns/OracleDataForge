@@ -1,3 +1,4 @@
+import { worksheetStatement } from "../utils/worksheetStatement";
 import {
   createContext,
   useCallback,
@@ -17,7 +18,7 @@ import type {
   TabKind,
   Toast,
 } from "../types";
-import { api, type ExplainResult, type SessionInfo } from "../utils/api";
+import { api, type ExplainResult, type SessionInfo, type RowChangeRequest, type RowChangeResult } from "../utils/api";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { destructiveCheck, formatSql, isReadOnlySql } from "../utils/sql";
@@ -51,6 +52,8 @@ interface Store {
   removeConnection: (id: string) => void;
   /** close the pooled sessions of a live connection (it stays saved) */
   disconnectConn: (id: string) => Promise<void>;
+  /** close the sessions of every connected connection in one pass */
+  disconnectAll: () => Promise<void>;
   /** close and re-open the sessions of a live connection, and make it the active one */
   reconnectConn: (id: string) => Promise<void>;
   /** connection being edited in the wizard, or null when creating a new one */
@@ -79,7 +82,15 @@ interface Store {
 
   sql: string;
   setSql: (s: string) => void;
+  setSqlSelection: (start: number, end: number) => void;
   running: boolean;
+  autoCommit: boolean;
+  transactionBusy: boolean;
+  toggleAutoCommit: () => void;
+  finishTransaction: (action: 'COMMIT' | 'ROLLBACK', close?: boolean, id?: string) => Promise<void>;
+  getTransactionId: (id: string) => string | undefined;
+  isAutoCommit: (id: string) => boolean;
+  changeTableRow: (id: string, request: RowChangeRequest, confirmed?: boolean) => Promise<RowChangeResult>;
   result: ResultSet | null;
   runSql: (override?: string) => void;
   doFormat: () => void;
@@ -113,6 +124,14 @@ interface Store {
   setWizardOpen: (v: boolean) => void;
   importOpen: boolean;
   setImportOpen: (v: boolean) => void;
+  /** the "export connections to an encrypted file" dialog */
+  exportConnsOpen: boolean;
+  setExportConnsOpen: (v: boolean) => void;
+  /** the "import connections from an encrypted file" dialog */
+  importConnsOpen: boolean;
+  setImportConnsOpen: (v: boolean) => void;
+  /** re-read the backend registry — what an import lands in */
+  refreshConnections: () => Promise<void>;
 
   selectedObject: string | null;
   setSelectedObject: (o: string | null) => void;
@@ -236,6 +255,26 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [activeTabId, setActiveTabId] = useState("t1");
   const [sql, setSql] = useState(INITIAL_SQL);
   const [running, setRunning] = useState(false);
+  const [transactions, setTransactions] = useState<Record<string, string>>(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('dataforge.worksheet.sessions') ?? '{}');
+      return saved && typeof saved === 'object' && !Array.isArray(saved)
+        ? Object.fromEntries(Object.entries(saved).filter(([, v]) => typeof v === 'string')) as Record<string, string> : {};
+    } catch { return {}; }
+  });
+  const transactionsRef = useRef(transactions);
+  transactionsRef.current = transactions;
+  const [transactionBusy, setTransactionBusy] = useState(false);
+  const worksheetBusy = useRef(false);
+  // A manual session is opened lazily on the first run. Absence of a session must
+  // never imply permission to auto-commit a new connection's worksheet.
+  const [autoCommitEnabled, setAutoCommitEnabled] = useState<Record<string, boolean>>({});
+  const autoCommitEnabledRef = useRef(autoCommitEnabled);
+  autoCommitEnabledRef.current = autoCommitEnabled;
+  const autoCommit = autoCommitEnabled[activeConnId] === true;
+  useEffect(() => {
+    try { sessionStorage.setItem('dataforge.worksheet.sessions', JSON.stringify(transactions)); } catch { /* unavailable */ }
+  }, [transactions]);
   const [result, setResult] = useState<ResultSet | null>(null);
   const [planVisible, setPlanVisible] = useState(false);
   const [plan, setPlan] = useState<ExplainResult | null>(null);
@@ -248,9 +287,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [editingConn, setEditingConn] = useState<Connection | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  const [exportConnsOpen, setExportConnsOpen] = useState(false);
+  const [importConnsOpen, setImportConnsOpen] = useState(false);
   const [selectedObject, setSelectedObject] = useState<string | null>(null);
   const [editDataRequest, setEditDataRequest] = useState<string | null>(null);
 
+  const sqlSelection = useRef({ start: 0, end: 0, source: sql });
+  const setSqlSelection = useCallback((start: number, end: number) => { sqlSelection.current = { start, end, source: sqlRef.current }; }, []);
   const sqlRef = useRef(sql);
   sqlRef.current = sql;
   const tabsRef = useRef(tabs);
@@ -292,53 +335,54 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     }
   }, [connections]);
 
-  // Reconcile with the backend registry once on load. localStorage paints instantly (no
-  // flash of an empty list) but it is per-browser: a different browser, profile or machine
-  // used to show "No connections yet" while the server still held them. The registry is the
-  // owner of *which* connections exist; localStorage only keeps the per-browser colour.
-  // Nothing here opens a session — everything comes back `idle`, as on any reload.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { connections: stored } = await api.list();
-        if (cancelled) return;
-        setConnections((prev) => {
-          const byId = new Map(prev.map((c) => [c.id, c]));
-          return stored.map((s, i) => {
-            const old = byId.get(s.id);
-            return {
-              id: s.id,
-              name: s.name,
-              engine: s.engine as Connection["engine"],
-              host: s.host,
-              port: s.port,
-              user: s.user,
-              database: s.database,
-              readOnly: s.readOnly,
-              live: true,
-              status: "idle" as const,
-              // keep the colour this browser already showed, so the list doesn't reshuffle
-              color: old?.color ?? CONN_COLORS[i % CONN_COLORS.length],
-            };
-          });
+  // Reconcile with the backend registry. localStorage paints instantly (no flash of an empty
+  // list) but it is per-browser: a different browser, profile or machine used to show "No
+  // connections yet" while the server still held them. The registry is the owner of *which*
+  // connections exist; localStorage only keeps the per-browser colour. Nothing here opens a
+  // session — everything comes back `idle`, as on any reload.
+  //
+  // Called once on mount, and again after an import, which is the one way the registry gains
+  // connections this browser has never seen.
+  const refreshConnections = useCallback(async () => {
+    try {
+      const { connections: stored } = await api.list();
+      setConnections((prev) => {
+        const byId = new Map(prev.map((c) => [c.id, c]));
+        return stored.map((s, i) => {
+          const old = byId.get(s.id);
+          return {
+            id: s.id,
+            name: s.name,
+            engine: s.engine as Connection["engine"],
+            host: s.host,
+            port: s.port,
+            user: s.user,
+            database: s.database,
+            readOnly: s.readOnly,
+            role: s.role,
+            authMode: s.authMode,
+            walletId: s.walletId,
+            live: true,
+            status: "idle" as const,
+            // keep the colour this browser already showed, so the list doesn't reshuffle
+            color: old?.color ?? CONN_COLORS[i % CONN_COLORS.length],
+          };
         });
-        // Point the active connection at something that exists. It is seeded from
-        // localStorage, so a fresh browser (or one whose connection was deleted elsewhere)
-        // held "" or a dead id — and every `activeConn` lookup then came back undefined,
-        // which the panels used to read as "not live" and answer with sample data.
-        setActiveConnId((cur) => (stored.some((c) => c.id === cur) ? cur : stored[0]?.id ?? ""));
-      } catch {
-        /* backend unreachable — keep whatever localStorage had rather than blanking the list */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // once, on mount: the registry only changes through this app's own create/edit/delete,
-    // which already update `connections` directly
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+      });
+      // Point the active connection at something that exists. It is seeded from
+      // localStorage, so a fresh browser (or one whose connection was deleted elsewhere)
+      // held "" or a dead id — and every `activeConn` lookup then came back undefined,
+      // which the panels used to read as "not live" and answer with sample data.
+      setActiveConnId((cur) => (stored.some((c) => c.id === cur) ? cur : stored[0]?.id ?? ""));
+    } catch {
+      /* backend unreachable — keep whatever localStorage had rather than blanking the list */
+    }
   }, []);
+
+  // on mount: create/edit/delete update `connections` directly, so nothing else has to re-read
+  useEffect(() => {
+    void refreshConnections();
+  }, [refreshConnections]);
 
   // keep query history across page reloads (capped to the most recent HIST_MAX)
   useEffect(() => {
@@ -447,9 +491,76 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setHistory((h) => [entry, ...h].slice(0, HIST_MAX));
   }, []);
 
+  const getTransactionId = useCallback((id: string) => transactionsRef.current[id], []);
+  const isAutoCommit = useCallback((id: string) => autoCommitEnabledRef.current[id] === true, []);
+  const changeTableRow = useCallback(async (id: string, request: RowChangeRequest, confirmed = false) => {
+    if (worksheetBusy.current) throw new Error('Wait for the current transaction operation to finish.');
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      let token = transactionsRef.current[id];
+      if (!token && !autoCommitEnabledRef.current[id]) {
+        const session = await api.startWorksheetSession(id);
+        token = session.transactionId;
+        transactionsRef.current = { ...transactionsRef.current, [id]: token };
+        setTransactions(current => ({ ...current, [id]: session.transactionId }));
+        setConnStatus(id, 'connected');
+      }
+      // Refuse older API processes that ignore transaction tokens before sending a write.
+      if (token) await api.tableRows(id, request.table, token);
+      return await api.changeTableRow(id, request, confirmed, token);
+    } finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [setConnStatus]);
+
+  const finishTransaction = useCallback(async (action: 'COMMIT' | 'ROLLBACK', close = false, id = activeConnRef.current?.id) => {
+    if (!id || worksheetBusy.current) return;
+    const token = transactionsRef.current[id];
+    if (!token) { toast('info', 'No worksheet transaction has started yet.'); return; }
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      const res = await api.query(id, action, true, token, close);
+      if (res.error) {
+        if (close && res.error.code === 'TRANSACTION-EXPIRED') {
+          setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
+          setAutoCommitEnabled(current => ({ ...current, [id]: true }));
+        }
+        throw new Error(res.error.message);
+      }
+      if (close) {
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
+        setAutoCommitEnabled(current => ({ ...current, [id]: true }));
+      }
+      toast('success', `${action === 'COMMIT' ? 'Committed' : 'Rolled back'} worksheet transaction${close ? ' · Auto-commit on' : ''}`);
+      setSchemaBump(b => b + 1);
+    } catch (e) { toast('error', (e as Error).message); }
+    finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [toast]);
+
+  const toggleAutoCommit = useCallback(async () => {
+    const conn = activeConnRef.current;
+    if (!conn?.live || worksheetBusy.current) return;
+    if (transactionsRef.current[conn.id]) {
+      setConfirm({ title: 'Turn auto-commit on?', body: `This commits pending worksheet changes on "${conn.name}" and closes the manual session. To discard changes, cancel and use Rollback first.`, confirmLabel: 'Commit and turn on', onConfirm: () => { void finishTransaction('COMMIT', true, conn.id); } });
+      return;
+    }
+    if (!autoCommitEnabledRef.current[conn.id]) {
+      setAutoCommitEnabled(current => ({ ...current, [conn.id]: true }));
+      toast('info', 'Auto-commit on for this worksheet connection.');
+      return;
+    }
+    worksheetBusy.current = true; setTransactionBusy(true);
+    try {
+      const res = await api.startWorksheetSession(conn.id);
+      setTransactions(current => ({ ...current, [conn.id]: res.transactionId }));
+      setAutoCommitEnabled(current => ({ ...current, [conn.id]: false }));
+      setConnStatus(conn.id, 'connected');
+      toast('info', 'Auto-commit off for this worksheet connection. Use Commit or Rollback.');
+    } catch (e) { toast('error', (e as Error).message); }
+    finally { worksheetBusy.current = false; setTransactionBusy(false); }
+  }, [toast, finishTransaction, setConnStatus]);
+
   const reallyRun = useCallback(
-    (statement: string, confirmed = false) => {
-      const conn = activeConnRef.current;
+    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? '']) => {
+      if (worksheetBusy.current) return;
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
         setResult({
@@ -463,10 +574,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("warning", "No connection selected");
         return;
       }
+      worksheetBusy.current = true;
       setRunning(true);
       setPlanVisible(false);
-      api
-        .query(conn.id, statement, confirmed)
+      (async () => {
+        if (!transactionId && !autoCommitEnabledRef.current[conn.id] && !conn.readOnly && ['Administrator', 'Developer'].includes(accessRole)) {
+          const session = await api.startWorksheetSession(conn.id);
+          transactionId = session.transactionId;
+          transactionsRef.current = { ...transactionsRef.current, [conn.id]: transactionId };
+          setTransactions(current => ({ ...current, [conn.id]: session.transactionId }));
+        }
+        return api.query(conn.id, statement, confirmed, transactionId);
+      })()
         .then((res) => {
           // the write guard held this statement back: nothing ran, so don't touch the
           // result grid or history — just ask, using the backend's own wording
@@ -477,7 +596,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
               body: g.body,
               confirmLabel: g.confirmLabel,
               danger: g.danger,
-              onConfirm: () => reallyRun(statement, true),
+              onConfirm: () => reallyRun(statement, true, conn, transactionId),
             });
             return;
           }
@@ -510,16 +629,22 @@ export function StudioProvider({ children }: { children: ReactNode }) {
             columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
             error: { message: err.message, line: 1, code: "BACKEND" },
           });
-          toast("error", "Backend unreachable — is the API server running?");
+          toast("error", err.message);
         })
-        .finally(() => setRunning(false));
+        .finally(() => { worksheetBusy.current = false; setRunning(false); });
     },
-    [toast, pushHistory, setConnStatus]
+    [accessRole, toast, pushHistory, setConnStatus]
   );
 
   const runSql = useCallback(
     (override?: string) => {
-      const statement = override ?? sqlRef.current;
+      let statement = override;
+      if (statement === undefined) {
+        const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
+        try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
+        catch (error) { toast("warning", (error as Error).message); return; }
+      }
+      if (!statement.trim()) { toast("info", "Place the cursor inside a statement to run it."); return; }
       if (accessRole === "Analyst") {
         toast("warning", "Analyst access is limited to table data");
         return;
@@ -557,7 +682,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const runExplain = useCallback(() => {
     const conn = activeConnRef.current;
-    const statement = sqlRef.current.trim();
+    let statement: string;
+    const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
+    try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
+    catch (error) { toast("warning", (error as Error).message); return; }
+    if (!statement) return;
     if (!conn?.live) {
       setPlan({
         engine: "oracle", plan: null, totalCost: 0,
@@ -636,6 +765,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       if (!conn?.live) return;
       try {
         const r = await api.disconnect(id);
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         setConnStatus(id, "idle");
         setSchemaBump((b) => b + 1); // drop the cached catalog of the closed session
         toast("info", r.wasOpen ? `"${conn.name}" disconnected` : `"${conn.name}" had no open session`);
@@ -646,12 +776,40 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [setConnStatus, toast]
   );
 
+  // One pass over every open connection, with a single summary toast: disconnecting
+  // eight of them one by one would otherwise stack eight toasts on top of each other.
+  const disconnectAll = useCallback(async () => {
+    const open = connectionsRef.current.filter((c) => c.live && c.status !== "idle");
+    if (!open.length) {
+      toast("info", "No connected connections to disconnect");
+      return;
+    }
+    const failures = await Promise.all(
+      open.map(async (c) => {
+        try {
+          await api.disconnect(c.id);
+          setTransactions(current => { const next = { ...current }; delete next[c.id]; return next; });
+          setConnStatus(c.id, "idle");
+          return null;
+        } catch (e) {
+          return `"${c.name}": ${(e as Error).message}`;
+        }
+      })
+    );
+    setSchemaBump((b) => b + 1); // drop the cached catalogs of the closed sessions
+    const failed = failures.filter((f): f is string => f !== null);
+    const closed = open.length - failed.length;
+    if (failed.length) toast("error", `Disconnected ${closed} of ${open.length} — ${failed.join("; ")}`);
+    else toast("info", `Disconnected ${closed} connection${closed === 1 ? "" : "s"}`);
+  }, [setConnStatus, toast]);
+
   const reconnectConn = useCallback(
     async (id: string) => {
       const conn = connectionsRef.current.find((c) => c.id === id);
       if (!conn?.live) return;
       try {
         const r = await api.reconnect(id);
+        setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         if (!r.ok) {
           setConnStatus(id, "error");
           toast("error", `${conn.name}: ${r.error}`);
@@ -696,6 +854,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       updateConnection,
       removeConnection,
       disconnectConn,
+      disconnectAll,
       reconnectConn,
       editingConn,
       setEditingConn,
@@ -713,7 +872,15 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       sql,
       setSql,
       running,
+      autoCommit,
+      transactionBusy,
+      toggleAutoCommit,
+      finishTransaction,
+      getTransactionId,
+      isAutoCommit,
+      changeTableRow,
       result,
+      setSqlSelection,
       runSql,
       doFormat,
       planVisible,
@@ -736,12 +903,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setWizardOpen,
       importOpen,
       setImportOpen,
+      exportConnsOpen,
+      setExportConnsOpen,
+      importConnsOpen,
+      setImportConnsOpen,
+      refreshConnections,
       selectedObject,
       setSelectedObject,
       editDataRequest,
       setEditDataRequest,
     }),
-    [accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, selectedObject, editDataRequest]
+    [getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

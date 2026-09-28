@@ -7,6 +7,8 @@ import {
   ChevronRight,
   Database,
   FileCode2,
+  FileLock2,
+  FileUp,
   FolderOpen,
   FunctionSquare,
   GitBranch,
@@ -209,11 +211,15 @@ const schemaCache: Record<string, LiveSchemaState> = {};
 /** the `schemaBump` the cache was filled at (the store starts at 0) */
 let cachedBump = 0;
 
+/** `connBusy` sentinel for an action that spans every connection rather than one */
+const ALL_BUSY = "*";
+
 export default function Sidebar() {
   const s = useStudio();
   const [search, setSearch] = useState("");
   const [connsOpen, setConnsOpen] = useState(true);
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ Tables: true });
+  const [expandedConnId, setExpandedConnId] = useState(s.activeConnId);
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   /** how many items each group is currently rendering (see GROUP_PAGE) */
   const [shown, setShown] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
@@ -224,6 +230,13 @@ export default function Sidebar() {
 
   const q = search.trim().toLowerCase();
   const activeConn = s.connections.find((c) => c.id === s.activeConnId);
+  // Selection can also change outside the Explorer (for example after reconnecting).
+  useEffect(() => setExpandedConnId(s.activeConnId), [s.activeConnId]);
+  // Exporting connections hands out stored credentials, so it sits behind the same access
+  // boundary the backend enforces on the registry itself — the button is hidden for the
+  // read tiers rather than left to fail with a 403 when clicked.
+  const fullAccess = s.accessRole === "Administrator" || s.accessRole === "Developer";
+  const exportableConns = s.connections.filter((c) => c.live).length;
   const [liveSchemas, setLiveSchemas] = useState<Record<string, LiveSchemaState>>(() => ({ ...schemaCache }));
 
   // mirror into the module cache so the tree survives collapsing the panel. "loading" is
@@ -236,7 +249,10 @@ export default function Sidebar() {
 
   // a different schema starts from a short list again, rather than inheriting how far
   // the previous one had been expanded
-  useEffect(() => setShown({}), [s.activeConnId]);
+  useEffect(() => {
+    setShown({});
+    setOpenGroups((groups) => ({ ...groups, Tables: false }));
+  }, [s.activeConnId]);
 
   // fetch the real schema when a live connection becomes active
   useEffect(() => {
@@ -345,6 +361,22 @@ export default function Sidebar() {
     void fn(id).finally(() => setConnBusy(null));
   };
 
+  /** connections whose session is open — what "Disconnect all" would close */
+  const openConns = s.connections.filter((c) => c.live && c.status !== "idle");
+  // a bulk action belongs to no single row, so ALL_BUSY marks every one of them busy
+  const disconnectAll = () => {
+    if (connBusy) return;
+    setConnBusy(ALL_BUSY);
+    void s.disconnectAll().finally(() => setConnBusy(null));
+  };
+  const askDisconnectAll = () =>
+    s.askConfirm({
+      title: openConns.length === 1 ? "Disconnect the open connection?" : `Disconnect all ${openConns.length} connections?`,
+      body: "Their pooled sessions are closed and the browsed schemas are dropped. The connections stay saved — reconnect to open them again.",
+      confirmLabel: "Disconnect all",
+      onConfirm: disconnectAll,
+    });
+
   // successful DDL or an edited connection bumps this counter — drop all cached schemas.
   // Compared against the module-level `cachedBump` rather than "> 0": this effect also runs on
   // every *mount*, and the panel now mounts again each time it is expanded, so a plain
@@ -361,23 +393,24 @@ export default function Sidebar() {
   const liveRowCounts = liveState?.status === "ready" ? liveState.rowCounts : undefined;
   const browsed = schemaOf(activeConn) ?? schema.schemaName;
   const schemaLabel = !activeConn ? "no connection" : `${browsed} schema`;
-  const filteredConns = useMemo(
-    () => s.connections.filter((c) => !q || c.name.toLowerCase().includes(q)),
-    [s.connections, q]
-  );
+  const objectQuery = activeConn?.name.toLowerCase().includes(q) ? "" : q;
   const filteredGroups = useMemo(
     () =>
       schema.groups
         .map((g) => ({
           ...g,
-          items: g.items.filter((i) => !q || i.toLowerCase().includes(q)),
+          items: g.items.filter((i) => !objectQuery || i.toLowerCase().includes(objectQuery)),
           // null (not an empty Set) when the group reports no validity — the icons must stay
           // neutral there, since "nothing is invalid" and "we didn't check" are different claims
           invalidSet: g.invalid ? new Set(g.invalid) : null,
         }))
         // empty categories stay visible (like SQL Developer) except while searching
-        .filter((g) => (q ? g.items.length > 0 : true)),
-    [schema, q]
+        .filter((g) => (objectQuery ? g.items.length > 0 : true)),
+    [schema, objectQuery]
+  );
+  const filteredConns = useMemo(
+    () => s.connections.filter((c) => !q || c.name.toLowerCase().includes(q) || (c.id === s.activeConnId && filteredGroups.length > 0)),
+    [s.connections, s.activeConnId, q, filteredGroups]
   );
 
   // Object Editor tab — reused by kind+payload, so re-opening focuses the existing tab
@@ -389,7 +422,7 @@ export default function Sidebar() {
   const canCreateTable = canDesignTable && !activeConn?.readOnly;
   const openTableDesigner = (name: string) => s.openTab("tabledesign", `${name} (Table)`, name);
   // Row editor inside the Data tab — the same bar the backend puts on the row endpoint
-  const canEditRows = canCreateTable && (s.accessRole === "Administrator" || s.accessRole === "Developer");
+  const canEditRows = canCreateTable && fullAccess;
   const openRowEditor = (name: string) => {
     s.setEditDataRequest(name);
     s.openTab("data", name, name);
@@ -524,7 +557,10 @@ export default function Sidebar() {
           <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-mute" />
           <input
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              if (e.target.value.trim()) setExpandedConnId(s.activeConnId);
+            }}
             placeholder="Search connections & objects…"
             aria-label="Search connections and schema objects"
             className="w-full h-7.5 pl-8 pr-2 rounded-md bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
@@ -540,7 +576,29 @@ export default function Sidebar() {
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto py-1">
+      <div className="px-3 py-2 border-b border-bdrsoft bg-panel2/60 shrink-0" aria-live="polite">
+        <div className="text-[10px] font-bold uppercase tracking-wider text-mute">Selected connection</div>
+        {activeConn ? (
+          <>
+            <div className="flex items-center gap-2 min-w-0 mt-1">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[activeConn.status]}`} aria-hidden="true" />
+              <Database size={14} className="shrink-0" style={{ color: activeConn.color }} />
+              <span className="truncate text-[12px] font-semibold text-ink" title={activeConn.name}>{activeConn.name}</span>
+              <span className={`ml-auto shrink-0 text-[10px] font-semibold ${activeConn.status === "connected" ? "text-ok" : activeConn.status === "error" ? "text-err" : "text-mute"}`}>
+                {activeConn.status === "idle" ? "Offline" : activeConn.status === "error" ? "Failed" : "Connected"}
+              </span>
+            </div>
+            <div className="pl-4 mt-0.5 text-[10.5px] text-mute truncate" title={`${activeConn.user}@${activeConn.host}:${activeConn.port}${activeConn.database ? ` / ${activeConn.database}` : ""}`}>
+              {activeConn.user}@{activeConn.database || activeConn.host}
+              {activeConn.readOnly ? " · Read only" : ""}
+            </div>
+          </>
+        ) : (
+          <div className="mt-1 text-[12px] text-soft">Choose a connection below</div>
+        )}
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto py-1">
         {/* connections */}
         <button
           className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-mute hover:text-soft"
@@ -549,34 +607,104 @@ export default function Sidebar() {
         >
           {connsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           Connections
-          <span
-            role="button"
-            tabIndex={0}
-            aria-label="New connection"
-            title="New connection"
-            className="ml-auto p-0.5 rounded hover:bg-panel3 hover:text-accent"
-            onClick={(e) => {
-              e.stopPropagation();
-              s.setWizardOpen(true);
-            }}
-            onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setWizardOpen(true))}
-          >
-            <Plus size={13} />
+          <span className="text-[10px] font-normal normal-case tracking-normal">{s.connections.length}</span>
+          <span className="ml-auto flex items-center gap-0.5">
+            {fullAccess && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="Import connections from an encrypted file"
+                title="Import connections from an encrypted file"
+                className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  s.setImportConnsOpen(true);
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setImportConnsOpen(true))}
+              >
+                <FileUp size={13} />
+              </span>
+            )}
+            {fullAccess && exportableConns > 0 && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="Export connections to an encrypted file"
+                title="Export connections to an encrypted file"
+                className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  s.setExportConnsOpen(true);
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setExportConnsOpen(true))}
+              >
+                <FileLock2 size={13} />
+              </span>
+            )}
+            {openConns.length > 0 && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label={`Disconnect all ${openConns.length} open connections`}
+                title={`Disconnect all — closes the sessions of ${openConns.length} open connection${openConns.length === 1 ? "" : "s"} (they stay saved)`}
+                className="p-0.5 rounded hover:bg-panel3 hover:text-warn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  askDisconnectAll();
+                }}
+                onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), askDisconnectAll())}
+              >
+                <Unplug size={13} />
+              </span>
+            )}
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="New connection"
+              title="New connection"
+              className="p-0.5 rounded hover:bg-panel3 hover:text-accent"
+              onClick={(e) => {
+                e.stopPropagation();
+                s.setWizardOpen(true);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && (e.stopPropagation(), s.setWizardOpen(true))}
+            >
+              <Plus size={13} />
+            </span>
           </span>
         </button>
         {connsOpen && s.connections.length === 0 && (
           <p className="px-6 py-2 text-[11.5px] text-mute leading-snug">
-            No connections yet — click <Plus size={11} className="inline -mt-0.5" /> above to create a live Oracle connection.
+            No connections yet — click <Plus size={11} className="inline -mt-0.5" /> above to create a live Oracle connection
+            {fullAccess ? (
+              <>
+                , or <FileUp size={11} className="inline -mt-0.5" /> to import an encrypted export.
+              </>
+            ) : (
+              "."
+            )}
           </p>
         )}
-        {connsOpen &&
-          filteredConns.map((c) => {
+        {connsOpen && s.connections.length > 0 && filteredConns.length === 0 && (
+          <p className="px-6 py-2 text-[11px] text-mute">No matching connections</p>
+        )}
+        {connsOpen && filteredConns.length > 0 && <div className="border-b border-bdrsoft" aria-label="Saved connections">
+          {filteredConns.map((c) => {
             const startEdit = () => {
               s.setEditingConn(c);
               s.setWizardOpen(true);
             };
             const offline = c.status === "idle";
-            const busy = connBusy === c.id;
+            const busy = connBusy === c.id || connBusy === ALL_BUSY;
+            const treeOpen = expandedConnId === c.id && s.activeConnId === c.id;
+            const toggleTree = () => {
+              if (s.activeConnId === c.id) setExpandedConnId((id) => id === c.id ? "" : c.id);
+              else {
+                setExpandedConnId(c.id);
+                s.setActiveConnId(c.id);
+              }
+              if (c.status === "error") s.toast("error", `${c.name} is not connected — use Reconnect to try again.`);
+            };
             const doReconnect = () => runConnAction(c.id, s.reconnectConn);
             const doDisconnect = () => runConnAction(c.id, s.disconnectConn);
             const askRemove = () =>
@@ -607,6 +735,9 @@ export default function Sidebar() {
                             ...(offline ? [] : [{ label: "Disconnect", action: doDisconnect }]),
                           ]
                         : [{ label: "Connect", action: () => s.setActiveConnId(c.id) }]),
+                      ...(openConns.length > 0
+                        ? [{ label: `Disconnect all (${openConns.length})`, action: askDisconnectAll }]
+                        : []),
                       // opens the tab; it previews what is broken and asks before compiling
                       ...(c.engine === "oracle" && c.live
                         ? [{
@@ -614,8 +745,20 @@ export default function Sidebar() {
                             action: () => { s.setActiveConnId(c.id); s.openTab("compile", `Compile: ${c.name}`, "schema"); },
                           }]
                         : []),
+                      ...(fullAccess && c.live ? [{
+                        label: "Sessions…",
+                        action: () => { s.setActiveConnId(c.id); s.openTab("sessions", "Sessions"); },
+                      }] : []),
                       { divider: true },
                       { label: "Edit connection…", action: startEdit },
+                      // opens the dialog with every connection preselected, not just this
+                      // one — picking the subset is the dialog's job
+                      ...(fullAccess && c.live
+                        ? [
+                            { label: "Export connections…", action: () => s.setExportConnsOpen(true) },
+                            { label: "Import connections…", action: () => s.setImportConnsOpen(true) },
+                          ]
+                        : []),
                       { divider: true },
                       { label: "Remove connection…", danger: true, action: askRemove },
                     ],
@@ -624,24 +767,22 @@ export default function Sidebar() {
               >
                 {/* Keep selection and the connection name separate from the controls: on a
                     narrow Explorer the old one-row layout made both the name and buttons hard to see. */}
-                <div
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => {
-                    s.setActiveConnId(c.id);
-                    // the real driver message was toasted when the attempt failed — don't invent a code here
-                    if (c.status === "error") s.toast("error", `${c.name} is not connected — use Reconnect to try again.`);
-                  }}
-                  onKeyDown={(e) => e.key === "Enter" && s.setActiveConnId(c.id)}
-                  className="flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 cursor-pointer"
-                  title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
+                <button
+                  type="button"
+                  onClick={toggleTree}
+                  aria-expanded={treeOpen}
+                  aria-label={`${c.name} connection${treeOpen ? ", collapse schema" : ", expand schema"}`}
+                  className="w-full flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 text-left cursor-pointer"
+                  title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.role && c.role !== "default" ? ` AS ${c.role}` : ""}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
                 >
+                  {treeOpen ? <ChevronDown size={12} className="shrink-0" /> : <ChevronRight size={12} className="shrink-0" />}
                   <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
                   <Database size={13} className="shrink-0" style={{ color: c.color }} />
                   <span className="truncate font-medium">{c.name}</span>
+                  {s.activeConnId === c.id && <span className="ml-auto shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-accenthi">Selected</span>}
                   {c.readOnly && <Lock size={11} className="shrink-0 text-warn" aria-label="Read-only connection" />}
-                </div>
-                <div className="flex items-center gap-1 pl-10 pr-2 py-1 border-t border-bdrsoft/70 bg-panel2/35">
+                </button>
+                {treeOpen && <div className="flex items-center gap-1 pl-10 pr-2 py-1 border-t border-bdrsoft/70 bg-panel2/35">
                   <span className={`text-[10px] font-semibold uppercase tracking-wide ${offline ? "text-mute" : c.status === "error" ? "text-err" : "text-ok"}`}>
                     {offline ? "Offline" : c.status}
                   </span>
@@ -702,13 +843,10 @@ export default function Sidebar() {
                     <Trash2 size={12} />
                   </button>
                   </span>
-                </div>
-              </div>
-            );
-          })}
-
-        {/* schema tree (follows the active connection) */}
-        <div className="mt-2 px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-mute flex items-center gap-1.5">
+                </div>}
+                {treeOpen && <div className="border-t border-bdrsoft bg-panel/50" aria-label={`${c.name} schema tree`}>
+        {/* schema tree for the selected connection */}
+        <div className="px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-mute flex items-center gap-1.5">
           <Layers size={12} />
           {/* the schema being browsed — the Oracle user, not the service name (FREEPDB1 is the PDB) */}
           <span
@@ -812,7 +950,7 @@ export default function Sidebar() {
           </div>
         ) : (
         filteredGroups.map((g) => {
-          const open = openGroups[g.label] ?? (!!q || g.label === "Databases");
+          const open = q ? true : (openGroups[g.label] ?? g.label === "Databases");
           const limit = shown[g.label] ?? GROUP_PAGE;
           const visible = g.items.length > limit ? g.items.slice(0, limit) : g.items;
           const rest = g.items.length - visible.length;
@@ -958,6 +1096,11 @@ export default function Sidebar() {
           );
         })
         )}
+                </div>}
+              </div>
+            );
+          })}
+        </div>}
       </div>
 
       <div className="border-t border-bdrsoft px-3 py-2 text-[11px] text-mute">

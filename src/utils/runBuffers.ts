@@ -17,6 +17,9 @@ export interface BlockState {
 }
 
 export interface RunBuffer {
+  cases?: RoutineTestCase[];
+  expectation?: { enabled: boolean; value: string; isNull: boolean };
+  checkResult?: string | null;
   /** `${member.name}#${member.overload ?? ""}` of the selected member */
   memberKey: string | null;
   /** memberKey → param name → form state */
@@ -26,6 +29,15 @@ export interface RunBuffer {
   /** memberKey → block state */
   blocks: Record<string, BlockState>;
   result: RoutineRunResult | null;
+}
+
+export interface RoutineTestCase {
+  name: string;
+  memberKey: string;
+  values: Record<string, ArgState>;
+  mode: 'form' | 'block';
+  block: BlockState;
+  expectation: { enabled: boolean; value: string; isNull: boolean };
 }
 
 const buffers = new Map<string, RunBuffer>();

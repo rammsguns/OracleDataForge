@@ -37,6 +37,8 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
   const [editing, setEditing] = useState<{ rowId: string; draft: Record<string, string> } | null>(null);
   const [adding, setAdding] = useState<Record<string, string> | null>(null);
   const [busy, setBusy] = useState(false);
+  const autoCommit = s.isAutoCommit(connId);
+  const getTransactionId = s.getTransactionId;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -44,18 +46,18 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
     setEditing(null);
     setAdding(null);
     try {
-      setData(await api.tableRows(connId, table));
+      setData(await api.tableRows(connId, table, getTransactionId(connId)));
     } catch (e) {
       setError((e as Error).message);
       setData(null);
     } finally {
       setLoading(false);
     }
-  }, [connId, table]);
+  }, [connId, table, getTransactionId]);
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, s.schemaBump]);
 
   const columns = data?.columns ?? [];
   const rows = useMemo(() => data?.rows ?? [], [data]);
@@ -73,7 +75,7 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
     async (req: RowChangeRequest, confirmed = false): Promise<void> => {
       setBusy(true);
       try {
-        const r = await api.changeTableRow(connId, req, confirmed);
+        const r = await s.changeTableRow(connId, req, confirmed);
         setData((prev) => {
           if (!prev) return prev;
           const next = { ...prev, rows: prev.rows.slice(), rowIds: prev.rowIds.slice() };
@@ -102,7 +104,7 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
         } else {
           setEditing(null);
         }
-        s.toast("success", r.action === "delete" ? "Row deleted" : r.action === "insert" ? "Row inserted" : "Row saved");
+        s.toast("success", `${r.action === "delete" ? "Row deleted" : r.action === "insert" ? "Row inserted" : "Row saved"}${s.isAutoCommit(connId) ? ' · committed' : ' · pending Commit/Rollback'}`);
       } catch (e) {
         if (e instanceof ConfirmRequiredError) {
           const cf = e.confirmation;
@@ -220,6 +222,12 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
     <div className="flex flex-col h-full min-h-0">
       {/* toolbar */}
       <div className="flex items-center gap-2 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
+        <Btn variant="outline" disabled={autoCommit || busy || s.running || s.transactionBusy || !s.getTransactionId(connId) || !!editing || !!adding}
+          onClick={() => void s.finishTransaction('COMMIT', false, connId)} title="Commit all pending table and worksheet changes on this connection">Commit</Btn>
+        <Btn variant="outline" disabled={autoCommit || busy || s.running || s.transactionBusy || !s.getTransactionId(connId) || !!editing || !!adding}
+          onClick={() => s.askConfirm({ title: 'Roll back pending changes?', body: 'This discards all uncommitted table and worksheet changes on this connection. The table will refresh.', confirmLabel: 'Rollback', danger: true, onConfirm: () => { void s.finishTransaction('ROLLBACK', false, connId); } })}
+          title="Roll back all pending table and worksheet changes on this connection">Rollback</Btn>
+        <span className="text-[11px] text-mute">Auto-commit {autoCommit ? 'on' : 'off'}</span>
         <Btn
           variant="outline"
           onClick={() => {
@@ -252,9 +260,8 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
         </div>
       </div>
 
-      {/* every save commits immediately — say so once, up front, not in a toast after the fact */}
       <div className="px-2.5 py-1 text-[11px] text-mute border-b border-bdrsoft shrink-0">
-        Each change is one statement against the live database, committed as soon as you confirm it. Rows are matched on ROWID.
+        {autoCommit ? 'Confirmed changes commit immediately.' : 'Save each row to apply it, then Commit or Rollback. Pending changes share the worksheet transaction for this connection; disconnect or 30 minutes idle rolls them back.'} Rows are matched on ROWID.
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto">

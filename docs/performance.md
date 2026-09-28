@@ -65,8 +65,11 @@ That is the entire configuration. `poolIncrement`, `poolTimeout`, `queueTimeout`
 
 N saved connections means up to N pools of 4 sessions each.
 
-**`SYS` bypasses the pool entirely** — every SYS request opens a standalone `SYSDBA`
-connection and pays a fresh authentication round trip. Connection tests also bypass the pool.
+**Connections with a role bypass the pool entirely** — a connection whose role is `SYSDBA`,
+`SYSOPER`, `SYSBACKUP`, `SYSDG`, `SYSKM` or `SYSASM` (and `SYS`, which gets `SYSDBA`
+whether or not it asked) opens a standalone privileged connection per request and pays a
+fresh authentication round trip, because `createPool` cannot carry a privilege. Connection
+tests also bypass the pool.
 
 Pools close on update, delete, disconnect, and reconnect. Disconnect is the documented escape
 hatch for a pool left stale by a database or network restart, since the next query reopens

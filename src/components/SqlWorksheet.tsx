@@ -1,6 +1,8 @@
 import { useCallback, useRef, useState } from "react";
 import {
   AlignLeft,
+  Maximize2,
+  Minimize2,
   CircleAlert,
   Clock,
   Database,
@@ -20,6 +22,7 @@ import { download } from "../utils/sql";
 
 export default function SqlWorksheet() {
   const s = useStudio();
+  const [expanded, setExpanded] = useState(false);
   const [editorPct, setEditorPct] = useState(46);
   const [view, setView] = useState<"results" | "plan">("results");
   const dragRef = useRef<HTMLDivElement>(null);
@@ -41,13 +44,16 @@ export default function SqlWorksheet() {
     window.addEventListener("pointerup", up);
   }, []);
 
-  const errorLine = s.result?.error?.line ?? null;
+  const statementOffset = s.result?.statement ? s.sql.indexOf(s.result.statement) : -1;
+  const errorLine = s.result?.error && statementOffset >= 0
+    ? s.result.error.line + s.sql.slice(0, statementOffset).split("\n").length - 1
+    : null;
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
-        <Btn variant="primary" onClick={() => s.runSql()} title="Run statement (Ctrl+Enter)" disabled={s.running}>
+        <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
           <Play size={12} fill="currentColor" />
           Run
         </Btn>
@@ -80,15 +86,27 @@ export default function SqlWorksheet() {
           <kbd className="hidden md:inline">Enter</kbd>
         </div>
       </div>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-1 border-b border-bdrsoft text-[12px]">
+        <button type="button" role="switch" aria-checked={s.autoCommit} onClick={s.toggleAutoCommit}
+          disabled={s.running || s.transactionBusy || !s.activeConnId || !['Administrator', 'Developer'].includes(s.accessRole) || s.connections.find(c => c.id === s.activeConnId)?.readOnly}
+          className="rounded border border-bdr px-2 py-1 hover:bg-panel3 disabled:opacity-50">Auto-commit: {s.autoCommit ? 'On' : 'Off'}</button>
+        {!s.autoCommit && <>
+          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('COMMIT')}>Commit</Btn>
+          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('ROLLBACK')}>Rollback</Btn>
+        </>}
+        <span className="text-mute">Shared with table edits · DDL commits implicitly; explicit COMMIT still applies.</span>
+        {!s.autoCommit && <span className="text-warn">Manual sessions roll back on disconnect or after 30 minutes idle.</span>}
+      </div>
 
       {/* editor */}
-      <div className="flex flex-col flex-1 min-h-0">
-        <div style={{ height: `${editorPct}%` }} className="min-h-24">
-          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onRun={() => s.runSql()} />
+      <div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
+        <div hidden={expanded} style={{ height: `${editorPct}%` }} className="min-h-24 min-w-0 shrink-0 overflow-hidden">
+          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={() => s.runSql()} />
         </div>
 
         {/* splitter */}
         <div
+          hidden={expanded}
           ref={dragRef}
           role="separator"
           aria-orientation="horizontal"
@@ -103,7 +121,7 @@ export default function SqlWorksheet() {
         />
 
         {/* results area */}
-        <div className="flex-1 min-h-0 flex flex-col bg-panel">
+        <div className="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col bg-panel">
           <div className="flex items-center gap-0.5 border-b border-bdrsoft px-2 pt-1 shrink-0">
             {(["results", "plan"] as const).map((v) => (
               <button
@@ -118,6 +136,9 @@ export default function SqlWorksheet() {
                 {v === "results" ? "Query Result" : "Explain Plan"}
               </button>
             ))}
+            <button type="button" className="ml-2 flex items-center gap-1 rounded px-2 py-1 text-[11px] hover:bg-panel3" onClick={() => setExpanded((v) => !v)} aria-label={expanded ? "Restore editor" : "Expand results"} title={expanded ? "Restore editor" : "Expand results"}>
+              {expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}<span className="hidden sm:inline">{expanded ? "Restore" : "Expand"}</span>
+            </button>
             {/* execution details */}
             {s.result && !s.running && (
               <div className="ml-auto flex items-center gap-3 pr-2 pb-1 text-[11.5px] text-soft">
@@ -141,7 +162,7 @@ export default function SqlWorksheet() {
             )}
           </div>
 
-          <div className="flex-1 min-h-0">
+          <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
             {s.running ? (
               <div className="h-full flex items-center justify-center">
                 <Spinner label="Executing statement…" />
@@ -164,7 +185,7 @@ export default function SqlWorksheet() {
                 <div className="border border-err/40 bg-err/8 rounded-lg p-3.5 max-w-2xl">
                   <div className="flex items-center gap-2 text-err font-semibold text-[13px]">
                     <CircleAlert size={15} />
-                    {s.result.error.code} — statement failed at line {s.result.error.line}
+                    {s.result.error.code} — statement failed at line {errorLine ?? s.result.error.line}
                   </div>
                   <div className="mt-1.5 text-[12.5px] text-ink font-mono">{s.result.error.message}</div>
                   {s.result.error.helpUrl && (

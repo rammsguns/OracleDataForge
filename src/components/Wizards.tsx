@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, FileSpreadsheet, Loader2, PlugZap, XCircle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, Server, ShieldAlert, XCircle } from "lucide-react";
 import { useStudio } from "../state/store";
-import { api, type ImportRequest, type ImportResult } from "../utils/api";
+import { api, CONNECTION_ROLES, type AuthMode, type ConnectionRole, type ImportPreview, type ImportRequest, type ImportResult, type WalletService } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
+import { download } from "../utils/sql";
 import type { Engine } from "../types";
 import { Btn, Field, inputCls, Modal } from "./ui";
 
@@ -17,6 +18,10 @@ export function ConnectionWizard() {
   const [port, setPort] = useState(editing?.port ?? 1521);
   const [user, setUser] = useState(editing && editing.user !== "—" ? editing.user : "");
   const [password, setPassword] = useState("");
+  // SQL Developer's "Role": the privilege sessions open with. Not a credential — it changes
+  // what the same username is allowed to do once it is in.
+  const [role, setRole] = useState<ConnectionRole>(editing?.role ?? "default");
+  // In wallet mode this holds the tnsnames.ora alias instead of a typed service name.
   const [database, setDatabase] = useState(editing?.database ?? "");
   // new connections start read-only: writing to a database you just pointed at should be
   // a deliberate choice, so the checkbox is on until the user turns it off
@@ -25,21 +30,96 @@ export function ConnectionWizard() {
   const [testMsg, setTestMsg] = useState("");
   const [saving, setSaving] = useState(false);
 
+  /* ---- Oracle Cloud wallet ----
+   * The zip goes to the backend, which unpacks it and answers with the services inside its
+   * tnsnames.ora. The wallet files themselves never come back here: this side holds an id,
+   * the alias list and whatever password the user types for the key. */
+  const [authMode, setAuthMode] = useState<AuthMode>(editing?.authMode === "wallet" ? "wallet" : "basic");
+  const [walletId, setWalletId] = useState(editing?.walletId ?? "");
+  const [services, setServices] = useState<WalletService[]>([]);
+  const [walletPassword, setWalletPassword] = useState("");
+  const [walletNeedsPassword, setWalletNeedsPassword] = useState(true);
+  const [walletFileName, setWalletFileName] = useState("");
+  const [walletBusy, setWalletBusy] = useState(false);
+  const [walletError, setWalletError] = useState("");
+  const wallet = authMode === "wallet";
+  const service = services.find((x) => x.alias === database);
+  // The backend gives SYS SYSDBA whether or not it was asked for (SYS cannot connect any
+  // other way), so the summary names the role the session will really open with.
+  const effectiveRole = role === "default" && user.trim().toLowerCase() === "sys" ? "SYSDBA" : role;
+
+  // Editing a wallet connection: the alias list lives in the wallet on the server, so it is
+  // read back rather than remembered in the browser. A wallet deleted underneath the
+  // connection says so here instead of at save time.
+  useEffect(() => {
+    const id = editing?.walletId;
+    if (editing?.authMode !== "wallet" || !id) return;
+    let dropped = false;
+    api
+      .wallet(id)
+      .then((info) => {
+        if (dropped) return;
+        setServices(info.services);
+        setWalletNeedsPassword(info.needsPassword);
+      })
+      .catch((e: Error) => !dropped && setWalletError(e.message));
+    return () => {
+      dropped = true;
+    };
+  }, [editing?.authMode, editing?.walletId]);
+
+  const uploadWallet = async (f: File | undefined) => {
+    if (!f) return;
+    setWalletBusy(true);
+    setWalletError("");
+    setWalletFileName(f.name);
+    setTesting("idle");
+    setTestMsg("");
+    try {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      const info = await api.uploadWallet(btoa(binary));
+      setWalletId(info.walletId);
+      setServices(info.services);
+      setWalletNeedsPassword(info.needsPassword);
+      // Autonomous Database publishes the same database as _high/_medium/_low consumer
+      // groups; _high is the one SQL Developer opens with, and a sensible default here too.
+      const keep = info.services.find((x) => x.alias === database);
+      const preferred = keep ?? info.services.find((x) => /_high$/i.test(x.alias)) ?? info.services[0];
+      setDatabase(preferred?.alias ?? "");
+      if (!name.trim()) setName(f.name.replace(/\.zip$/i, "").replace(/^Wallet_/i, ""));
+    } catch (e) {
+      setWalletId("");
+      setServices([]);
+      setWalletError((e as Error).message);
+    } finally {
+      setWalletBusy(false);
+    }
+  };
+
   const close = () => {
     s.setWizardOpen(false);
     s.setEditingConn(null);
   };
-  const canNext = name.trim() && host.trim() && database.trim();
+  const canNext = wallet
+    ? Boolean(name.trim() && walletId && database && user.trim())
+    : Boolean(name.trim() && host.trim() && database.trim());
 
   const liveCfg = () => ({
     name: name.trim(),
     engine,
-    host: host.trim(),
-    port,
+    // In wallet mode the endpoint comes from the wallet, not from the form; the resolved
+    // host and port are sent along because they are what the connection list shows.
+    host: wallet ? service?.host ?? "" : host.trim(),
+    port: wallet ? service?.port ?? 0 : port,
     user: user.trim(),
     password,
     database: database.trim(),
     readOnly,
+    role,
+    authMode,
+    ...(wallet ? { walletId, walletPassword } : {}),
   });
 
   const test = async () => {
@@ -66,11 +146,14 @@ export function ConnectionWizard() {
       const patched = {
         ...editing,
         name: name.trim(),
-        host: host.trim(),
-        port,
+        host: wallet ? service?.host ?? editing.host : host.trim(),
+        port: wallet ? service?.port ?? editing.port : port,
         user: user.trim() || "—",
         database: database.trim() || undefined,
         readOnly,
+        role,
+        authMode,
+        walletId: wallet ? walletId : undefined,
       };
       setSaving(true);
       try {
@@ -92,14 +175,17 @@ export function ConnectionWizard() {
         id,
         name: name.trim(),
         engine,
-        host: host.trim(),
-        port,
+        host: wallet ? service?.host ?? "" : host.trim(),
+        port: wallet ? service?.port ?? 0 : port,
         user: user.trim() || "—",
         status: "connected",
         color: "#f4b13e",
         live: true,
         database: database.trim(),
         readOnly,
+        role,
+        authMode,
+        walletId: wallet ? walletId : undefined,
       });
       close();
     } catch (e) {
@@ -136,19 +222,112 @@ export function ConnectionWizard() {
 
       {step === 1 && (
         <div className="space-y-3.5">
+          {/* Which of the two ways of reaching Oracle this connection uses. The wallet is
+              not an extra option on a host/port connection — it replaces the endpoint
+              entirely — so it is the first choice on the form rather than a checkbox. */}
+          <Field label="Connect using">
+            <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Connection method">
+              {([
+                { mode: "basic" as const, icon: <Server size={13} />, title: "Host and port", detail: "A database you reach directly" },
+                { mode: "wallet" as const, icon: <Cloud size={13} />, title: "Oracle Cloud wallet", detail: "Autonomous Database, over mTLS" },
+              ]).map((opt) => (
+                <button
+                  key={opt.mode}
+                  type="button"
+                  role="radio"
+                  aria-checked={authMode === opt.mode}
+                  onClick={() => {
+                    if (authMode === opt.mode) return;
+                    setAuthMode(opt.mode);
+                    // The service name and the wallet alias share a field but are never the
+                    // same string, so switching methods clears it rather than carrying a
+                    // value that cannot be right for the new one.
+                    setDatabase(editing && (editing.authMode === "wallet") === (opt.mode === "wallet") ? editing.database ?? "" : "");
+                    setTesting("idle");
+                    setTestMsg("");
+                  }}
+                  className={`text-left rounded-lg border p-2.5 transition-colors ${
+                    authMode === opt.mode ? "border-accent bg-accentdim" : "border-bdr hover:border-accent/50"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-ink">
+                    {opt.icon} {opt.title}
+                  </span>
+                  <span className="block text-[11px] text-mute mt-0.5">{opt.detail}</span>
+                </button>
+              ))}
+            </div>
+          </Field>
+
           <Field label="Connection name">
             <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sales Analytics (STAGING)" autoFocus />
           </Field>
-          <div className="grid grid-cols-[1fr_110px] gap-3">
-            <Field label="Host">
-              <input className={inputCls} value={host} onChange={(e) => setHost(e.target.value)} placeholder="db.example.corp" />
-            </Field>
-            <Field label="Port">
-              <input className={inputCls} type="number" value={port} onChange={(e) => setPort(+e.target.value)} />
-            </Field>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Username" hint="SYS connects automatically AS SYSDBA">
+
+          {wallet ? (
+            <>
+              <Field
+                label={walletId ? "Replace wallet" : "Wallet zip"}
+                hint="The zip from Oracle Cloud → your Autonomous Database → Database connection → Download wallet. It is unpacked on the backend; the browser never holds its key."
+              >
+                <input
+                  type="file"
+                  accept="application/zip,.zip"
+                  className="w-full text-[12px] text-soft file:mr-3 file:h-7 file:px-2.5 file:rounded-md file:border file:border-bdr file:bg-panel2 file:text-soft file:text-[12px] file:cursor-pointer hover:file:border-accent/60"
+                  onChange={(e) => void uploadWallet(e.target.files?.[0])}
+                />
+              </Field>
+              {walletBusy && (
+                <p className="flex items-center gap-1.5 text-[12px] text-mute">
+                  <Loader2 size={13} className="df-spin" /> Reading {walletFileName}…
+                </p>
+              )}
+              {walletError && (
+                <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+                  <XCircle size={14} className="shrink-0 mt-0.5" /> {walletError}
+                </p>
+              )}
+              {!walletBusy && !!services.length && (
+                <>
+                  <Field
+                    label="Database service"
+                    hint="Autonomous Database publishes one service per consumer group — _high gives each statement the most resources and the least concurrency, _low the reverse."
+                  >
+                    <select className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)}>
+                      {!database && <option value="">Choose a service…</option>}
+                      {services.map((x) => (
+                        <option key={x.alias} value={x.alias}>
+                          {x.alias}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {service && (
+                    <p className="text-[11px] text-mute -mt-1.5">
+                      Connects to <span className="font-mono text-soft">{service.host}:{service.port}</span> as{" "}
+                      <span className="font-mono text-soft">{service.serviceName}</span>
+                    </p>
+                  )}
+                </>
+              )}
+              {!walletBusy && !services.length && !walletError && editing?.authMode === "wallet" && (
+                <p className="flex items-center gap-1.5 text-[12px] text-mute">
+                  <Loader2 size={13} className="df-spin" /> Reading the saved wallet…
+                </p>
+              )}
+            </>
+          ) : (
+            <div className="grid grid-cols-[1fr_110px] gap-3">
+              <Field label="Host">
+                <input className={inputCls} value={host} onChange={(e) => setHost(e.target.value)} placeholder="db.example.corp" />
+              </Field>
+              <Field label="Port">
+                <input className={inputCls} type="number" value={port} onChange={(e) => setPort(+e.target.value)} />
+              </Field>
+            </div>
+          )}
+
+          <div className="grid grid-cols-[1fr_1fr_118px] gap-3">
+            <Field label="Username">
               <input className={inputCls} value={user} onChange={(e) => setUser(e.target.value)} placeholder="SYSTEM" autoComplete="off" />
             </Field>
             {/* The saved password is only reused for the endpoint it was saved against — the
@@ -157,10 +336,57 @@ export function ConnectionWizard() {
             <Field label="Password" hint={editing?.live ? "Leave blank to keep the saved password — required again if you change the server, port or user" : undefined}>
               <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
             </Field>
+            {/* SQL Developer's Role dropdown, same list and same default. A tested connection
+                is no evidence for a different privilege, so changing it clears the result. */}
+            <Field label="Role">
+              <select
+                className={inputCls}
+                value={role}
+                onChange={(e) => {
+                  setRole(e.target.value as ConnectionRole);
+                  setTesting("idle");
+                  setTestMsg("");
+                }}
+              >
+                {CONNECTION_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+            </Field>
           </div>
-          <Field label="Service name" hint="Required — the Oracle service to connect to, e.g. FREEPDB1 on Oracle Database Free 23ai. Credentials are held in the backend only, never in the browser.">
-            <input className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="FREEPDB1" />
-          </Field>
+          <p className="text-[11px] text-mute -mt-1.5">
+            <b>Role</b> is the privilege each session is opened with — SYSDBA and SYSOPER are how an administrator
+            connects to a database that is only mounted or still starting, and SYSBACKUP, SYSDG, SYSKM and SYSASM are
+            the narrower equivalents for backup, Data Guard, key management and ASM. Left at{" "}
+            <span className="font-mono">default</span>, SYS still connects AS SYSDBA on its own.
+          </p>
+          {wallet ? (
+            walletNeedsPassword && (
+              <Field
+                label="Wallet password"
+                hint={
+                  editing?.authMode === "wallet"
+                    ? "Leave blank to keep the saved wallet password. This is the password you set when downloading the wallet, not the database password."
+                    : "The password you set when downloading the wallet from Oracle Cloud — it decrypts the wallet's private key, and is not the database password."
+                }
+              >
+                <input
+                  className={inputCls}
+                  type="password"
+                  value={walletPassword}
+                  onChange={(e) => setWalletPassword(e.target.value)}
+                  placeholder={editing?.authMode === "wallet" ? "(unchanged)" : "••••••••"}
+                  autoComplete="new-password"
+                />
+              </Field>
+            )
+          ) : (
+            <Field label="Service name" hint="Required — the Oracle service to connect to, e.g. FREEPDB1 on Oracle Database Free 23ai. Credentials are held in the backend only, never in the browser.">
+              <input className={inputCls} value={database} onChange={(e) => setDatabase(e.target.value)} placeholder="FREEPDB1" />
+            </Field>
+          )}
           <label className="flex items-start gap-2.5 border border-bdr rounded-lg p-3 cursor-pointer hover:border-accent/50 transition-colors">
             <input
               type="checkbox"
@@ -185,12 +411,31 @@ export function ConnectionWizard() {
           <div className="border border-bdr rounded-xl p-4 text-[12.5px] space-y-1.5">
             <div><span className="text-mute w-24 inline-block">Engine</span> <b>Oracle</b> <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span></div>
             <div><span className="text-mute w-24 inline-block">Name</span> <b>{name}</b></div>
-            <div><span className="text-mute w-24 inline-block">Target</span> <span className="font-mono">{`${host}:${port}`}</span></div>
             <div>
-              <span className="text-mute w-24 inline-block">Service</span>{" "}
+              <span className="text-mute w-24 inline-block">Method</span>{" "}
+              {wallet ? (
+                <>
+                  <b>Oracle Cloud wallet</b>{" "}
+                  <span className="text-[10px] font-bold bg-accentdim text-accenthi rounded px-1 py-0.5 ml-1">mTLS</span>
+                </>
+              ) : (
+                <b>Host and port</b>
+              )}
+            </div>
+            <div>
+              <span className="text-mute w-24 inline-block">Target</span>{" "}
+              <span className="font-mono">{wallet ? (service ? `${service.host}:${service.port}` : "—") : `${host}:${port}`}</span>
+            </div>
+            <div>
+              <span className="text-mute w-24 inline-block">{wallet ? "Wallet service" : "Service"}</span>{" "}
               <span className="font-mono">{database}</span>
             </div>
             <div><span className="text-mute w-24 inline-block">User</span> <span className="font-mono">{user || "—"}</span></div>
+            <div>
+              <span className="text-mute w-24 inline-block">Role</span>{" "}
+              <span className="font-mono">{effectiveRole}</span>
+              {effectiveRole !== role && <span className="text-mute text-[11px] ml-1.5">automatic for SYS</span>}
+            </div>
             <div>
               <span className="text-mute w-24 inline-block">Access</span>{" "}
               {readOnly ? (
@@ -560,7 +805,7 @@ export function ConfirmDialog() {
   const c = s.confirm;
   return (
     <Modal title={c.title} onClose={s.closeConfirm} width={460}>
-      <p className="text-[12.5px] text-soft leading-relaxed">{c.body}</p>
+      <p className="text-[12.5px] text-soft leading-relaxed whitespace-pre-wrap break-words">{c.body}</p>
       <div className="flex justify-end gap-2 mt-5">
         <Btn variant="ghost" onClick={s.closeConfirm}>Cancel</Btn>
         <Btn
@@ -572,6 +817,387 @@ export function ConfirmDialog() {
         >
           {c.confirmLabel}
         </Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/** Passphrase floor, mirroring the backend's. Kept in one place so the hint, the disabled
+ *  state and the server's rejection message cannot drift apart. */
+const EXPORT_MIN_PASSPHRASE = 12;
+
+/**
+ * Export saved connections to an encrypted JSON file.
+ *
+ * The Oracle passwords are not in the browser — they never leave the backend — so this
+ * dialog does not build the file. It sends the passphrase and the selection to the server,
+ * which encrypts the connections with a key derived from that passphrase, and downloads
+ * whatever comes back. What the user ends up with is a portable backup of connections that
+ * otherwise only exist inside this machine's `data/connections.json`.
+ */
+export function ExportConnectionsDialog() {
+  const s = useStudio();
+  const exportable = s.connections.filter((c) => c.live);
+  const [selected, setSelected] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(exportable.map((c) => [c.id, true]))
+  );
+  const [pass, setPass] = useState("");
+  const [confirmPass, setConfirmPass] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const close = () => s.setExportConnsOpen(false);
+  const chosen = exportable.filter((c) => selected[c.id]);
+  const tooShort = pass.length < EXPORT_MIN_PASSPHRASE;
+  const mismatch = confirmPass.length > 0 && pass !== confirmPass;
+  const canExport = chosen.length > 0 && !tooShort && pass === confirmPass && !busy;
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const ids = chosen.map((c) => c.id);
+      const { file, count } = await api.exportConnections(pass, ids);
+      const stamp = new Date().toISOString().slice(0, 10);
+      download(`dataforge-connections-${stamp}.json`, JSON.stringify(file, null, 2), "application/json");
+      s.toast("success", `${count} connection(s) exported — the file is only as safe as the passphrase you chose.`);
+      close();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Export connections to an encrypted file" onClose={close} width={620}>
+      {exportable.length === 0 ? (
+        <p className="text-[12.5px] text-mute">There are no saved connections to export yet.</p>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex items-start gap-2.5 border border-warn/40 bg-warn/10 rounded-lg p-3 text-[11.5px] text-soft leading-snug">
+            <ShieldAlert size={15} className="shrink-0 text-warn mt-0.5" />
+            <span>
+              The file contains the <b>Oracle username and password</b> of every connection you pick, encrypted with
+              AES-256-GCM under a key derived from your passphrase. Anyone who gets both the file and the passphrase gets
+              the databases. There is no recovery: lose the passphrase and the file is unreadable.
+            </span>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                Connections ({chosen.length}/{exportable.length})
+              </span>
+              <button
+                className="text-[11px] text-accenthi hover:underline"
+                onClick={() =>
+                  setSelected(Object.fromEntries(exportable.map((c) => [c.id, chosen.length !== exportable.length])))
+                }
+              >
+                {chosen.length === exportable.length ? "Clear all" : "Select all"}
+              </button>
+            </div>
+            <ul className="border border-bdr rounded-lg divide-y divide-bdrsoft max-h-52 overflow-auto">
+              {exportable.map((c) => (
+                <li key={c.id}>
+                  <label className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-panel2">
+                    <input
+                      type="checkbox"
+                      className="accent-[var(--accent)]"
+                      checked={!!selected[c.id]}
+                      onChange={(e) => setSelected((m) => ({ ...m, [c.id]: e.target.checked }))}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-[12.5px] font-medium text-ink truncate">{c.name}</span>
+                      <span className="block text-[11px] text-mute font-mono truncate">
+                        {c.host}:{c.port}
+                        {c.database ? `/${c.database}` : ""} as {c.user}
+                        {c.role && c.role !== "default" ? ` · ${c.role}` : ""}
+                        {c.readOnly ? " · read-only" : ""}
+                        {/* the wallet travels inside the encrypted file, so the export is
+                            usable on a machine that has never seen it */}
+                        {c.authMode === "wallet" ? " · wallet included" : ""}
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Passphrase" hint={`At least ${EXPORT_MIN_PASSPHRASE} characters`}>
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={pass}
+                onChange={(e) => setPass(e.target.value)}
+                autoComplete="new-password"
+                autoFocus
+                placeholder="••••••••••••"
+              />
+            </Field>
+            <Field label="Confirm passphrase">
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={confirmPass}
+                onChange={(e) => setConfirmPass(e.target.value)}
+                autoComplete="new-password"
+                placeholder="••••••••••••"
+              />
+            </Field>
+          </div>
+          <label className="flex items-center gap-2 text-[11.5px] text-mute cursor-pointer">
+            <input type="checkbox" className="accent-[var(--accent)]" checked={reveal} onChange={(e) => setReveal(e.target.checked)} />
+            Show passphrase
+          </label>
+
+          {mismatch && (
+            <p className="flex items-center gap-1.5 text-err text-[12px]">
+              <XCircle size={14} /> The two passphrases do not match.
+            </p>
+          )}
+          {error && (
+            <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+              <XCircle size={14} className="shrink-0 mt-0.5" /> {error}
+            </p>
+          )}
+
+          <div className="flex items-center justify-between pt-4 border-t border-bdrsoft">
+            <Btn variant="ghost" onClick={close}>Cancel</Btn>
+            <Btn variant="primary" onClick={run} disabled={!canExport}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <Download size={13} />} Export {chosen.length || ""} connection
+              {chosen.length === 1 ? "" : "s"}
+            </Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/**
+ * Import connections from an encrypted export.
+ *
+ * The browser cannot open the file — the passphrase-derived key never exists here — so the
+ * dialog uploads the envelope and lets the backend decrypt it. Two calls, in the order the
+ * user thinks in: `preview` says what is inside (metadata only, still no passwords), then
+ * `import` writes the entries that were ticked. Nothing lands in the registry until the
+ * second call, so a wrong passphrase or the wrong file costs nothing.
+ */
+export function ImportConnectionsDialog() {
+  const s = useStudio();
+  const [fileName, setFileName] = useState("");
+  const [envelope, setEnvelope] = useState<unknown>(null);
+  const [pass, setPass] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [picked, setPicked] = useState<Record<number, boolean>>({});
+  const [mode, setMode] = useState<"skip" | "replace">("skip");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const close = () => s.setImportConnsOpen(false);
+
+  const readFile = async (f: File | undefined) => {
+    if (!f) return;
+    setError("");
+    setPreview(null);
+    setFileName(f.name);
+    try {
+      const parsed = JSON.parse(await f.text());
+      // named here rather than left to the server so the obvious mistake — picking the wrong
+      // .json — is answered before a passphrase is typed
+      if (!parsed || parsed.format !== "oracle-dataforge-connections") {
+        setEnvelope(null);
+        setError(`${f.name} is not an Oracle DataForge connection export.`);
+        return;
+      }
+      setEnvelope(parsed);
+    } catch {
+      setEnvelope(null);
+      setError(`${f.name} is not valid JSON.`);
+    }
+  };
+
+  const unlock = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const p = await api.previewConnectionImport(envelope, pass);
+      setPreview(p);
+      // everything importable starts ticked; an entry the server rejected cannot be
+      setPicked(Object.fromEntries(p.entries.filter((e) => !e.error).map((e) => [e.index, true])));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chosen = preview?.entries.filter((e) => picked[e.index] && !e.error) ?? [];
+  const duplicates = chosen.filter((e) => e.duplicateOfId).length;
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await api.importConnections(envelope, pass, chosen.map((e) => e.index), mode);
+      await s.refreshConnections();
+      const parts = [
+        r.added.length ? `${r.added.length} added` : "",
+        r.replaced.length ? `${r.replaced.length} replaced` : "",
+        r.skipped.length ? `${r.skipped.length} skipped` : "",
+      ].filter(Boolean);
+      s.toast(
+        r.added.length || r.replaced.length ? "success" : "info",
+        `Import finished — ${parts.join(", ")}. Connect to open a session.`
+      );
+      close();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Import connections from an encrypted file" onClose={close} width={640}>
+      <div className="space-y-4">
+        <Field label="Export file" hint="The dataforge-connections-….json written by Export connections">
+          <input
+            type="file"
+            accept="application/json,.json"
+            className="w-full text-[12px] text-soft file:mr-3 file:h-7 file:px-2.5 file:rounded-md file:border file:border-bdr file:bg-panel2 file:text-soft file:text-[12px] file:cursor-pointer hover:file:border-accent/60"
+            onChange={(e) => void readFile(e.target.files?.[0])}
+          />
+        </Field>
+
+        {envelope != null && !preview && (
+          <>
+            <Field label="Passphrase" hint="The one used when the file was exported">
+              <input
+                className={inputCls}
+                type={reveal ? "text" : "password"}
+                value={pass}
+                onChange={(e) => setPass(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && pass && !busy && void unlock()}
+                autoComplete="off"
+                autoFocus
+                placeholder="••••••••••••"
+              />
+            </Field>
+            <label className="flex items-center gap-2 text-[11.5px] text-mute cursor-pointer">
+              <input type="checkbox" className="accent-[var(--accent)]" checked={reveal} onChange={(e) => setReveal(e.target.checked)} />
+              Show passphrase
+            </label>
+          </>
+        )}
+
+        {preview && (
+          <>
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                  In {fileName} ({chosen.length}/{preview.entries.length})
+                </span>
+                {preview.exportedAt && (
+                  <span className="text-[11px] text-mute">exported {preview.exportedAt.slice(0, 10)}</span>
+                )}
+              </div>
+              <ul className="border border-bdr rounded-lg divide-y divide-bdrsoft max-h-56 overflow-auto">
+                {preview.entries.map((e) => (
+                  <li key={e.index}>
+                    <label className={`flex items-center gap-2.5 px-3 py-2 ${e.error ? "opacity-60" : "cursor-pointer hover:bg-panel2"}`}>
+                      <input
+                        type="checkbox"
+                        className="accent-[var(--accent)]"
+                        disabled={!!e.error}
+                        checked={!!picked[e.index]}
+                        onChange={(ev) => setPicked((m) => ({ ...m, [e.index]: ev.target.checked }))}
+                      />
+                      <span className="min-w-0">
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-[12.5px] font-medium text-ink truncate">{e.name}</span>
+                          {e.duplicateOfId && (
+                            <span className="text-[10px] font-bold bg-warn/15 text-warn rounded px-1 py-0.5 shrink-0">
+                              ALREADY SAVED
+                            </span>
+                          )}
+                        </span>
+                        <span className="block text-[11px] text-mute font-mono truncate">
+                          {e.host}:{e.port}
+                          {e.database ? `/${e.database}` : ""} as {e.user}
+                          {e.role && e.role !== "default" ? ` · ${e.role}` : ""}
+                          {e.readOnly ? " · read-only" : ""}
+                          {e.authMode === "wallet" ? " · restores its wallet" : ""}
+                        </span>
+                        {e.error && <span className="block text-[11px] text-err">Cannot import: {e.error}</span>}
+                        {e.duplicateOfId && e.duplicateOfName !== e.name && (
+                          <span className="block text-[11px] text-mute">saved here as “{e.duplicateOfName}”</span>
+                        )}
+                      </span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {duplicates > 0 && (
+              <div className="border border-bdr rounded-lg p-3 space-y-2">
+                <div className="text-[11px] font-semibold text-soft uppercase tracking-wider">
+                  {duplicates} of these already exist here
+                </div>
+                <p className="text-[11px] text-mute leading-snug">
+                  A connection counts as the same one when its server, port, user and service name all match — the same
+                  test the backend uses before it will reuse a stored password.
+                </p>
+                {(["skip", "replace"] as const).map((m) => (
+                  <label key={m} className="flex items-start gap-2.5 text-[12px] cursor-pointer">
+                    <input
+                      type="radio"
+                      name="dupe-mode"
+                      className="mt-0.5 accent-[var(--accent)]"
+                      checked={mode === m}
+                      onChange={() => setMode(m)}
+                    />
+                    <span>
+                      <span className="font-medium text-ink">{m === "skip" ? "Keep what is here" : "Replace with the file"}</span>
+                      <span className="block text-[11px] text-mute">
+                        {m === "skip"
+                          ? "Leave the saved connection and its password untouched."
+                          : "Overwrite the saved name, password and read-only flag; open sessions are closed."}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {error && (
+          <p className="flex items-start gap-1.5 text-err text-[12px] break-words">
+            <XCircle size={14} className="shrink-0 mt-0.5" /> {error}
+          </p>
+        )}
+
+        <div className="flex items-center justify-between pt-4 border-t border-bdrsoft">
+          <Btn variant="ghost" onClick={close}>Cancel</Btn>
+          {preview ? (
+            <Btn variant="primary" onClick={run} disabled={busy || chosen.length === 0}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <CheckCircle2 size={13} />} Import {chosen.length || ""}{" "}
+              connection{chosen.length === 1 ? "" : "s"}
+            </Btn>
+          ) : (
+            <Btn variant="primary" onClick={unlock} disabled={busy || envelope == null || !pass}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <KeyRound size={13} />} Unlock file
+            </Btn>
+          )}
+        </div>
       </div>
     </Modal>
   );

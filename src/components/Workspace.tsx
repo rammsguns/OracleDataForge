@@ -15,6 +15,7 @@ import {
   Table2,
   Terminal,
   UserCog,
+  Users,
   Waypoints,
   X,
 } from "lucide-react";
@@ -29,6 +30,7 @@ import QueryHistory from "./QueryHistory";
 import PerformanceMonitor from "./PerformanceMonitor";
 import MigrationAssistant from "./MigrationAssistant";
 import DbaAdvisor from "./DbaAdvisor";
+import DbaManager from "./DbaManager";
 import DependencyExplorer from "./DependencyExplorer";
 import VersionHistory from "./VersionHistory";
 import RoutineRunner from "./RoutineRunner";
@@ -36,6 +38,7 @@ import CompileInvalid from "./CompileInvalid";
 import JobRunLog from "./JobRunLog";
 import UserAdmin from "./UserAdmin";
 import PlsqlRepository from "./PlsqlRepository";
+import Sessions from "./Sessions";
 import { EmptyState } from "./ui";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
@@ -49,6 +52,8 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   perf: <Activity size={12} />,
   migration: <GitCompareArrows size={12} />,
   dba: <Gauge size={12} />,
+  dbamanager: <Hammer size={12} />,
+  sessions: <Users size={12} />,
   deps: <Waypoints size={12} />,
   versions: <History size={12} />,
   compile: <Hammer size={12} />,
@@ -62,6 +67,8 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "history", title: "Query History", label: "History" },
   { kind: "perf", title: "Performance", label: "Performance" },
   { kind: "dba", title: "DBA Advisor", label: "DBA Advisor" },
+  { kind: "dbamanager", title: "DBA Manager", label: "DBA Manager" },
+  { kind: "sessions", title: "Sessions", label: "Sessions" },
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
@@ -80,7 +87,25 @@ export default function Workspace() {
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-panel">
-      {/* tab bar */}
+      <div className="flex items-center gap-2 px-2 py-1.5 border-b border-bdr shrink-0">
+        <select aria-label="Open tabs" value={active.id} onChange={(e) => s.setActiveTabId(e.target.value)} className="min-w-0 max-w-52 rounded border border-bdr bg-panel2 px-2 py-1 text-[12px]">
+          {s.tabs.map((tab) => <option key={tab.id} value={tab.id}>{tab.title}{tab.dirty ? " •" : ""}</option>)}
+        </select>
+        {s.accessRole !== "Analyst" && <button className="text-[12px] flex items-center gap-1 whitespace-nowrap rounded px-2 py-1 hover:bg-panel3" onClick={() => s.openTab("worksheet", `Worksheet ${s.tabs.filter((t) => t.kind === "worksheet").length + 1}`, `ws-${Date.now()}`)}><Plus size={14} /> Worksheet</button>}
+        <details className="relative ml-auto">
+          <summary className="cursor-pointer rounded border border-bdr px-3 py-1 text-[12px]">Tools</summary>
+          <div className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[65vh] overflow-auto rounded-lg border border-bdr bg-panel p-2 shadow-2xl">
+            {[
+              { label: "Development", kinds: ["history", "versions", "repository", "migration", "deps", "erd"] },
+              { label: "Database administration", kinds: ["perf", "dba", "dbamanager", "sessions", "joblog", "admin"] },
+            ].map((group) => <div key={group.label}>
+              <div className="px-2 py-2 text-[10px] uppercase text-mute">{group.label}</div>
+              {LAUNCHERS.filter((l) => group.kinds.includes(l.kind) && canView(l.kind)).map((l) => <button key={l.kind} className="w-full flex items-center gap-2 rounded px-2 py-2 text-left text-[12px] hover:bg-panel3" onClick={(e) => { s.openTab(l.kind, l.title); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{TAB_ICON[l.kind]}{l.label}</button>)}
+            </div>)}
+          </div>
+        </details>
+      </div>
+      {/* Open documents have their own scrollable strip. */}
       <div className="flex items-stretch border-b border-bdr bg-bg shrink-0 overflow-x-auto" role="tablist" aria-label="Workspace tabs">
         {s.tabs.map((t) => (
           <div
@@ -112,36 +137,22 @@ export default function Workspace() {
             </button>
           </div>
         ))}
-        {/* quick launchers */}
-        <div className="flex items-center gap-0.5 px-2 ml-auto">
-          {LAUNCHERS.filter((l) => canView(l.kind)).map((l) => (
-            <button
-              key={l.kind}
-              onClick={() => s.openTab(l.kind, l.title)}
-              className="flex items-center gap-1 px-2 py-1 rounded text-[11px] text-mute hover:text-accenthi hover:bg-accentdim transition-colors whitespace-nowrap"
-              title={`Open ${l.title}`}
-            >
-              {TAB_ICON[l.kind]}
-              <span className="max-lg:hidden">{l.label}</span>
-            </button>
-          ))}
-          {s.accessRole !== "Analyst" && <button
-            onClick={() => s.openTab("worksheet", `Worksheet ${s.tabs.filter((t) => t.kind === "worksheet").length + 1}`, `ws-${Date.now()}`)}
-            className="p-1.5 rounded text-mute hover:text-accenthi hover:bg-accentdim transition-colors"
-            title="New worksheet (Ctrl+T)"
-            aria-label="New worksheet"
-          >
-            <Plus size={14} />
-          </button>}
-        </div>
+
       </div>
 
       {/* tab content */}
       <div className="flex-1 min-h-0" role="tabpanel" aria-label={active.title}>
+        {/* Keep open source editors alive when navigating to a worksheet or another
+            object. Their source, selection, scroll and search state belong to the
+            open tab; closing the tab removes its editor from memory. */}
+        {canView("object") && s.tabs.filter((tab) => tab.kind === "object").map((tab) => (
+          <div key={tab.id} className="h-full min-h-0" hidden={tab.id !== active.id}>
+            <ObjectEditor object={tab.payload!} tabId={tab.id} />
+          </div>
+        ))}
         {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>
         {active.kind === "worksheet" && <SqlWorksheet />}
         {active.kind === "data" && <DataBrowser table={active.payload!} />}
-        {active.kind === "object" && <ObjectEditor object={active.payload!} tabId={active.id} />}
         {active.kind === "run" && <RoutineRunner key={active.id} routine={active.payload!} />}
         {active.kind === "tabledesign" && <TableDesigner key={active.id} table={active.payload!} tabId={active.id} />}
         {active.kind === "erd" && <ErDiagram />}
@@ -149,6 +160,8 @@ export default function Workspace() {
         {active.kind === "perf" && <PerformanceMonitor />}
         {active.kind === "migration" && <MigrationAssistant />}
         {active.kind === "dba" && <DbaAdvisor />}
+        {active.kind === "dbamanager" && <DbaManager />}
+        {active.kind === "sessions" && <Sessions />}
         {active.kind === "deps" && <DependencyExplorer key={active.id} initialObject={active.payload} />}
         {active.kind === "versions" && <VersionHistory key={active.id} />}
         {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}

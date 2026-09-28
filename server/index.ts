@@ -1,13 +1,57 @@
 import express from "express";
+import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies } from './tableDataCopy.ts';
+import { tableDataSelection } from '../src/utils/tableDataDependencies.ts';
+import { WorksheetSessions } from "./worksheetSessions.ts";
+import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
+import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
+import { selectManagementQueries } from "./dbaManagement.ts";
+import { globalSessionsSql, localSessionsSql, globalConnectInfoSql, localConnectInfoSql, killSessionSql, sessionIdentifier } from "./oracleSessions.ts";
 import compression from "compression";
+import { AuthConcurrency } from "./authConcurrency.ts";
+import { loadUserStore, type Role, type StoredUser } from "./userStore.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { isIPv4, isIPv6 } from "node:net";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import {
+  decryptExport,
+  encryptExport,
+  EXPORT_MIN_PASSPHRASE,
+} from "./connectionExport.ts";
+import {
+  extractWallet,
+  parseTnsNames,
+  walletNeedsPassword,
+  WALLET_KEPT_FILES,
+  WALLET_ZIP_MAX_BYTES,
+  type WalletFiles,
+  type WalletService,
+} from "./oracleWallet.ts";
+import { effectiveRole, normalizeRole, oraPrivilege, type ConnectionRole } from "./connectionRole.ts";
+import {
+  ALL_COPY_KINDS,
+  copyBaseKinds,
+  copyBaseLabel,
+  copyCountLabel,
+  copyKindSpec,
+  copyMetadataType,
+  copyStatusTypes,
+  copyStatements,
+  copyTransforms,
+  dropStatement,
+  normalizeKind,
+  normalizeNames,
+  OBJECT_COPY_KINDS,
+  retargetSchema,
+  type CopyKind,
+} from "./objectCopy.ts";
 import oracledb from "oracledb";
 
 oracledb.fetchAsString = [oracledb.CLOB];
+// Thin mode sends this as V$SESSION.PROGRAM for every pool and standalone session.
+const appVersion = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+oracledb.program = `OracleDataForge/${appVersion}`;
 
 // node-oracledb exposes Lob at runtime, while the matching DefinitelyTyped
 // release models it only as an interface.
@@ -70,6 +114,17 @@ const ALLOWED_HOSTS = new Set(
 if (!IS_LOOPBACK && !AUTH_TOKEN) throw new Error("DATAFORGE_AUTH_TOKEN is required when HOST is not loopback.");
 if (!IS_LOOPBACK && !CREDENTIALS_KEY) throw new Error("DATAFORGE_ENCRYPTION_KEY is required when HOST is not loopback.");
 
+/**
+ * How the network side of a connection is established.
+ *
+ * `basic`  host, port and service name, over plain TCP — a database you run yourself.
+ * `wallet` an Oracle Cloud wallet: mutual TLS to Autonomous Database, where the endpoint
+ *          comes from the `tnsnames.ora` inside the wallet rather than from the form. The
+ *          database username and password are still required — the wallet secures the
+ *          channel, it does not sign anyone in.
+ */
+type AuthMode = "basic" | "wallet";
+
 interface ConnConfig {
   name: string;
   engine: "oracle";
@@ -77,8 +132,17 @@ interface ConnConfig {
   port: number;
   user: string;
   password: string;
-  database: string; // Oracle service name
+  /** Oracle service name; in wallet mode, the tnsnames.ora alias (e.g. `dataforge_high`) */
+  database: string;
   readOnly: boolean; // when true, only read statements are allowed through this connection
+  authMode: AuthMode;
+  /** the privilege every session on this connection is opened with; `default` for an ordinary one */
+  role: ConnectionRole;
+  /** wallet mode: which uploaded wallet under `data/wallets/` this connection uses */
+  walletId?: string;
+  /** wallet mode: the password the wallet's PEM key is encrypted with. A credential, so it
+   *  is stored and exported exactly like the database password and never sent to a browser. */
+  walletPassword?: string;
 }
 
 interface LiveConnection extends ConnConfig {
@@ -126,7 +190,17 @@ function loadRegistry() {
     const stored = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as StoredConnection[] | EncryptedRegistry;
     if (Array.isArray(stored) && !IS_LOOPBACK) throw new Error("Plaintext connection storage is not allowed for LAN access. Configure DATAFORGE_ENCRYPTION_KEY and migrate the file.");
     const arr = Array.isArray(stored) ? stored : decryptRegistry(stored);
-    for (const c of arr) if (c.engine === "oracle") registry.set(c.id, { ...c });
+    // `authMode` and `role` postdate the first registry format. An entry saved before them is
+    // a host/port connection with no privilege — spelled out here rather than left undefined,
+    // so the identity checks that compare them (and therefore the stored-password rule) still
+    // match, and so every reader sees a value of the type the field is declared to hold.
+    for (const c of arr)
+      if (c.engine === "oracle")
+        registry.set(c.id, {
+          ...c,
+          authMode: c.authMode === "wallet" ? "wallet" : "basic",
+          role: normalizeRole(c.role),
+        });
     seq = arr.reduce((m, c) => Math.max(m, Number(c.id.replace(/\D/g, "")) || 0), 0) + 1;
     if (arr.length) console.log(`Restored ${arr.length} saved connection(s) from ${DATA_FILE}`);
   } catch {
@@ -169,6 +243,115 @@ function saveRegistry() {
 
 loadRegistry();
 
+/* ---------------- Oracle Cloud wallets --------------------------------------------------
+ * An Autonomous Database wallet is a zip of files, and node-oracledb wants a directory to
+ * read them from — so an uploaded wallet is unpacked into `data/wallets/<id>/` and the
+ * connection stores only that id. The files themselves never go back to the browser: what a
+ * wallet upload answers with is the list of services inside its tnsnames.ora.
+ *
+ * The PEM in there is a private key, so the directory is created 0700 and the files 0600,
+ * the same treatment `data/connections.json` gets. Note that `DATAFORGE_ENCRYPTION_KEY`
+ * encrypts the *registry*, not this: the wallet's own password (kept in the registry, and
+ * therefore encrypted with everything else) is what stands between these files and use.
+ */
+const WALLET_DIR = path.join(DATA_DIR, "wallets");
+/** `w<n>` — a directory name, so it is never anything a request can influence. */
+let walletSeq = 1;
+
+/** True when `id` is one this server issued — never a path, never caller-shaped. */
+const isWalletId = (id: string) => /^w[0-9]+$/.test(id);
+
+/**
+ * The directory of one wallet. The id is re-checked here rather than only where requests
+ * arrive, so the "never a path" rule holds for every caller — including the registry, whose
+ * entries are read back from a file on disk.
+ */
+function walletPath(id: string): string {
+  if (!isWalletId(id)) throw new Error(`Not a wallet id: ${id}`);
+  return path.join(WALLET_DIR, id);
+}
+
+function nextWalletId(): string {
+  // Survives a restart without extra state: existing directories set the floor.
+  try {
+    for (const name of fs.readdirSync(WALLET_DIR)) {
+      const n = Number(name.replace(/\D/g, ""));
+      if (Number.isFinite(n) && n >= walletSeq) walletSeq = n + 1;
+    }
+  } catch {
+    /* no wallets yet */
+  }
+  return `w${walletSeq++}`;
+}
+
+/** Writes an unpacked wallet and returns the id a connection refers to it by. */
+function storeWallet(files: WalletFiles): string {
+  const id = nextWalletId();
+  const dir = walletPath(id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const name of WALLET_KEPT_FILES) {
+    if (files[name]) fs.writeFileSync(path.join(dir, name), files[name], { mode: 0o600 });
+  }
+  return id;
+}
+
+/** The services in a stored wallet's tnsnames.ora, or null when the wallet is gone. */
+function walletServices(id: string): WalletService[] | null {
+  try {
+    return parseTnsNames(fs.readFileSync(path.join(walletPath(id), "tnsnames.ora"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Reads a stored wallet back, for putting it inside an encrypted connection export. */
+function readWallet(id: string): WalletFiles | null {
+  const files: WalletFiles = {};
+  for (const name of WALLET_KEPT_FILES) {
+    try {
+      files[name] = fs.readFileSync(path.join(walletPath(id), name), "utf8");
+    } catch {
+      return null;
+    }
+  }
+  return files;
+}
+
+/** How long a freshly uploaded wallet is left alone even with nothing pointing at it. */
+const WALLET_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * Deletes wallet directories no saved connection points at any more.
+ *
+ * Called after every registry change rather than at the moment a connection is deleted,
+ * because two connections may share one wallet (an Autonomous Database wallet holds the
+ * high, medium and low services, and pointing a connection at each is the normal way to
+ * use it). Reachability is the only safe test.
+ *
+ * The grace period covers the gap the wizard opens: a wallet is uploaded a few fields before
+ * the connection that will point at it exists, and a registry change from somewhere else in
+ * that window — a second browser tab deleting a connection — would otherwise collect it out
+ * from under the form. An abandoned upload is swept up by the next prune after an hour.
+ */
+function pruneWallets() {
+  const inUse = new Set([...registry.values()].map((c) => c.walletId).filter(Boolean));
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(WALLET_DIR);
+  } catch {
+    return; // nothing has ever been uploaded
+  }
+  for (const dir of dirs) {
+    if (!isWalletId(dir) || inUse.has(dir)) continue;
+    try {
+      if (Date.now() - fs.statSync(walletPath(dir)).mtimeMs < WALLET_GRACE_MS) continue;
+      fs.rmSync(walletPath(dir), { recursive: true, force: true });
+    } catch (e) {
+      console.error(`Could not remove the unused wallet ${dir}:`, e);
+    }
+  }
+}
+
 /* ---------------- Workspace users: real server-side role enforcement ----------------
  * `accessRole` used to be a client-side dropdown backed by localStorage — cosmetic only,
  * trivially bypassed by anyone editing localStorage or calling the API directly. This
@@ -179,26 +362,14 @@ loadRegistry();
  * (via POST /api/users, open to everyone until one exists) switches the whole server over
  * to requiring HTTP Basic auth with a real username/password on every request.
  */
-type Role = "Administrator" | "Developer" | "Analyst" | "Viewer";
 const ROLES: Role[] = ["Administrator", "Developer", "Analyst", "Viewer"];
 const FULL_ACCESS_ROLES: Role[] = ["Administrator", "Developer"];
 
-interface StoredUser {
-  id: string;
-  name: string;
-  email: string; // lowercase; doubles as the HTTP Basic auth username
-  role: Role;
-  status: "Active" | "Suspended";
-  mfa: boolean; // stored, not enforced — see docs/security.md
-  salt: string; // base64
-  hash: string; // base64 scrypt hash
-  createdAt: string;
-}
 type PublicUser = Omit<StoredUser, "salt" | "hash">;
 const toPublicUser = ({ salt: _salt, hash: _hash, ...rest }: StoredUser): PublicUser => rest;
 
 const USERS_FILE = path.join(DATA_DIR, "users.json");
-const users = new Map<string, StoredUser>(); // keyed by lowercase email
+const users = loadUserStore(USERS_FILE); // keyed by lowercase email; load errors abort startup
 
 /** scrypt needs no extra dependency and (unlike a plain hash) is deliberately slow to brute-force. */
 function hashPassword(password: string, salt: Buffer = randomBytes(16)) {
@@ -275,6 +446,7 @@ const AUTH_FAILURE_WINDOW_MS = 60_000;
 const AUTH_COOLDOWN_MS = 60_000;
 const AUTH_FAILURE_MAX_TRACKED = 1000;
 const authFailures = new Map<string, { count: number; since: number; until: number }>();
+const authConcurrency = new AuthConcurrency();
 function authCooldownRemaining(ip: string): number {
   return Math.max(0, (authFailures.get(ip)?.until ?? 0) - Date.now());
 }
@@ -308,14 +480,6 @@ function recordAuthFailure(ip: string, username: string) {
   }
 }
 
-function loadUsers() {
-  try {
-    const arr = JSON.parse(fs.readFileSync(USERS_FILE, "utf8")) as StoredUser[];
-    for (const u of arr) users.set(u.email.toLowerCase(), u);
-  } catch {
-    /* no accounts yet — the server stays wide open, as documented above */
-  }
-}
 function saveUsers() {
   authCache.clear(); // a changed, suspended or deleted account must not ride a cached verification
   try {
@@ -325,7 +489,6 @@ function saveUsers() {
     console.error("Could not persist users:", e);
   }
 }
-loadUsers();
 
 /**
  * True once changing (or removing, via `statusOverride: "Suspended"`) `targetId` would
@@ -346,7 +509,7 @@ function wouldOrphanAdministrators(targetId: string, roleOverride?: Role, status
  * uses it to tell "disconnected" from "already disconnected".
  */
 async function closePools(c: LiveConnection): Promise<boolean> {
-  let wasOpen = false;
+  let wasOpen = await worksheetSessions.closeDatabase(c.id);
   if (c.oraPool) {
     wasOpen = true;
     try {
@@ -358,6 +521,9 @@ async function closePools(c: LiveConnection): Promise<boolean> {
 }
 
 function pickConfig(body: any): ConnConfig {
+  const authMode: AuthMode = body?.authMode === "wallet" ? "wallet" : "basic";
+  const walletId = String(body?.walletId ?? "");
+  const role = normalizeRole(body?.role);
   return {
     name: String(body?.name ?? "").slice(0, 120),
     engine: "oracle",
@@ -369,7 +535,32 @@ function pickConfig(body: any): ConnConfig {
     // read-only unless the caller explicitly opts out — a connection created without
     // saying anything about writes is treated as the safest thing it could be
     readOnly: body?.readOnly !== false,
+    authMode,
+    role,
+    // The wallet fields are dropped outright in basic mode, so switching a connection back
+    // to host/port cannot leave a stale wallet behind for `pruneWallets` to keep alive.
+    ...(authMode === "wallet"
+      ? {
+          walletId: isWalletId(walletId) ? walletId : "",
+          walletPassword: String(body?.walletPassword ?? ""),
+        }
+      : {}),
   };
+}
+
+/**
+ * Fills in the endpoint a wallet connection points at, from the wallet's own tnsnames.ora.
+ *
+ * `host` and `port` are display and bookkeeping values in wallet mode — the connection is
+ * made through the alias — but they are what the UI shows, what `sameEndpoint` compares and
+ * what `withNetworkHint` reads, so they are derived here rather than trusted from the
+ * request or left blank.
+ */
+function resolveWalletEndpoint(cfg: ConnConfig): ConnConfig {
+  if (cfg.authMode !== "wallet" || !cfg.walletId) return cfg;
+  const svc = walletServices(cfg.walletId)?.find((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase());
+  if (!svc) return cfg;
+  return { ...cfg, database: svc.alias, host: svc.host, port: svc.port };
 }
 
 /** closing character of an Oracle q-quote delimiter: q'[…]' and friends are mirrored, everything else is itself */
@@ -604,6 +795,17 @@ function confirmRequired(res: express.Response, confirmation: GuardConfirmation)
 
 function validate(cfg: ConnConfig): string | null {
   if (cfg.engine !== "oracle") return "Only Oracle Database connections are supported";
+  if (cfg.authMode === "wallet") {
+    if (!cfg.walletId) return "Upload the Oracle Cloud wallet zip for this connection";
+    const services = walletServices(cfg.walletId);
+    if (!services) return "That wallet is no longer on this server — upload the wallet zip again";
+    if (!cfg.database) return "Choose a database service from the wallet (e.g. the _high alias)";
+    if (!services.some((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase())) {
+      return `The wallet has no service called "${cfg.database}"`;
+    }
+    if (!cfg.user) return "Username is required";
+    return null;
+  }
   if (!cfg.host) return "Host is required";
   if (cfg.engine === "oracle" && !cfg.database) return "Service name is required for Oracle (e.g. FREEPDB1)";
   if (!Number.isFinite(cfg.port) || cfg.port < 1 || cfg.port > 65535) return "Invalid port";
@@ -691,27 +893,46 @@ function mapVal(v: unknown): string | number | null {
 
 /* ---------------- Oracle driver (node-oracledb Thin mode — no client install needed) ---------------- */
 
-const oraConnectString = (c: ConnConfig) => `${c.host}:${c.port}/${c.database}`;
+const oraConnectString = (c: ConnConfig) =>
+  // In wallet mode the descriptor lives in the wallet's tnsnames.ora and `database` is the
+  // alias into it — the host and port on the config are what that alias resolved to, kept
+  // for display, not for dialling.
+  c.authMode === "wallet" ? c.database : `${c.host}:${c.port}/${c.database}`;
 
-/** SYS can only connect AS SYSDBA (ORA-28009) — apply the privilege automatically, like SQL Developer does. */
-const isSysUser = (user: string) => user.trim().toLowerCase() === "sys";
+/**
+ * The connection attributes that make an Oracle Cloud wallet work in Thin mode: the
+ * directory holding `tnsnames.ora` (`configDir`, so the alias resolves) and the one holding
+ * `ewallet.pem` with the password it is encrypted under (`walletLocation` / `walletPassword`,
+ * so mutual TLS can complete). They are the same directory here. Empty in basic mode.
+ */
+function oraWalletOptions(c: ConnConfig): oracledb.ConnectionAttributes {
+  if (c.authMode !== "wallet" || !c.walletId) return {};
+  const dir = walletPath(c.walletId);
+  return { configDir: dir, walletLocation: dir, ...(c.walletPassword ? { walletPassword: c.walletPassword } : {}) };
+}
 
 async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
   if (!c.oraPool) {
     c.oraPool = await oracledb.createPool({
       user: c.user, password: c.password, connectString: oraConnectString(c),
+      ...oraWalletOptions(c),
       poolMin: 0, poolMax: 4, connectTimeout: 8,
     });
   }
   return c.oraPool;
 }
 
-/** SYS sessions bypass the pool: each query gets a standalone SYSDBA connection. */
+/**
+ * Privileged sessions bypass the pool: `createPool` takes no `privilege`, so a connection
+ * that has to be AS SYSDBA (or SYSOPER, SYSBACKUP…) is opened standalone for each query.
+ */
 async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
-  if (isSysUser(c.user)) {
+  const privilege = oraPrivilege(c);
+  if (privilege !== undefined) {
     return oracledb.getConnection({
       user: c.user, password: c.password, connectString: oraConnectString(c),
-      privilege: oracledb.SYSDBA, connectTimeout: 8,
+      ...oraWalletOptions(c),
+      privilege, connectTimeout: 8,
     });
   }
   const pool = await getOraPool(c);
@@ -719,14 +940,18 @@ async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
 }
 
 async function oraTest(cfg: ConnConfig): Promise<string> {
+  const role = effectiveRole(cfg);
+  const privilege = oraPrivilege(cfg);
   const conn = await oracledb.getConnection({
     user: cfg.user, password: cfg.password, connectString: oraConnectString(cfg), connectTimeout: 8,
-    ...(isSysUser(cfg.user) ? { privilege: oracledb.SYSDBA } : {}),
+    ...oraWalletOptions(cfg),
+    ...(privilege !== undefined ? { privilege } : {}),
   });
   await conn.execute("SELECT 1 FROM dual");
   const v = conn.oracleServerVersionString;
   await conn.close();
-  return `Oracle Database ${v}${isSysUser(cfg.user) ? " (as SYSDBA)" : ""}`;
+  // Naming the role back is how the user sees that SYS picked up SYSDBA without being asked.
+  return `Oracle Database ${v}${role === "default" ? "" : ` (as ${role})`}`;
 }
 
 /**
@@ -2702,13 +2927,16 @@ function oraPrepare(sql: string): string {
   return sql.replace(/;\s*$/, "");
 }
 
-async function oraQuery(c: LiveConnection, sql: string): Promise<QueryOutcome> {
-  const conn = await getOraConn(c);
+const worksheetSessions = new WorksheetSessions<oracledb.Connection>();
+setInterval(() => { void worksheetSessions.expire(); }, 60_000).unref();
+
+async function oraQuery(c: LiveConnection, sql: string, session?: oracledb.Connection): Promise<QueryOutcome> {
+  const conn = session ?? await getOraConn(c);
   try {
     const result = await conn.execute(oraPrepare(sql), [], {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
       maxRows: MAX_ROWS + 1,
-      autoCommit: true,
+      autoCommit: !session,
     });
     if (result.rows) {
       return {
@@ -2725,7 +2953,7 @@ async function oraQuery(c: LiveConnection, sql: string): Promise<QueryOutcome> {
       rowsReturned: affected,
     };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
@@ -3207,9 +3435,9 @@ async function oraRowColumns(conn: oracledb.Connection, table: string): Promise<
 }
 
 /** Read a page of rows together with the ROWID that identifies each one. */
-async function oraTableRows(c: LiveConnection, name: string, limit: number): Promise<TableRowsResult> {
+async function oraTableRows(c: LiveConnection, name: string, limit: number, session?: oracledb.Connection): Promise<TableRowsResult> {
   const lim = Math.min(MAX_ROWS, Math.max(1, limit));
-  const conn = await getOraConn(c);
+  const conn = session ?? await getOraConn(c);
   try {
     const table = await oraResolveTable(conn, name);
     if (!table) {
@@ -3242,13 +3470,13 @@ async function oraTableRows(c: LiveConnection, name: string, limit: number): Pro
       ...(editable ? {} : { reason: `No column of ${table} holds a type the data grid can write back.` }),
     };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
 /** Apply one row change. Identifiers come from the dictionary, values are always binds. */
-async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<RowChangeResult | { error: string }> {
-  const conn = await getOraConn(c);
+async function oraRowChange(c: LiveConnection, body: RowChangeBody, session?: oracledb.Connection): Promise<RowChangeResult | { error: string }> {
+  const conn = session ?? await getOraConn(c);
   try {
     const table = await oraResolveTable(conn, body.table);
     if (!table) return { error: `${body.table} is not a table in this schema — rows can only be edited on tables.` };
@@ -3260,7 +3488,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     if (body.action === "delete") {
       if (!body.rowId) return { error: "The row to delete could not be identified. Refresh the grid and try again." };
       const sql = `DELETE FROM ${quoteIdent(table)} WHERE ROWID = :rid${match.sql}`;
-      const r = await conn.execute(sql, { ...match.binds, rid: body.rowId }, { autoCommit: true });
+      const r = await conn.execute(sql, { ...match.binds, rid: body.rowId }, { autoCommit: !session });
       if (!r.rowsAffected) return { error: gone };
       return { ok: true, action: "delete", table, sql, rowId: null, row: null };
     }
@@ -3297,7 +3525,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
       const r = await conn.execute(
         sql,
         { ...binds, ...match.binds, rid: body.rowId, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
-        { autoCommit: true }
+        { autoCommit: !session }
       );
       if (!r.rowsAffected) return { error: gone };
       rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
@@ -3307,7 +3535,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
       const r = await conn.execute(
         sql,
         { ...binds, df_rowid: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 64 } },
-        { autoCommit: true }
+        { autoCommit: !session }
       );
       rowId = String((r.outBinds as { df_rowid: string[] }).df_rowid[0]);
     }
@@ -3322,7 +3550,7 @@ async function oraRowChange(c: LiveConnection, body: RowChangeBody): Promise<Row
     const row = back.rows?.[0] ? back.rows[0].map(mapVal) : null;
     return { ok: true, action: body.action, table, sql, rowId, row };
   } finally {
-    await conn.close();
+    if (!session) await conn.close();
   }
 }
 
@@ -3467,6 +3695,688 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
   } finally {
     await conn.close();
   }
+}
+
+/* ---------------- Copy objects into another connection (Oracle) ---------------- */
+
+/**
+ * A copy is capped rather than streamed. Everything below runs inside one HTTP request, so
+ * the caps are what stop a schema nobody looked at first from holding a request open for an
+ * hour. Both are reported in the plan, so the UI can say "this is more than one run" before
+ * anything is created rather than after.
+ */
+const OBJECT_COPY_MAX_OBJECTS = 2000;
+const OBJECT_COPY_BUDGET_MS = 300_000;
+const OBJECT_COPY_DDL_LOCK_S = 10;
+
+/** What a copy does with an object the target already has. */
+type CopyExisting = "skip" | "replace";
+
+interface ObjectCopyItem {
+  name: string;
+  existsInTarget: boolean;
+  /**
+   * The object this one is built on, when the target does not have it — an index whose table
+   * has not been copied yet, a trigger whose table or view has not. Absent for everything that
+   * can be created as things stand, which is every object of a kind that stands on its own.
+   */
+  missingBase?: string;
+}
+
+interface ObjectCopyKindSummary {
+  kind: CopyKind;
+  label: string;
+  note: string;
+  /** what replacing an existing one costs — dropping a table is not dropping an index */
+  replaceNote: string;
+  /** objects of this kind live in a tablespace, so the choice about it is worth offering */
+  hasTablespace: boolean;
+  /** replacing one is its own create statement, so "drop and recreate" is the wrong name for it */
+  replaceInPlace: boolean;
+  /**
+   * What objects of this kind are built on — "tables", "tables and views" — so the browser can
+   * say which run to do first about a blocked object instead of always saying "tables". Empty
+   * for a kind that stands on its own.
+   */
+  baseLabel: string;
+  /** this is the kind the run will copy — the plan surveys every kind, chosen or not */
+  selected: boolean;
+  total: number;
+  conflicts: number;
+}
+
+interface ObjectCopyPlan {
+  sourceId: string;
+  sourceName: string;
+  sourceSchema: string;
+  targetId: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  breakdown: ObjectCopyKindSummary[];
+  /** the objects of the chosen kind, in name order — what the run will walk */
+  items: ObjectCopyItem[];
+  total: number;
+  conflicts: number;
+  /** how many of them name a table the target has not got — they would be skipped, not created */
+  blocked: number;
+  cap: number;
+  overCap: boolean;
+  targetReadOnly: boolean;
+  targetSystemSchema: boolean;
+  /** the two connections resolve to the same schema on the same database — nothing to copy */
+  sameSchema: boolean;
+  checkedAt: string;
+}
+
+interface ObjectCopyObjectResult {
+  name: string;
+  status: "created" | "replaced" | "skipped" | "failed";
+  /** skipped: why. failed: the Oracle error. */
+  reason?: string;
+  error?: string;
+  /**
+   * Created, and still not working: a view the target cannot compile because something it
+   * selects from is not there, a trigger whose body calls a package that is not, a synonym
+   * for a table nobody copied. The object exists, so this is not a failure — but reporting it
+   * as a plain "created" would be a green result for a view that raises ORA-04063 on the next
+   * select, a trigger that raises it on the next insert, or a synonym that answers ORA-00980
+   * to whatever names it next.
+   */
+  warning?: string;
+  /** how many statements it took */
+  statements: number;
+}
+
+/** One foreign key of a copied table, added after every table in the run exists. */
+interface ObjectCopyFkResult {
+  table: string;
+  name: string;
+  status: "created" | "skipped" | "failed";
+  reason?: string;
+  error?: string;
+}
+
+interface ObjectCopyResult {
+  sourceName: string;
+  sourceSchema: string;
+  targetName: string;
+  targetSchema: string;
+  kind: CopyKind;
+  label: string;
+  existing: CopyExisting;
+  objects: ObjectCopyObjectResult[];
+  foreignKeys: ObjectCopyFkResult[];
+  created: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  /** created, but the target cannot compile them yet — always 0 for a kind that is not compiled */
+  invalid: number;
+  fksCreated: number;
+  fksFailed: number;
+  timedOut: boolean;
+  elapsedMs: number;
+  note?: string;
+}
+
+/**
+ * What each kind lists in the *source* dictionary.
+ *
+ * The listing excludes the objects Oracle generated for something else, because a copy that
+ * recreates them is a copy that fails: recycle-bin (`BIN$`) entries are dropped tables rather
+ * than tables, and `ORA_NOISE_TABLE` is the same exclusion the Explorer applies, so the copy
+ * offers exactly the tables the rest of the app calls the user's.
+ *
+ * A kind is added here, in `OBJECT_COPY_KINDS`, and — if it is built on something else — in
+ * `OBJECT_COPY_BASE_SQL`. Nothing else in the server needs to know about it, and the browser
+ * only needs the name added to its own copy of the union.
+ */
+const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
+  types: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'TYPE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  packages: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PACKAGE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  procedures: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PROCEDURE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  functions: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'FUNCTION' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  // The sequence behind an identity column is Oracle's, not the user's: it is created with the
+  // table, dropped with it, named ISEQ$_<object id>_<column> and refuses to be dropped on its
+  // own (ORA-32794). `user_objects.generated` is Oracle's own answer to "did a human name
+  // this?", so it is the same test the index listing uses rather than a second guess at it.
+  sequences: `SELECT s.sequence_name AS "name" FROM user_sequences s
+     WHERE NOT EXISTS (
+       SELECT 1 FROM user_objects o
+        WHERE o.object_name = s.sequence_name AND o.object_type = 'SEQUENCE' AND o.generated = 'Y')
+     ORDER BY s.sequence_name`,
+  // A materialized view keeps its rows in a table of the same name, and `user_tables` lists
+  // it like any other. Copying that as a table would create a plain table where a
+  // materialized view belongs and then leave the materialized-view run to fail on the name
+  // (ORA-00955), so the container is left to the kind that owns it.
+  tables: `SELECT table_name AS "name" FROM user_tables t WHERE NOT ${ORA_NOISE_TABLE}
+     AND NOT EXISTS (SELECT 1 FROM user_mviews m WHERE m.mview_name = t.table_name)
+     ORDER BY table_name`,
+  // Indexes are mostly an exercise in leaving out the ones that are not anybody's to copy:
+  //   · the index behind a primary or unique key is created *by* that constraint, and the
+  //     table copy already brings it — recreating it by hand would be a second index over the
+  //     same columns at best, and ORA-01408 at worst
+  //   · `generated = 'Y'` is Oracle's own answer to "did a human name this?", which catches
+  //     the constraint indexes it names itself along with LOB and IOT internals
+  //   · an index on someone else's table, or on a cluster, is not this schema's to recreate
+  // What is left is the indexes somebody wrote a CREATE INDEX for, which is the whole point.
+  indexes: `SELECT index_name AS "name" FROM user_indexes i
+     WHERE table_owner = USER AND table_type = 'TABLE'
+       AND generated = 'N' AND index_name NOT LIKE 'BIN$%'
+       AND index_type NOT IN ('LOB', 'IOT - TOP')
+       AND NOT ${ORA_NOISE_TABLE}
+       AND NOT EXISTS (
+         SELECT 1 FROM user_constraints c
+          WHERE c.index_name = i.index_name AND c.constraint_type IN ('P', 'U'))
+       AND NOT EXISTS (
+         SELECT 1 FROM user_mviews m WHERE m.mview_name = i.table_name)
+     ORDER BY index_name`,
+  // A view is text, and the copy's whole job is that text arriving in another schema with its
+  // meaning intact — which is why `retargetSchema` earns its keep here more than anywhere
+  // else: a view body is the likeliest place for someone to have typed WMT_RETAIL.ORDERS by
+  // hand, and a copy that leaves it reads the source database for ever.
+  //
+  // `generated = 'Y'` leaves out the views Oracle built for something of its own, the same
+  // test the sequence and index listings use. A materialized view is not in `user_views` at
+  // all, so nothing has to be done about one here.
+  views: `SELECT v.view_name AS "name" FROM user_views v
+     WHERE NOT EXISTS (
+       SELECT 1 FROM user_objects o
+        WHERE o.object_name = v.view_name AND o.object_type = 'VIEW' AND o.generated = 'Y')
+     ORDER BY v.view_name`,
+  // The container table, its index and the rows in it all arrive with the CREATE, so a
+  // materialized view is listed from `user_mviews` alone and nothing here has to describe the
+  // pieces underneath it — the table and index listings leave those out instead.
+  mviews: `SELECT mview_name AS "name" FROM user_mviews ORDER BY mview_name`,
+  // `user_synonyms` is the private ones, which is exactly the right list: a PUBLIC synonym is
+  // owned by PUBLIC rather than by this schema, is visible to every session on the database,
+  // and needs a privilege of its own to create — copying one is a change to the database, not
+  // to the target schema, so it is not offered and the kind's note says so.
+  //
+  //   · a synonym whose object has been dropped points at a `BIN$` name, and recreating it in
+  //     the target is a name for something that does not exist there under any name
+  //   · `generated = 'Y'` leaves out the ones Oracle named for something of its own, the same
+  //     test the sequence, index, view and trigger listings use
+  //
+  // A synonym over a database link is *not* excluded, and that is a decision rather than an
+  // oversight. The link is not one of the kinds this copies, so one landing in a target that
+  // has no such link is a synonym that does not resolve — but a target that does have the
+  // link needs the synonym, and leaving them out would drop objects silently. It lands, and
+  // the invalid check afterwards is what says whether it works.
+  synonyms: `SELECT s.synonym_name AS "name" FROM user_synonyms s
+     WHERE s.table_name NOT LIKE 'BIN$%'
+       AND NOT EXISTS (
+         SELECT 1 FROM user_objects o
+          WHERE o.object_name = s.synonym_name AND o.object_type = 'SYNONYM' AND o.generated = 'Y')
+     ORDER BY s.synonym_name`,
+  // A trigger is offered only where copying it means something in another schema:
+  //   · `base_object_type` leaves out the ones on the SCHEMA and the DATABASE — a DDL or
+  //     logon trigger is a rule about the account rather than one of its objects, and
+  //     recreating it in the target changes what that account is allowed to do
+  //   · a trigger on someone else's table is not this schema's to recreate, the same
+  //     exclusion the index listing makes
+  //   · `ORA_NOISE_TABLE` takes out the triggers Oracle keeps on its own tables — a
+  //     materialized view log, a container table, a Text index table — which are the
+  //     dictionary's business and fail or misfire in a target that has no such thing
+  //   · `generated = 'Y'` leaves out the ones Oracle named for something of its own
+  triggers: `SELECT t.trigger_name AS "name" FROM user_triggers t
+     WHERE t.base_object_type IN ('TABLE', 'VIEW')
+       AND t.table_owner = USER
+       AND t.trigger_name NOT LIKE 'BIN$%'
+       AND NOT ${ORA_NOISE_TABLE}
+       AND NOT EXISTS (
+         SELECT 1 FROM user_objects o
+          WHERE o.object_name = t.trigger_name AND o.object_type = 'TRIGGER' AND o.generated = 'Y')
+     ORDER BY t.trigger_name`,
+};
+
+/**
+ * What each object of a kind is built on, for the kinds that are built on something at all.
+ *
+ * Read from the source, because that is where the object exists; what the *target* is missing
+ * is then a lookup against what it already has, among the kinds `copyBaseKinds` names. A kind
+ * with no entry here has `requiresTable: false` and never asks.
+ *
+ * The query answers with a name and nothing else — not which kind of object it is. That is
+ * deliberate: a trigger's base object can be a table or a view, the target is searched for
+ * both, and a name that is there under either is a base object this trigger can be created on.
+ * Asking Oracle which one it is in the *source* would only let the run refuse a name the
+ * target has.
+ */
+const OBJECT_COPY_BASE_SQL: Partial<Record<CopyKind, string>> = {
+  indexes: `SELECT index_name AS "name", table_name AS "tbl" FROM user_indexes WHERE table_owner = USER`,
+  triggers: `SELECT trigger_name AS "name", table_name AS "tbl" FROM user_triggers
+     WHERE base_object_type IN ('TABLE', 'VIEW') AND table_owner = USER`,
+};
+
+/**
+ * Ask this session for DDL that can land in another schema.
+ *
+ * Which parameters and why is `copyTransforms` in `server/objectCopy.ts`; this is the half
+ * that talks to Oracle. Each parameter is set on its own and its failure ignored: the set is
+ * version-dependent, and an older database refusing one of them (ORA-31604) must not cost the
+ * copy the other parameters.
+ */
+async function oraCopyPrepareMetadata(conn: oracledb.Connection, preserveTablespace: boolean): Promise<void> {
+  for (const [name, value] of copyTransforms(preserveTablespace)) {
+    await conn
+      .execute(
+        `BEGIN dbms_metadata.set_transform_param(dbms_metadata.session_transform, :n, :v); END;`,
+        { n: name, v: value }
+      )
+      .catch(() => {});
+  }
+}
+
+/** Every object of one kind in the connected schema, as the dictionary spells it. */
+async function oraCopyList(conn: oracledb.Connection, kind: CopyKind): Promise<string[]> {
+  const rows = await oraExecRows(conn, OBJECT_COPY_LIST_SQL[kind]);
+  return rows.map((r) => String(r.name));
+}
+
+/** Object name → the object it is built on, empty for a kind that is not built on one. */
+async function oraCopyBaseObjects(conn: oracledb.Connection, kind: CopyKind): Promise<Map<string, string>> {
+  const sql = OBJECT_COPY_BASE_SQL[kind];
+  if (!sql) return new Map();
+  const rows = await oraExecRows(conn, sql);
+  return new Map(rows.map((r) => [String(r.name), String(r.tbl)]));
+}
+
+/** What the target already has, as `KIND NAME` keys, for one query rather than one per kind. */
+async function oraCopyExisting(conn: oracledb.Connection, kinds: CopyKind[]): Promise<Set<string>> {
+  const have = new Set<string>();
+  if (!kinds.length) return have;
+  const types = kinds.map((k) => copyKindSpec(k).objectType);
+  const rows = await oraExecRows(
+    conn,
+    `SELECT object_type AS "type", object_name AS "name" FROM user_objects
+     WHERE object_type IN (${types.map((t) => `'${t}'`).join(",")}) AND object_name NOT LIKE 'BIN$%'`
+  );
+  const kindOfType = new Map(kinds.map((k) => [copyKindSpec(k).objectType, k]));
+  for (const r of rows) {
+    const kind = kindOfType.get(String(r.type));
+    if (kind) have.add(`${kind} ${String(r.name)}`);
+  }
+  return have;
+}
+
+/**
+ * Which of these objects the target has but cannot compile.
+ *
+ * A view is created `FORCE`, so one whose tables are not in the target is created INVALID
+ * rather than refused — which is the bet that makes the order views are copied in irrelevant,
+ * and the reason a run of them cannot be reported from the `CREATE`s alone. A trigger is the
+ * same shape of problem from the other direction: its base table has to be there or the
+ * `CREATE` is refused, but whatever its body *calls* need not be, and a trigger that cannot
+ * compile is a trigger that raises ORA-04063 on the next insert instead of the next select.
+ *
+ * A disabled trigger is not an invalid one — `status` is about compilation, and the copy
+ * brings the source's enabled or disabled state across on purpose — so nothing here reports
+ * one, which is right.
+ *
+ * A synonym is the odd one out, and knowingly so. Nothing about it is compiled: it is a name
+ * and a target, and Oracle creates one for an object that is not there rather than refusing
+ * it. Asking this question of the synonyms anyway costs one query and turns a dangling one
+ * into a reported warning wherever the target marks it INVALID — the case that matters most
+ * for this kind, since a synonym for a package or a database link is dangling by construction
+ * when the dependency has not been copied. What is *not* established is whether Oracle
+ * marks a never-resolvable synonym at all; where it does not, this finds nothing and the
+ * synonym is reported as the plain "created" it also is.
+ *
+ * The whole schema's invalid objects of the type are read and filtered here rather than named
+ * in an `IN` list, for the same reason the foreign-key pass does it: a run can carry two
+ * thousand names and Oracle stops at a thousand expressions in one `IN`.
+ */
+async function oraCopyInvalid(conn: oracledb.Connection, kind: CopyKind, names: Set<string>): Promise<Set<string>> {
+  if (!names.size) return new Set();
+  const rows = await oraExecRows(
+    conn,
+    `SELECT object_name AS "name" FROM user_objects WHERE object_type IN (:t, :body) AND status <> 'VALID'`,
+    { t: copyStatusTypes(kind)[0], body: copyStatusTypes(kind)[1] ?? copyStatusTypes(kind)[0] }
+  );
+  return new Set(rows.map((r) => String(r.name)).filter((n) => names.has(n)));
+}
+
+/**
+ * The statements that recreate one object in another schema.
+ *
+ * Empty when the object has no readable DDL — an object someone dropped between the plan and
+ * the run, a table DBMS_METADATA refuses. The caller reports that as a skip rather than
+ * inventing a statement for it.
+ */
+async function oraCopyObjectDdl(
+  conn: oracledb.Connection,
+  kind: CopyKind,
+  name: string,
+  fromSchema: string,
+  toSchema: string
+): Promise<string[]> {
+  // `copyMetadataType` rather than `objectType`: DBMS_METADATA calls it MATERIALIZED_VIEW
+  // where the dictionary calls it MATERIALIZED VIEW, and the dictionary's spelling here earns
+  // an ORA-31600 naming the parameter rather than the mistake.
+  const rows = await oraExecRows(conn, `SELECT dbms_metadata.get_ddl(:t, :n) AS "ddl" FROM dual`, {
+    t: copyMetadataType(kind),
+    n: name,
+  });
+  const ddl = rows[0]?.ddl;
+  if (ddl == null) return [];
+  return copyStatements(retargetSchema(String(ddl), fromSchema, toSchema));
+}
+
+/**
+ * Add the foreign keys of the tables this run put in the target.
+ *
+ * The second half of leaving `REF_CONSTRAINTS` out of `CREATE TABLE`. A foreign key names a
+ * second table, so it cannot be part of the statement that creates the first one without
+ * making the order the tables are copied in matter — and the order is alphabetical, which puts
+ * plenty of children before their parents. Deferring them to here is what makes a copied
+ * schema come out with its referential integrity intact whatever order the tables arrived in.
+ *
+ * Each constraint is read and run on its own rather than through `GET_DEPENDENT_DDL` for the
+ * whole table, so one foreign key pointing at a table nobody copied is one reported failure
+ * instead of a table's worth of them. What the target already has is read once and skipped:
+ * re-running a copy is expected, and a constraint that is already there is not an error to
+ * report — Oracle would raise ORA-02264 on the name, which says nothing useful about why.
+ */
+async function oraCopyForeignKeys(
+  srcConn: oracledb.Connection,
+  tgtConn: oracledb.Connection,
+  tables: Set<string>,
+  fromSchema: string,
+  toSchema: string,
+  deadline: number
+): Promise<{ results: ObjectCopyFkResult[]; timedOut: boolean }> {
+  const results: ObjectCopyFkResult[] = [];
+  if (!tables.size) return { results, timedOut: false };
+
+  // the whole schema's foreign keys, filtered here rather than with an IN list: a run can
+  // carry two thousand table names and Oracle stops at a thousand expressions in one IN
+  const all = await oraExecRows(
+    srcConn,
+    `SELECT constraint_name AS "name", table_name AS "table" FROM user_constraints
+     WHERE constraint_type = 'R' ORDER BY table_name, constraint_name`
+  );
+  const wanted = all.filter((r) => tables.has(String(r.table)));
+  if (!wanted.length) return { results, timedOut: false };
+
+  const present = new Set(
+    (
+      await oraExecRows(tgtConn, `SELECT constraint_name AS "name" FROM user_constraints WHERE constraint_type = 'R'`)
+    ).map((r) => String(r.name))
+  );
+
+  let timedOut = false;
+  for (const row of wanted) {
+    const name = String(row.name);
+    const table = String(row.table);
+    if (Date.now() > deadline) {
+      timedOut = true;
+      break;
+    }
+    if (present.has(name)) {
+      results.push({ table, name, status: "skipped", reason: `Already in ${toSchema}.` });
+      continue;
+    }
+    try {
+      const rows = await oraExecRows(srcConn, `SELECT dbms_metadata.get_ddl('REF_CONSTRAINT', :n) AS "ddl" FROM dual`, {
+        n: name,
+      });
+      const ddl = rows[0]?.ddl;
+      if (ddl == null) {
+        results.push({ table, name, status: "skipped", reason: "The source has no readable DDL for this constraint." });
+        continue;
+      }
+      for (const sql of copyStatements(retargetSchema(String(ddl), fromSchema, toSchema))) {
+        await tgtConn.execute(sql, [], { autoCommit: true });
+      }
+      results.push({ table, name, status: "created" });
+    } catch (e) {
+      results.push({ table, name, status: "failed", error: errMsg(e) });
+    }
+  }
+  return { results, timedOut };
+}
+
+/**
+ * Read the source and the target and describe what a copy would do, without touching either.
+ *
+ * The plan is what the confirmation dialog is written from, so it counts the same objects the
+ * run will walk, using the same query — a preview built from a different list than the run is
+ * worse than no preview.
+ *
+ * It surveys **every** kind and marks which one is chosen, rather than surveying only the
+ * chosen one. That is what lets the browser render the whole list of kinds — with a count
+ * beside each and the note saying what that kind carries — from the server's own catalogue
+ * instead of a copy of it that can drift, and it is what will make the next kind a change to
+ * this file alone. Only the chosen kind is counted into `total`, `conflicts` and the cap.
+ */
+async function oraObjectCopyPlan(
+  source: LiveConnection,
+  target: LiveConnection,
+  kind: CopyKind
+): Promise<ObjectCopyPlan> {
+  const sourceSchema = source.user.toUpperCase();
+  const targetSchema = target.user.toUpperCase();
+  const srcConn = await getOraConn(source);
+  const names = new Map<CopyKind, string[]>();
+  let baseObjects = new Map<string, string>();
+  let targetSystemSchema = false;
+  let existing: Set<string>;
+  try {
+    for (const k of ALL_COPY_KINDS) names.set(k, await oraCopyList(srcConn, k));
+    if (copyKindSpec(kind).requiresTable) baseObjects = await oraCopyBaseObjects(srcConn, kind);
+    const tgtConn = await getOraConn(target);
+    try {
+      targetSystemSchema = await oraUserIsSystem(target, tgtConn);
+      existing = await oraCopyExisting(tgtConn, ALL_COPY_KINDS);
+    } finally {
+      await tgtConn.close();
+    }
+  } finally {
+    await srcConn.close();
+  }
+
+  const breakdown: ObjectCopyKindSummary[] = OBJECT_COPY_KINDS.map((spec) => {
+    const of = names.get(spec.kind) ?? [];
+    return {
+      kind: spec.kind,
+      label: spec.label,
+      note: spec.note,
+      replaceNote: spec.replaceNote,
+      hasTablespace: spec.hasTablespace,
+      replaceInPlace: spec.replaceInPlace,
+      baseLabel: copyBaseLabel(spec.kind),
+      selected: spec.kind === kind,
+      total: of.length,
+      conflicts: of.filter((n) => existing.has(`${spec.kind} ${n}`)).length,
+    };
+  });
+
+  // `existing` was read for every kind, so what the target has is already in hand: an index
+  // whose table is not among them — or a trigger whose table *and* view are not — is one the
+  // run will skip, and saying so here is what lets the picker show it before anything is
+  // attempted rather than after.
+  const baseKinds = copyBaseKinds(kind);
+  const items: ObjectCopyItem[] = (names.get(kind) ?? []).map((name) => {
+    const base = baseObjects.get(name);
+    const haveBase = !!base && baseKinds.some((k) => existing.has(`${k} ${base}`));
+    return {
+      name,
+      existsInTarget: existing.has(`${kind} ${name}`),
+      ...(base && !haveBase ? { missingBase: base } : {}),
+    };
+  });
+
+  return {
+    sourceId: source.id,
+    sourceName: source.name,
+    sourceSchema,
+    targetId: target.id,
+    targetName: target.name,
+    targetSchema,
+    kind,
+    label: copyKindSpec(kind).label,
+    breakdown,
+    items,
+    total: items.length,
+    conflicts: items.filter((i) => i.existsInTarget).length,
+    blocked: items.filter((i) => i.missingBase).length,
+    cap: OBJECT_COPY_MAX_OBJECTS,
+    overCap: items.length > OBJECT_COPY_MAX_OBJECTS,
+    targetReadOnly: !!target.readOnly,
+    targetSystemSchema,
+    sameSchema: sameOracleSchema(source, target),
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Run the copy: one source session and one target session, one kind of object.
+ *
+ * A failure does not stop the run. `oraApplyTableDdl` stops on the first error because it is
+ * applying one table's ordered script, where everything after the failure depends on it; this
+ * is hundreds of independent objects, and one table with a missing grant must not cost the
+ * other two hundred. Every object is attempted and every outcome is reported, which is also
+ * what makes a second run useful: re-running with "skip" fills in only what failed.
+ *
+ * `names` is the objects the caller picked, already intersected with the source listing by
+ * `normalizeNames`, or null for every object of the kind. It is applied against a *fresh*
+ * listing rather than trusted as a list of things to fetch, so a name that has been dropped
+ * since the plan was read simply is not there to copy.
+ */
+async function oraObjectCopy(
+  source: LiveConnection,
+  target: LiveConnection,
+  kind: CopyKind,
+  existing: CopyExisting,
+  opts: { names: string[] | null; preserveTablespace: boolean }
+): Promise<ObjectCopyResult> {
+  const t0 = Date.now();
+  const deadline = t0 + OBJECT_COPY_BUDGET_MS;
+  const sourceSchema = source.user.toUpperCase();
+  const targetSchema = target.user.toUpperCase();
+  const spec = copyKindSpec(kind);
+  const objects: ObjectCopyObjectResult[] = [];
+  const foreignKeys: ObjectCopyFkResult[] = [];
+  /** what this run left standing in the target, and therefore owes foreign keys to */
+  const landed = new Set<string>();
+  let timedOut = false;
+
+  const srcConn = await getOraConn(source);
+  try {
+    await oraCopyPrepareMetadata(srcConn, opts.preserveTablespace);
+    const tgtConn = await getOraConn(target);
+    try {
+      // A dropped or replaced object someone else is using would otherwise block for ever;
+      // ten seconds turns that into one reported failure instead of a stalled request.
+      await tgtConn.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
+
+      // A kind built on something needs the target read for that too — the same query with
+      // another type or two in its IN list, which is what makes the check below cost nothing.
+      const baseKinds = copyBaseKinds(kind);
+      const present = await oraCopyExisting(tgtConn, [kind, ...baseKinds]);
+      const baseObjects = baseKinds.length ? await oraCopyBaseObjects(srcConn, kind) : new Map<string, string>();
+      const wanted = opts.names ? new Set(opts.names) : null;
+      for (const name of await oraCopyList(srcConn, kind)) {
+        if (wanted && !wanted.has(name)) continue;
+        if (Date.now() > deadline) {
+          timedOut = true;
+          break;
+        }
+        const base = { name, statements: 0 };
+        const already = present.has(`${kind} ${name}`);
+        if (already && existing === "skip") {
+          objects.push({ ...base, status: "skipped", reason: `Already in ${targetSchema} — left as it is.` });
+          // it is in the target, so its foreign keys are still this run's business: the second
+          // pass fills in the ones the target is missing and leaves the ones it has
+          landed.add(name);
+          continue;
+        }
+        // An index cannot be created before its table is there, and neither can a trigger
+        // before the table or view it fires for. Oracle's own answer to that is ORA-00942 on
+        // the CREATE, which names neither the object nor the one it wanted; this names both
+        // and says which run to do first.
+        const baseObject = baseObjects.get(name);
+        if (baseObject && !baseKinds.some((k) => present.has(`${k} ${baseObject}`))) {
+          objects.push({
+            ...base,
+            status: "skipped",
+            reason: `${baseObject} is not in ${targetSchema} — copy the ${copyBaseLabel(kind)} first, then run this again.`,
+          });
+          continue;
+        }
+        try {
+          const statements = await oraCopyObjectDdl(srcConn, kind, name, sourceSchema, targetSchema);
+          if (!statements.length) {
+            objects.push({ ...base, status: "skipped", reason: "The source has no readable DDL for this object." });
+            continue;
+          }
+          // Replacing a view is the `CREATE OR REPLACE` the source itself emitted. Dropping it
+          // first would throw away the grants on it and invalidate every view built on it, to
+          // make room for a statement that was going to overwrite it anyway.
+          if (already && !spec.replaceInPlace) {
+            const drop = dropStatement(kind, name);
+            if (drop) await tgtConn.execute(drop, [], { autoCommit: true });
+          }
+          for (const sql of statements) await tgtConn.execute(sql, [], { autoCommit: true });
+          objects.push({ ...base, status: already ? "replaced" : "created", statements: statements.length });
+          landed.add(name);
+        } catch (e) {
+          objects.push({ ...base, status: "failed", error: withNetworkHint(errMsg(e), target.host) });
+        }
+      }
+
+      // Second pass, once every table this run is responsible for exists in the target — the
+      // point of having taken the foreign keys out of CREATE TABLE in the first place.
+      if (spec.foreignKeys && !timedOut) {
+        const fks = await oraCopyForeignKeys(srcConn, tgtConn, landed, sourceSchema, targetSchema, deadline);
+        foreignKeys.push(...fks.results);
+        timedOut = timedOut || fks.timedOut;
+      }
+
+      // The other kind of second pass: a view is created FORCE, so it lands whether or not the
+      // target has what it selects from, and a run that only reported the CREATEs would call
+      // that a success. One query says which of the ones just created are invalid, and each of
+      // those is still a created object — with the one sentence that says it does not work yet.
+      if (spec.compiled) {
+        const made = objects.filter((o) => o.status === "created" || o.status === "replaced");
+        const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name)));
+        for (const o of made) {
+          if (!invalid.has(o.name)) continue;
+          o.warning = `Created, but ${targetSchema} reports invalid compilation (including any package or type body). Check compilation errors and dependencies, then recompile.`;
+        }
+      }
+    } finally {
+      await tgtConn.close();
+    }
+  } finally {
+    await srcConn.close();
+  }
+
+  const count = (s: ObjectCopyObjectResult["status"]) => objects.filter((o) => o.status === s).length;
+  return {
+    sourceName: source.name,
+    sourceSchema,
+    targetName: target.name,
+    targetSchema,
+    kind,
+    label: spec.label,
+    existing,
+    objects,
+    foreignKeys,
+    created: count("created"),
+    replaced: count("replaced"),
+    skipped: count("skipped"),
+    failed: count("failed"),
+    invalid: objects.filter((o) => o.warning).length,
+    fksCreated: foreignKeys.filter((f) => f.status === "created").length,
+    fksFailed: foreignKeys.filter((f) => f.status === "failed").length,
+    timedOut,
+    elapsedMs: Date.now() - t0,
+    ...(objects.length ? {} : { note: `Nothing to copy — ${sourceSchema} has no ${spec.label.toLowerCase()}.` }),
+  };
 }
 
 /* ---------------- HTTP API ---------------- */
@@ -3651,19 +4561,16 @@ app.use((req, res, next) => {
   }
 
   const user = users.get(username.toLowerCase());
-  if (!user || user.status !== "Active") {
-    // Same derivation cost as a real wrong-password check below, against a fixed dummy pair
-    // rather than a real one — see the comment on DUMMY_CREDENTIAL. Its own result is never
-    // checked; the only thing that matters here is the wall-clock time it consumes.
-    verifyPassword(password, DUMMY_CREDENTIAL.salt, DUMMY_CREDENTIAL.hash).then(() => {
-      recordAuthFailure(req.ip ?? "", username);
-      challenge();
-    }, next);
-    return;
+  const active = user?.status === "Active";
+  const { salt, hash } = active ? user : DUMMY_CREDENTIAL;
+  const verification = authConcurrency.run(req.ip ?? "", () => verifyPassword(password, salt, hash));
+  if (!verification) {
+    res.setHeader("Retry-After", "1");
+    return res.status(429).json({ error: "Too many sign-in checks in progress. Try again shortly." });
   }
-  const { salt, hash } = user;
-  verifyPassword(password, salt, hash).then((ok) => {
-    if (!ok) {
+  verification.then((ok) => {
+    // Unknown and suspended accounts use the same bounded derivation as active accounts.
+    if (!active || !ok) {
       recordAuthFailure(req.ip ?? "", username);
       return challenge();
     }
@@ -3954,10 +4861,58 @@ async function runTest(cfg: ConnConfig) {
  */
 app.get("/api/connections", (_req, res) => {
   const connections = [...registry.values()].map((c) => {
-    const { password: _pw, oraPool: _op, oracleMaintained: _om, ...safe } = c;
+    const { password: _pw, walletPassword: _wp, oraPool: _op, oracleMaintained: _om, ...safe } = c;
     return safe;
   });
   res.json({ connections });
+});
+
+/* ---------------- Uploading an Oracle Cloud wallet ------------------------------------
+ * The wallet zip is the whole endpoint definition for an Autonomous Database: host, port,
+ * service names and the certificate to present, all inside the file Oracle Cloud hands you.
+ * So a wallet connection is made by uploading that zip rather than by typing an endpoint —
+ * this unpacks it, keeps the two files Thin mode reads, and answers with the services it
+ * found so the user can pick one.
+ *
+ * Full access only, like every route that writes to `data/`. What lands on disk is a private
+ * key, and an upload with no connection saved after it is swept up by `pruneWallets`.
+ */
+app.post("/api/wallets", requireFullAccess, (req, res) => {
+  const b64 = String(req.body?.data ?? "");
+  if (!b64) return res.status(400).json({ error: "No wallet file was uploaded." });
+  // base64 runs ~4/3 the size of the bytes; refuse an oversized upload before decoding it.
+  if (b64.length > WALLET_ZIP_MAX_BYTES * 2) {
+    return res.status(413).json({ error: `That file is larger than the ${WALLET_ZIP_MAX_BYTES / 1024 / 1024} MB a wallet zip may be.` });
+  }
+  let files: WalletFiles;
+  try {
+    files = extractWallet(Buffer.from(b64, "base64"));
+  } catch (e) {
+    return res.status(400).json({ error: errMsg(e) });
+  }
+
+  let id: string;
+  try {
+    id = storeWallet(files);
+  } catch (e) {
+    console.error("Could not store the uploaded wallet:", e);
+    return res.status(500).json({ error: "The wallet could not be written to disk." });
+  }
+  console.log(`Stored an Oracle Cloud wallet as ${id} — requested by ${(res.locals.userName as string | undefined) ?? (res.locals.role as Role)}`);
+  res.json({
+    walletId: id,
+    services: parseTnsNames(files["tnsnames.ora"]),
+    needsPassword: walletNeedsPassword(files["ewallet.pem"]),
+  });
+});
+
+/** The services in an already-uploaded wallet — what the edit form repopulates from. */
+app.get("/api/wallets/:id", requireFullAccess, (req, res) => {
+  if (!isWalletId(req.params.id)) return res.status(400).json({ error: "Not a wallet id." });
+  const services = walletServices(req.params.id);
+  if (!services) return res.status(404).json({ error: "That wallet is no longer on this server — upload the wallet zip again." });
+  const pem = readWallet(req.params.id)?.["ewallet.pem"] ?? "";
+  res.json({ walletId: req.params.id, services, needsPassword: walletNeedsPassword(pem) });
 });
 
 /**
@@ -3969,7 +4924,7 @@ app.get("/api/connections", (_req, res) => {
  * Analyst and Viewer reach anything at all, not a registry or data mutation.
  */
 app.post("/api/connections/test", requireFullAccess, async (req, res) => {
-  res.json(await runTest(pickConfig(req.body)));
+  res.json(await runTest(resolveWalletEndpoint(pickConfig(req.body))));
 });
 
 /**
@@ -3989,27 +4944,64 @@ const sameEndpoint = (a: ConnConfig, b: ConnConfig) =>
   a.host === b.host &&
   Number(a.port) === Number(b.port) &&
   a.user === b.user &&
-  (a.database ?? "") === (b.database ?? "");
+  (a.database ?? "") === (b.database ?? "") &&
+  // A wallet is part of the destination's identity: swapping in a different wallet points
+  // the same alias at a different Autonomous Database, which is exactly the substitution
+  // the stored-password rule exists to stop.
+  a.authMode === b.authMode &&
+  (a.walletId ?? "") === (b.walletId ?? "");
+
+/**
+ * The two connections are the same Oracle schema on the same database.
+ *
+ * `sameEndpoint` is deliberately case-sensitive about the username, because it guards
+ * replaying a stored password and the conservative answer there is "not the same
+ * destination". Oracle is not: `hr` and `HR` are one account, and a copy of a schema onto
+ * itself — which with "replace" drops every object and recreates it from a dictionary it is
+ * in the middle of changing — is exactly what the copy refusal exists to stop. So this folds
+ * the case that one does not, and leaves the wallet out of it: two saved connections reaching
+ * the same database through different copies of the same wallet are still the same schema.
+ */
+const sameOracleSchema = (a: ConnConfig, b: ConnConfig) =>
+  a.engine === b.engine &&
+  a.host === b.host &&
+  Number(a.port) === Number(b.port) &&
+  (a.database ?? "") === (b.database ?? "") &&
+  a.user.trim().toUpperCase() === b.user.trim().toUpperCase();
+
+/**
+ * Fills a blank password with the stored one, for the endpoint it was stored against.
+ * Returns the reason it may not be reused, or null once `cfg` is ready to connect with.
+ */
+function reuseStoredSecrets(cfg: ConnConfig, saved: LiveConnection): string | null {
+  const needsWalletPassword = cfg.authMode === "wallet" && !cfg.walletPassword && !!saved.walletPassword;
+  if (cfg.password && !needsWalletPassword) return null;
+  if (!sameEndpoint(cfg, saved)) return SAME_ENDPOINT_ERROR;
+  if (!cfg.password) cfg.password = saved.password;
+  if (needsWalletPassword) cfg.walletPassword = saved.walletPassword;
+  return null;
+}
 
 /** Test against an existing connection — an empty password means "use the stored one". */
 app.post("/api/connections/:id/test", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.json({ ok: false, error: "Unknown connection (backend may have restarted — recreate it)" });
-  const cfg = pickConfig(req.body);
-  if (!cfg.password) {
-    if (!sameEndpoint(cfg, c)) return res.json({ ok: false, error: SAME_ENDPOINT_ERROR });
-    cfg.password = c.password;
-  }
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
+  const refused = reuseStoredSecrets(cfg, c);
+  if (refused) return res.json({ ok: false, error: refused });
   res.json(await runTest(cfg));
 });
 
 app.post("/api/connections", requireFullAccess, (req, res) => {
-  const cfg = pickConfig(req.body);
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
   const bad = validate(cfg);
   if (bad) return res.status(400).json({ error: bad });
   const id = `live${seq++}`;
   registry.set(id, { ...cfg, id });
   saveRegistry();
+  // An upload the user abandoned before saving leaves a private key on disk; the first save
+  // after it is as good a moment as any to notice nothing points at it.
+  pruneWallets();
   res.json({ id });
 });
 
@@ -4017,27 +5009,302 @@ app.post("/api/connections", requireFullAccess, (req, res) => {
 app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  const cfg = pickConfig(req.body);
-  if (!cfg.password) {
-    if (!sameEndpoint(cfg, c)) return res.status(400).json({ error: SAME_ENDPOINT_ERROR });
-    cfg.password = c.password;
-  }
+  const cfg = resolveWalletEndpoint(pickConfig(req.body));
+  const refused = reuseStoredSecrets(cfg, c);
+  if (refused) return res.status(400).json({ error: refused });
   const bad = validate(cfg);
   if (bad) return res.status(400).json({ error: bad });
-  await closePools(c);
+  try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
   registry.set(c.id, { ...cfg, id: c.id });
   saveRegistry();
+  pruneWallets(); // the wallet this connection used to point at may now be unreferenced
   res.json({ ok: true });
 });
 
 app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
   const c = registry.get(req.params.id);
   if (c) {
-    await closePools(c);
+    try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
     registry.delete(c.id);
     saveRegistry();
+    pruneWallets();
   }
   res.json({ ok: true });
+});
+
+/* ---------------- Portable, passphrase-encrypted export of saved connections ----------
+ * `data/connections.json` is encrypted with DATAFORGE_ENCRYPTION_KEY — a key that lives in
+ * this server's environment, which makes that file a backup of the registry only for as
+ * long as the machine holding the key survives. This endpoint is the portable form: the
+ * caller supplies a passphrase, the server derives a key from it and re-encrypts the chosen
+ * connections — Oracle passwords included — under that passphrase alone.
+ *
+ * The result is a credential file whose only protection is what the user typed, so:
+ *  - full access only, like every other route that reads or mutates the registry;
+ *  - the passphrase floor is higher than the one for workspace accounts. An account
+ *    password is guessed online against a server that rate-limits and logs; an export file
+ *    is guessed offline, at whatever rate the attacker's hardware allows, forever;
+ *  - scrypt runs at a deliberately expensive cost so each of those guesses has to pay.
+ *
+ * The password is never sent to the browser in the clear on the way out either: the plaintext
+ * exists only inside `encryptExport` — connectionExport.ts, where the envelope format lives
+ * and where its tests are — and what leaves here is ciphertext.
+ */
+/**
+ * One connection as it appears inside the encrypted payload — the stored config minus the
+ * server-assigned id, which is a registry sequence number and means nothing elsewhere.
+ *
+ * A wallet connection carries its wallet along, inline. `walletId` is a directory name on
+ * the machine that wrote the file, so an export without the files themselves would restore
+ * to a connection pointing at nothing; the wallet is a few kilobytes, and the envelope it
+ * travels in is the same passphrase-encrypted one already carrying the passwords.
+ */
+type ExportedConnection = ConnConfig & { wallet?: WalletFiles };
+
+/** The wallet files of an entry in an uploaded export, or null — every field is untrusted. */
+function pickWalletFiles(entry: unknown): WalletFiles | null {
+  const raw = (entry as { wallet?: unknown } | null)?.wallet;
+  if (!raw || typeof raw !== "object") return null;
+  const files: WalletFiles = {};
+  for (const name of WALLET_KEPT_FILES) {
+    const v = (raw as Record<string, unknown>)[name];
+    if (typeof v !== "string" || !v || v.length > WALLET_ZIP_MAX_BYTES) return null;
+    files[name] = v;
+  }
+  return files;
+}
+
+/**
+ * Export saved connections as one passphrase-encrypted JSON file.
+ * Body: `{ password, ids? }` — `ids` omitted means every saved connection.
+ */
+app.post("/api/connections/export", requireFullAccess, async (req, res) => {
+  const passphrase = String(req.body?.password ?? "");
+  if (passphrase.length < EXPORT_MIN_PASSPHRASE) {
+    return res.status(400).json({ error: `The export passphrase must be at least ${EXPORT_MIN_PASSPHRASE} characters.` });
+  }
+
+  const ids: string[] | null = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+  const chosen = ids ? ids.map((id) => registry.get(id)) : [...registry.values()];
+  if (chosen.some((c) => !c)) {
+    return res.status(404).json({ error: "Unknown connection (backend may have restarted — reload the page)" });
+  }
+  if (!chosen.length) return res.status(400).json({ error: "Select at least one connection to export." });
+
+  const payload: ExportedConnection[] = (chosen as LiveConnection[]).map(
+    ({ name, engine, host, port, user, password, database, readOnly, role, authMode, walletId, walletPassword }) => {
+      const wallet = authMode === "wallet" && walletId ? readWallet(walletId) : null;
+      return {
+        name, engine, host, port, user, password, database, readOnly, role, authMode,
+        ...(authMode === "wallet" ? { walletId, walletPassword, ...(wallet ? { wallet } : {}) } : {}),
+      };
+    }
+  );
+  const missingWallet = payload.find((c) => c.authMode === "wallet" && !c.wallet);
+  if (missingWallet) {
+    return res.status(409).json({
+      error: `"${missingWallet.name}" uses an Oracle Cloud wallet that is no longer on this server — upload its wallet zip again before exporting.`,
+    });
+  }
+
+  const file = await encryptExport(payload, passphrase);
+  // Credentials leaving the machine is worth a line in the operator's console — the same
+  // reasoning as the failed-sign-in log above, and for the same lack of an audit trail.
+  console.log(
+    `Exported ${payload.length} saved connection(s) with passwords, passphrase-encrypted — requested by ${
+      (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
+    }`
+  );
+  res.json({ file, count: payload.length });
+});
+
+/* ---------------- Importing an encrypted export back ---------------------------------
+ * The other half of the export: hand back the file and its passphrase and the connections
+ * inside it become saved connections again — on this machine or on another one.
+ *
+ * Two endpoints rather than one, because an import writes credentials into the registry and
+ * the user should see what is about to land before it does. `/import/preview` decrypts and
+ * describes the file (metadata only — no passwords go back to the browser, the same rule as
+ * everywhere else); `/import` decrypts again and applies the entries the user picked. The
+ * passphrase is therefore sent twice, which costs one extra scrypt derivation and keeps the
+ * server free of any half-finished import state.
+ *
+ * Everything about the envelope is caller-supplied and therefore untrusted; `decryptExport`
+ * in connectionExport.ts is where that is dealt with, and where the tests live.
+ */
+/** Open an uploaded envelope and shape every entry the way a hand-typed connection is
+ *  shaped — so an entry from a later export carrying extra fields lands as the fields this
+ *  build understands rather than going into the registry unexamined. */
+async function decryptExportFile(raw: unknown, passphrase: string): Promise<ExportedConnection[]> {
+  return (await decryptExport(raw, passphrase)).map((e) => {
+    const cfg = pickConfig(e) as ExportedConnection;
+    // The id inside the file names a directory on the machine that wrote it and means
+    // nothing here; the files travelling with it are what this import can actually use.
+    if (cfg.authMode === "wallet") {
+      cfg.walletId = "";
+      const wallet = pickWalletFiles(e);
+      if (wallet) cfg.wallet = wallet;
+    }
+    return cfg;
+  });
+}
+
+/**
+ * Whether an entry can be imported. A wallet entry cannot be checked against the wallets on
+ * this server — it brings its own — so its alias is checked against the tnsnames.ora inside
+ * the file, and `validate` is left to the entries that describe a host and a port.
+ */
+function validateImport(cfg: ExportedConnection): string | null {
+  if (cfg.authMode !== "wallet") return validate(cfg);
+  if (!cfg.wallet) return "This connection uses an Oracle Cloud wallet that the export file does not carry";
+  if (!cfg.database) return "The export does not say which service of the wallet to use";
+  if (!parseTnsNames(cfg.wallet["tnsnames.ora"]).some((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase())) {
+    return `The wallet in the file has no service called "${cfg.database}"`;
+  }
+  if (!cfg.user) return "Username is required";
+  return null;
+}
+
+/**
+ * Whether an entry points where a saved connection already points.
+ *
+ * Deliberately not `sameEndpoint`: that one compares `walletId` too, which is a local
+ * directory name and therefore never equal across machines — every re-import of a wallet
+ * connection would look new and land as a second copy with a second wallet on disk. What
+ * identifies an Autonomous Database instead is the host, port and service the alias
+ * resolved to, which is what the exporting server stored and what this compares.
+ */
+const sameImportTarget = (a: ExportedConnection, b: LiveConnection) =>
+  a.engine === b.engine &&
+  a.authMode === b.authMode &&
+  a.host === b.host &&
+  Number(a.port) === Number(b.port) &&
+  a.user === b.user &&
+  (a.database ?? "") === (b.database ?? "");
+
+/** What the browser is told about one entry in an uploaded file — deliberately no password. */
+interface ImportPreviewEntry {
+  index: number;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  readOnly: boolean;
+  /** the privilege the entry connects with, so an `AS SYSDBA` import is visible before it lands */
+  role: ConnectionRole;
+  /** `wallet` entries restore the Oracle Cloud wallet that came inside the file with them */
+  authMode: AuthMode;
+  /** why this entry cannot be imported, when it cannot */
+  error?: string;
+  /** the saved connection this entry points at the same place as */
+  duplicateOfId?: string;
+  duplicateOfName?: string;
+}
+
+function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
+  return entries.map((cfg, index) => {
+    const existing = [...registry.values()].find((c) => sameImportTarget(cfg, c));
+    return {
+      index,
+      name: cfg.name,
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user,
+      database: cfg.database,
+      readOnly: cfg.readOnly,
+      role: cfg.role,
+      authMode: cfg.authMode,
+      error: validateImport(cfg) ?? undefined,
+      duplicateOfId: existing?.id,
+      duplicateOfName: existing?.name,
+    };
+  });
+}
+
+/** Decrypt an uploaded export and describe what is in it. Writes nothing. */
+app.post("/api/connections/import/preview", requireFullAccess, async (req, res) => {
+  try {
+    const entries = await decryptExportFile(req.body?.file, String(req.body?.password ?? ""));
+    res.json({ exportedAt: String(req.body?.file?.exportedAt ?? ""), entries: describeImport(entries) });
+  } catch (e) {
+    res.status(400).json({ error: errMsg(e) });
+  }
+});
+
+/**
+ * Apply an import. `indexes` selects entries from the file (all of them when omitted), and
+ * `mode` decides what happens to an entry pointing at the same engine/host/port/user/service
+ * as a saved connection — the same identity the stored-password replay rule uses:
+ *
+ *   skip    (default) leave the saved connection alone
+ *   replace overwrite it in place, keeping its id so tabs and history keep their target
+ *
+ * An entry pointing somewhere new is always added.
+ */
+app.post("/api/connections/import", requireFullAccess, async (req, res) => {
+  const mode = req.body?.mode === "replace" ? "replace" : "skip";
+  let entries: ExportedConnection[];
+  try {
+    entries = await decryptExportFile(req.body?.file, String(req.body?.password ?? ""));
+  } catch (e) {
+    return res.status(400).json({ error: errMsg(e) });
+  }
+
+  const wanted: number[] = Array.isArray(req.body?.indexes)
+    ? [...new Set<number>(req.body.indexes.map(Number))]
+    : entries.map((_e, i) => i);
+  if (wanted.some((i) => !Number.isInteger(i) || i < 0 || i >= entries.length)) {
+    return res.status(400).json({ error: "The selection does not match the file." });
+  }
+  if (!wanted.length) return res.status(400).json({ error: "Select at least one connection to import." });
+
+  const chosen = wanted.map((i) => entries[i]);
+  const invalid = chosen.map((cfg) => validateImport(cfg)).find(Boolean);
+  if (invalid) return res.status(400).json({ error: `The file contains a connection this app cannot use: ${invalid}` });
+
+  const added: string[] = [];
+  const replaced: string[] = [];
+  const skipped: string[] = [];
+  for (const entry of chosen) {
+    const existing = [...registry.values()].find((c) => sameImportTarget(entry, c));
+    if (existing && mode === "skip") {
+      skipped.push(existing.name);
+      continue;
+    }
+    // The wallet lands on disk under an id this server issues, replacing the exporting
+    // machine's. Written only once the entry is going to be saved, so a skipped duplicate
+    // leaves nothing behind.
+    const { wallet, ...cfg } = entry;
+    if (cfg.authMode === "wallet" && wallet) {
+      try {
+        cfg.walletId = storeWallet(wallet);
+      } catch (e) {
+        console.error("Could not store an imported wallet:", e);
+        return res.status(500).json({ error: `The wallet for "${cfg.name}" could not be written to disk.` });
+      }
+    }
+    if (existing) {
+      // the pooled sessions belong to the credentials being overwritten
+      try { await closePools(existing); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
+      registry.set(existing.id, { ...cfg, id: existing.id });
+      replaced.push(cfg.name);
+    } else {
+      const id = `live${seq++}`;
+      registry.set(id, { ...cfg, id });
+      added.push(cfg.name);
+    }
+  }
+  if (added.length || replaced.length) {
+    saveRegistry();
+    pruneWallets(); // a replaced connection's old wallet is now unreferenced
+  }
+  console.log(
+    `Imported connections from an encrypted export — ${added.length} added, ${replaced.length} replaced, ${skipped.length} skipped — requested by ${
+      (res.locals.userName as string | undefined) ?? (res.locals.role as Role)
+    }`
+  );
+  res.json({ added, replaced, skipped });
 });
 
 /**
@@ -4048,15 +5315,17 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
 app.post("/api/connections/:id/disconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  const wasOpen = await closePools(c);
-  res.json({ ok: true, wasOpen });
+  try {
+    const wasOpen = await closePools(c);
+    res.json({ ok: true, wasOpen });
+  } catch (e) { res.status(409).json({ error: errMsg(e) }); }
 });
 
 /** Reconnect: close whatever is open, then prove a fresh session can be established. */
 app.post("/api/connections/:id/reconnect", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
-  await closePools(c);
+  try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
   const started = Date.now();
   try {
     const version = await oraTest(c);
@@ -4089,6 +5358,414 @@ app.get("/api/connections/:id/schema/group", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
   }
+});
+
+/**
+ * The two object-copy endpoints, both addressed by the **target** connection.
+ *
+ * Which id is in the path is the whole access-control story: a copy writes to the target and
+ * only reads the source, so putting the target in the path is what makes the existing guards
+ * cover it without a second set of rules — `requireFullAccess`, the read-only refusal, the
+ * Oracle-maintained-schema refusal and the confirmation dialog all already describe "this
+ * connection is about to be changed". The source is a body/query parameter and is treated as
+ * what it is: a connection this browser must also be allowed to read.
+ */
+function readCopyRequest(
+  src: Record<string, unknown>,
+  targetId: string
+): CopyRequest | { error: string } {
+  const sourceId = String(src.sourceId ?? src.source ?? "").trim();
+  if (!sourceId) return { error: "Missing source connection (sourceId)." };
+  if (sourceId === targetId) return { error: "The source and the target are the same connection." };
+  const existing = String(src.existing ?? "skip").trim().toLowerCase();
+  if (existing !== "skip" && existing !== "replace") {
+    return { error: `\`existing\` must be "skip" or "replace", not "${existing}".` };
+  }
+  return {
+    sourceId,
+    kind: normalizeKind(src.kind),
+    existing,
+    // left raw on purpose: which of these names are real is a question only the source
+    // dictionary can answer, so `normalizeNames` gets them once the listing is in hand
+    names: src.names,
+    preserveTablespace: src.preserveTablespace === true || src.preserveTablespace === "true",
+  };
+}
+
+interface CopyRequest {
+  sourceId: string;
+  kind: CopyKind;
+  existing: CopyExisting;
+  /** the names the caller picked, unvalidated — absent means every object of the kind */
+  names: unknown;
+  preserveTablespace: boolean;
+}
+
+/** Both connections, or the reason the copy cannot be set up at all. */
+function copyEndpoints(sourceId: string, targetId: string): { source: LiveConnection; target: LiveConnection } | { error: string; status: number } {
+  const target = registry.get(targetId);
+  if (!target) return { status: 404, error: "Unknown connection (backend may have restarted — recreate it)" };
+  const source = registry.get(sourceId);
+  if (!source) return { status: 404, error: "Unknown source connection (backend may have restarted — recreate it)" };
+  if (source.engine !== "oracle" || target.engine !== "oracle") {
+    return { status: 400, error: "Copying objects between connections is Oracle-to-Oracle only." };
+  }
+  return { source, target };
+}
+
+/** What a copy would do, without doing any of it: GET ?source=<id>&kind=tables */
+app.get("/api/connections/:id/objects/copy", requireSchemaMetadataAccess, async (req, res) => {
+  const parsed = readCopyRequest(req.query as Record<string, unknown>, req.params.id);
+  if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  try {
+    res.json(await oraObjectCopyPlan(ends.source, ends.target, parsed.kind));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), ends.target.host) });
+  }
+});
+
+/** Run it: body { sourceId, kind?, existing?, confirm? } */
+app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res) => {
+  const parsed = readCopyRequest((req.body ?? {}) as Record<string, unknown>, req.params.id);
+  if ("error" in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  const { source, target } = ends;
+  const { kind, existing } = parsed;
+  const label = copyKindSpec(kind).label.toLowerCase();
+
+  if (target.readOnly) {
+    return res.status(400).json({
+      error: `"${target.name}" is read-only — copying ${label} into it is blocked. Edit the connection to disable read-only mode.`,
+    });
+  }
+  // Two saved connections can name the same schema on the same database. Copying it onto
+  // itself is not a no-op — with "replace" it drops every object and recreates it from a
+  // dictionary it is in the middle of changing — so it is refused rather than confirmed.
+  if (sameOracleSchema(source, target)) {
+    return res.status(400).json({
+      error: `"${source.name}" and "${target.name}" are the same schema on the same database — there is nothing to copy between them.`,
+    });
+  }
+
+  let plan: ObjectCopyPlan;
+  try {
+    plan = await oraObjectCopyPlan(source, target, kind);
+  } catch (e) {
+    return res.status(500).json({ error: withNetworkHint(errMsg(e), target.host) });
+  }
+  if (plan.targetSystemSchema) {
+    return res.status(400).json({
+      error: `${plan.targetSchema} is an Oracle-maintained schema — copying objects into it from here is blocked.`,
+    });
+  }
+  // What the caller actually picked, against the listing the plan just read: everything when
+  // it named nothing, and exactly nothing when it named only objects the source does not have.
+  const names = normalizeNames(parsed.names, plan.items.map((i) => i.name));
+  const picked = new Set(names ?? plan.items.map((i) => i.name));
+  const total = picked.size;
+  const conflicts = plan.items.filter((i) => picked.has(i.name) && i.existsInTarget).length;
+  const blocked = plan.items.filter((i) => picked.has(i.name) && i.missingBase).length;
+
+  if (total > plan.cap) {
+    return res.status(400).json({
+      error: `${total} object(s) is more than this tool copies in one request (cap ${plan.cap}). Copy a smaller selection, or use Data Pump for a schema this size.`,
+    });
+  }
+  // Nothing to do is not something to confirm — the guard exists to describe real changes.
+  if (!total) {
+    return res.json({
+      sourceName: source.name, sourceSchema: plan.sourceSchema,
+      targetName: target.name, targetSchema: plan.targetSchema,
+      kind, label: plan.label, existing, objects: [], foreignKeys: [],
+      created: 0, replaced: 0, skipped: 0, failed: 0, invalid: 0, fksCreated: 0, fksFailed: 0,
+      timedOut: false, elapsedMs: 0,
+      note: plan.total
+        ? `Nothing to copy — none of the ${label} that were asked for are in ${plan.sourceSchema}.`
+        : `Nothing to copy — ${plan.sourceSchema} has no ${label}.`,
+    } satisfies ObjectCopyResult);
+  }
+
+  if (!acknowledged(req)) {
+    // What a replacement costs is the kind's own sentence rather than one written here: a
+    // dropped table takes its rows with it, a dropped index is a rebuild, a dropped sequence
+    // hands out numbers it has already given away, and a view is not dropped at all.
+    const conflictLine = conflicts
+      ? existing === "replace"
+        ? ` ⚠ ${conflicts} of them already exist in ${plan.targetSchema} and will be replaced. ${copyKindSpec(kind).replaceNote}`
+        : ` ${conflicts} of them already exist in ${plan.targetSchema} and will be left exactly as they are.`
+      : "";
+    // Worth its own sentence because it is the one number that says "this run will not do all
+    // of what you just asked for": an index whose table is not there yet is reported, not
+    // created, and the dialog is the last place to say so before it happens.
+    const blockedLine = blocked
+      ? ` ${blocked} of them are built on something ${plan.targetSchema} does not have and will be skipped — copy the ${copyBaseLabel(kind)} first if you want them.`
+      : "";
+    // The tablespace is worth a sentence either way round: preserved, it is the clause that
+    // fails the whole copy on a target laid out differently; not preserved, the objects land
+    // somewhere other than where they came from, which is not what everyone expects. For a
+    // kind that occupies no segment there is nothing to say, and saying it anyway would be
+    // the dialog describing something that is not going to happen.
+    const tablespaceLine = !copyKindSpec(kind).hasTablespace
+      ? ""
+      : parsed.preserveTablespace
+      ? ` Each one keeps the tablespace it has in ${plan.sourceSchema}, and fails if ${target.name} has no tablespace of that name.`
+      : ` They are created in ${plan.targetSchema}'s default tablespace.`;
+    return confirmRequired(res, describeOperation({
+      level: existing === "replace" && conflicts ? "destructive" : "write",
+      verb: `COPY ${copyKindSpec(kind).label.toUpperCase()}`,
+      target: plan.targetSchema,
+      title: `Copy ${plan.sourceSchema}'s ${label} into ${plan.targetSchema}?`,
+      body:
+        `${copyCountLabel(kind, total)} from "${source.name}"` +
+        (names && total < plan.total ? ` (of ${plan.total})` : "") +
+        ` will be created in ${plan.targetSchema} on "${target.name}".` +
+        conflictLine +
+        blockedLine +
+        tablespaceLine +
+        ` ${copyKindSpec(kind).note} Objects that fail are reported and the rest of the copy continues.`,
+      confirmLabel:
+        existing === "replace" && conflicts ? `Replace and copy ${total} object(s)` : `Copy ${total} object(s)`,
+    }));
+  }
+
+  try {
+    res.json(await oraObjectCopy(source, target, kind, existing, { names, preserveTablespace: parsed.preserveTablespace }));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), target.host) });
+  }
+});
+
+const activeDataCopies = new Set<string>();
+app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, async (req, res) => {
+  const parsed = readCopyRequest(req.query as Record<string, unknown>, req.params.id);
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ('error' in ends) return res.status(ends.status).json({ error: ends.error });
+  let conn: oracledb.Connection | undefined;
+  let src: oracledb.Connection | undefined;
+  try {
+    const plan = await oraObjectCopyPlan(ends.source, ends.target, 'tables');
+    conn = await getOraConn(ends.target);
+    src = await getOraConn(ends.source);
+    src.callTimeout = 30000;
+    const sourceCounts: Record<string, number> = Object.create(null);
+    const countErrors: Record<string, string> = Object.create(null);
+    for (const item of plan.items) {
+      try { Object.assign(sourceCounts, await countCopyRows(src, [item.name])); }
+      catch (e) { countErrors[item.name] = errMsg(e); }
+    }
+    res.json({ ...plan, sourceCounts, countErrors, dependencies: await readTableDependencies(conn, plan.targetSchema) });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
+  finally { await Promise.allSettled([...(conn ? [conn.close()] : []), ...(src ? [src.close()] : [])]); }
+});
+app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req, res) => {
+  const parsed = readCopyRequest(req.body ?? {}, req.params.id);
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  if ('error' in ends) return res.status(ends.status).json({ error: ends.error });
+  const { source, target } = ends;
+  if (target.readOnly || sameOracleSchema(source, target)) return res.status(400).json({ error: 'Choose a different, writable target schema.' });
+  let src: oracledb.Connection | undefined;
+  let dst: oracledb.Connection | undefined;
+  let locked = false;
+  try {
+    const plan = await oraObjectCopyPlan(source, target, 'tables');
+    if (plan.targetSystemSchema || plan.sameSchema) return res.status(400).json({ error: 'Copying into this schema is blocked.' });
+    const names = req.body.names;
+    if (!Array.isArray(names) || !names.length || names.length > 25 || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
+      return res.status(400).json({ error: 'Select 1–25 distinct tables that exist in both schemas. Create missing tables using Copy objects first.' });
+    }
+    dst = await getOraConn(target);
+    const dependencies = await readTableDependencies(dst, plan.targetSchema);
+    const selection = tableDataSelection(names, plan.items.filter(i => i.existsInTarget).map(i => i.name), dependencies);
+    if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
+      selection.overLimit ? 'Required parent tables exceed the 25-table limit. Use a custom migration.' :
+      `Additional parent tables are required: ${selection.added.join(', ')}. Re-read tables and review the updated selection.` });
+    src = await getOraConn(source);
+    src.callTimeout = 30000;
+    dst.callTimeout = 30000;
+    await src.execute('SET TRANSACTION READ ONLY');
+    const sourceCounts = await countCopyRows(src, selection.names);
+    let sourceTotal: number;
+    try { sourceTotal = validateCopyCounts(sourceCounts); }
+    catch (e) { return res.status(400).json({ error: errMsg(e) }); }
+    const occupied = await nonEmptyCopyTables(dst, selection.names);
+    if (req.body.checkOnly === true) return res.json({ occupied, sourceCounts, sourceTotal });
+    const mode = req.body.mode;
+    if (mode !== 'append' && mode !== 'replace') return res.status(400).json({ error: 'Choose append or replace before copying.' });
+    if (!acknowledged(req)) return confirmRequired(res, describeOperation({
+      level: mode === 'replace' ? 'destructive' : 'write', verb: 'COPY TABLE DATA', target: plan.targetSchema,
+      title: `Copy data into ${plan.targetSchema}?`,
+      body: `Source count: ${sourceTotal.toLocaleString()} rows. ${occupied.length ? 'Existing rows found in: ' + occupied.join(', ') + '. ' : 'Selected target tables are currently empty. '}${mode === 'replace' ? 'DELETE ALL existing rows in every selected table, including automatically selected parents, then copy' : 'Append (preserve existing rows; duplicate keys may fail)'} rows from ${plan.sourceSchema} to ${selection.names.join(' → ')} on ${target.name}. Rows waiting for parent keys are retried after other rows are loaded; foreign keys remain enabled. Unresolved parent keys or duplicate keys roll back the entire copy. All copied rows commit together in a separate session. ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after rows commit. These schema changes commit separately. Pause other target writes during copying. If interrupted, identity settings may need manual repair. Target triggers run on attempts, including retries; autonomous trigger changes cannot be rolled back. ${selection.warnings.join(' ')} Parent row coverage has not been validated. Limit: 100,000 rows across 25 tables.`,
+      confirmLabel: mode === 'replace' ? 'Delete existing data and copy' : 'Append data',
+    }));
+    if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
+    activeDataCopies.add(target.id);
+    locked = true;
+    res.json(await copyTableRows(src, dst, selection.names, mode));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
+  finally {
+    try {
+      await Promise.allSettled([
+        ...(src ? [(async () => { try { await src.rollback(); } finally { await src.close(); } })()] : []),
+        ...(dst ? [dst.close()] : []),
+      ]);
+    } finally { if (locked) activeDataCopies.delete(target.id); }
+  }
+});
+
+const DBA_AUDIT_FILE = path.join(DATA_DIR, "dba-audit.jsonl");
+app.get("/api/connections/:id/dba-audit", requireFullAccess, (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  try { res.json({ entries: readDbaAudit(DBA_AUDIT_FILE, connKey(c)) }); }
+  catch { res.status(500).json({ error: "Cannot read the server audit log." }); }
+});
+app.post("/api/connections/:id/dba-storage", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.readOnly) return res.status(403).json({ error: "This connection is read-only." });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "Oracle is required." });
+  let sql: string;
+  const change = req.body as StorageChange;
+  try { sql = storageChangeSql(change); }
+  catch (e) { return res.status(400).json({ error: errMsg(e) }); }
+  const operationLabel: Record<string, string> = { create: "Create tablespace", add: "Add file", resize: "Resize file", autoextend: "Change automatic growth", readOnly: "Make tablespace read-only", readWrite: "Allow tablespace writes", drop: "Delete tablespace" };
+  const warning: Record<string, string> = { create: "Creates a tablespace and allocates storage.", add: "Allocates another file on the database server.", resize: "Changes the file’s total size. A smaller value shrinks it; Oracle may reject shrinking if data occupies the end of the file.", autoextend: "Changes automatic storage consumption. Disabling growth or choosing a low limit can cause future allocations to fail.", readOnly: "Blocks writes to this tablespace and may wait for active transactions.", readWrite: "Enables writes to this tablespace." };
+  if (!acknowledged(req)) return res.status(409).json({ error: "Confirmation required", code: "CONFIRM_REQUIRED", confirmation: describeOperation({
+    level: "destructive", verb: change.action, target: change.name || change.path,
+    title: `${operationLabel[change.action]} on ${c.name}?`,
+    body: `${sql}\n\n${change.action === "drop" ? `All objects in this tablespace will be permanently deleted, including their dependent segments in other tablespaces. ${change.deleteFiles ? "Physical files will also be deleted." : "Physical files will be kept."}` : warning[change.action]} Oracle DDL commits implicitly and cannot be rolled back. The attempt and outcome are recorded in the server audit log.`,
+    confirmLabel: change.action === "drop" ? "Delete tablespace" : "Apply change",
+  }) });
+  if (change.action === "drop" && req.body.typedName !== change.name) return res.status(400).json({ error: "Type the exact tablespace name to confirm deletion." });
+  const event = { id: randomBytes(16).toString("hex"), connection: connKey(c), connectionName: c.name, actor: res.locals.userEmail ?? res.locals.userName ?? res.locals.role, databaseUser: c.user, action: change.action, target: change.name || change.path, sql };
+  try { appendDbaAudit(DBA_AUDIT_FILE, { ...event, outcome: "attempt" }); }
+  catch { return res.status(503).json({ error: "Audit log is unavailable. No change was executed." }); }
+  let failure: unknown;
+  let succeeded = false;
+  let conn: oracledb.Connection | undefined;
+  try {
+    conn = await getOraConn(c);
+    await conn.execute(oraPrepare(sql), [], { autoCommit: true });
+    succeeded = true;
+  } catch (e) { failure = e; }
+  finally { if (conn) await conn.close().catch(() => {}); }
+  try { appendDbaAudit(DBA_AUDIT_FILE, { ...event, outcome: succeeded ? "success" : "failed", ...(failure ? { error: errMsg(failure) } : {}) }); }
+  catch { return res.status(500).json({ error: `Database outcome: ${succeeded ? "change succeeded" : "failed or uncertain"}. Audit completion could not be saved. Do not retry without checking the database. Audit ID: ${event.id}` }); }
+  if (!succeeded) return res.status(500).json({ error: `${errMsg(failure)} (Audit ID: ${event.id})` });
+  res.json({ ok: true, auditId: event.id });
+});
+
+/** Oracle can expose every RAC instance through GV$SESSION; a V$SESSION grant still
+ * gives a useful local-instance view when the global view is unavailable. */
+function sessionViewUnavailable(error: unknown): boolean {
+  return /ORA-(00942|01031)/.test(errMsg(error));
+}
+
+app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  try {
+    const conn = await getOraConn(c);
+    try {
+      let scope: "all-instances" | "local-instance" = "all-instances";
+      let result;
+      try { result = await conn.execute(globalSessionsSql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 }); }
+      catch (error) {
+        if (!sessionViewUnavailable(error)) throw error;
+        scope = "local-instance";
+        result = await conn.execute(localSessionsSql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 });
+      }
+      const sessions = (result.rows as Record<string, unknown>[] ?? []).map(row =>
+        Object.fromEntries(Object.entries(row).map(([key, value]) => [key, mapVal(value)]))
+      );
+      let clientDetailsAvailable = true;
+      try {
+        const info = await conn.execute(scope === "all-instances" ? globalConnectInfoSql : localConnectInfoSql,
+          [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 });
+        const bySession = new Map((info.rows as Record<string, unknown>[] ?? []).map(row => [
+          `${row.instance}:${row.sid}:${row.serial}`,
+          row,
+        ]));
+        for (const session of sessions) {
+          const infoRow = bySession.get(`${session.instance}:${session.sid}:${session.serial}`);
+          for (const field of ["clientDriver", "clientVersion", "clientConnection", "clientOciLibrary"] as const) {
+            session[field] = mapVal(infoRow?.[field]);
+          }
+        }
+      } catch {
+        // The connect-info view is optional. Keep the session list and its PROGRAM/MODULE
+        // values even when this database does not expose the driver metadata.
+        clientDetailsAvailable = false;
+      }
+      res.json({ sessions, scope, clientDetailsAvailable, capturedAt: new Date().toISOString() });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
+app.post("/api/connections/:id/sessions/kill", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.readOnly) return res.status(403).json({ error: "This connection is read-only. Edit it to allow killing sessions." });
+  let sid: number, serial: number, instance: number;
+  try {
+    sid = sessionIdentifier(req.body?.sid);
+    serial = sessionIdentifier(req.body?.serial);
+    instance = sessionIdentifier(req.body?.instance);
+  } catch (error) { return res.status(400).json({ error: errMsg(error) }); }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      let global = true;
+      let target;
+      try {
+        target = await conn.execute(
+          `SELECT username AS "username" FROM gv$session WHERE inst_id = :instance AND sid = :sid AND serial# = :serial AND type = 'USER'`,
+          { instance, sid, serial }, { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+      } catch (error) {
+        if (!sessionViewUnavailable(error)) throw error;
+        global = false;
+        target = await conn.execute(
+          `SELECT username AS "username" FROM v$session WHERE TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE')) = :instance AND sid = :sid AND serial# = :serial AND type = 'USER'`,
+          { instance, sid, serial }, { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+      }
+      if (!target.rows?.length) return res.status(404).json({ error: "Session no longer exists. Refresh the list." });
+      await conn.execute(killSessionSql(sid, serial, global ? instance : undefined));
+      res.json({ ok: true });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
+app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "DBA Manager requires Oracle." });
+  let queries;
+  try { queries = selectManagementQueries(req.query.sections); }
+  catch (error) { return res.status(400).json({ error: errMsg(error) }); }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      const sections: Record<string, { rows: Row[]; error?: string; truncated?: boolean }> = {};
+      // One session, sequential reads; missing grants affect only that section.
+      for (const [name, sql] of queries) {
+        try {
+          const result = await conn.execute(sql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 501 });
+          const rows = result.rows as Record<string, unknown>[] ?? [];
+          sections[name] = { truncated: rows.length > 500, rows: rows.slice(0, 500).map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, mapVal(value)]))) };
+        } catch (error) {
+          sections[name] = { rows: [], error: errMsg(error) };
+        }
+      }
+      res.json({ sections, capturedAt: new Date().toISOString() });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });
 
 app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
@@ -4797,6 +6474,7 @@ interface RoutineParam {
 }
 
 interface RoutineMember {
+  returnFields?: { name: string; dataType: string; bindKind: RoutineBindKind | null }[];
   name: string;
   kind: "PROCEDURE" | "FUNCTION";
   overload: string | null;
@@ -4903,6 +6581,13 @@ async function oraRoutineMeta(c: LiveConnection, rawName: string): Promise<Routi
         m.returnType = display;
         m.returnBindKind = dt ? ROUTINE_BIND_KINDS[dt] ?? null : null;
         m.returnDeclType = declType;
+        if (dt === 'PL/SQL RECORD' && r.TYPE_SUBNAME && r.TYPE_NAME) {
+          const attrs = await oraRows(conn, `SELECT attr_name, attr_type_name, attr_type_package FROM all_plsql_type_attrs
+            WHERE owner = :owner AND package_name = :pkg AND type_name = :typ ORDER BY attr_no`,
+          { owner: str(r.TYPE_OWNER) ?? c.user, pkg: String(r.TYPE_NAME), typ: String(r.TYPE_SUBNAME) });
+          m.returnFields = attrs.map(a => ({ name: String(a.ATTR_NAME), dataType: String(a.ATTR_TYPE_NAME),
+            bindKind: a.ATTR_TYPE_PACKAGE ? null : ROUTINE_BIND_KINDS[String(a.ATTR_TYPE_NAME)] ?? null }));
+        }
         continue;
       }
       if (r.ARGUMENT_NAME == null && dt == null) continue; // old-style "no arguments" placeholder row
@@ -5262,6 +6947,9 @@ async function oraRoutineRunBlock(
     } else if (member?.kind === "FUNCTION" && member.returnBindKind && (n === "RESULT" || n === "RETURN_VALUE")) {
       kind = member.returnBindKind;
       dataType = member.returnType ?? "";
+    } else if (/^DF_RECORD_\d+$/.test(n)) {
+      const field = member?.returnFields?.[Number(n.slice('DF_RECORD_'.length)) - 1];
+      if (field?.bindKind) { kind = field.bindKind; dataType = field.dataType; }
     }
     binds[n] = { dir: oracledb.BIND_OUT, type: oraBindType(kind), ...(kind === "string" ? { maxSize: 32767 } : {}) };
     outs.push({ name: n, dataType, kind });
@@ -5477,7 +7165,11 @@ app.get("/api/connections/:id/table/rows", async (req, res) => {
   if (!name) return res.status(400).json({ error: "Missing table name (?name=...)" });
   const limit = Number(req.query.limit) || MAX_ROWS;
   try {
-    res.json(await oraTableRows(c, name, limit));
+    const token = req.headers['x-dataforge-transaction'];
+    const out = token
+      ? await worksheetSessions.use(String(token), worksheetOwner(req), c.id, conn => oraTableRows(c, name, limit, conn))
+      : await oraTableRows(c, name, limit);
+    res.json({ ...out, manualTransaction: !!token });
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
   }
@@ -5511,7 +7203,9 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
       verb: action.toUpperCase(),
       target: table,
       title: action === "delete" ? `Delete this row from ${table}?` : action === "insert" ? `Insert a row into ${table}?` : `Save this row in ${table}?`,
-      body:
+      body: req.body?.transactionId
+        ? `Apply this ${action} to ${table} on "${c.name}"? It remains pending until you commit or roll back the shared worksheet/table transaction.`
+        :
         action === "delete"
           ? `The row is removed from ${table} on "${c.name}" and committed straight away — there is no undo.`
           : action === "insert"
@@ -5522,13 +7216,17 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
     }));
   }
   try {
-    const out = await oraRowChange(c, {
+    const body: RowChangeBody = {
       table,
       action,
       rowId: req.body?.rowId == null ? undefined : String(req.body.rowId),
       values: values as Record<string, string | number | null> | undefined,
       original: (original ?? undefined) as Record<string, string | number | null> | undefined,
-    });
+    };
+    const token = req.body?.transactionId;
+    const out = token
+      ? await worksheetSessions.use(String(token), worksheetOwner(req), c.id, conn => oraRowChange(c, body, conn))
+      : await oraRowChange(c, body);
     if ("error" in out) return res.status(400).json({ error: out.error });
     res.json(out);
   } catch (e) {
@@ -5734,6 +7432,23 @@ app.get("/api/connections/:id/job-runs/:logId/output", requireFullAccess, async 
   }
 });
 
+function worksheetOwner(req: express.Request): string {
+  return createHash('sha256').update(req.headers.authorization ?? '').digest('hex');
+}
+
+app.post("/api/connections/:id/worksheet-session", requireFullAccess, async (req, res) => {
+  const c = registry.get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Unknown connection' });
+  if (c.readOnly) return res.status(403).json({ error: 'This connection is read-only.' });
+  try {
+    const transactionId = await worksheetSessions.create(worksheetOwner(req), c.id, () => oracledb.getConnection({
+      user: c.user, password: c.password, connectString: oraConnectString(c),
+      ...oraWalletOptions(c), privilege: oraPrivilege(c), connectTimeout: 8,
+    }));
+    res.json({ transactionId });
+  } catch (e) { res.status(400).json({ error: errMsg(e) }); }
+});
+
 app.post("/api/connections/:id/query", async (req, res) => {
   const c = registry.get(req.params.id);
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
@@ -5773,8 +7488,21 @@ app.post("/api/connections/:id/query", async (req, res) => {
       confirmation,
     });
   }
+  const queryAudit = cls.level === "read" ? null : { id: randomBytes(16).toString("hex"), connection: connKey(c), connectionName: c.name, actor: res.locals.userEmail ?? res.locals.userName ?? res.locals.role, databaseUser: c.user, action: cls.verb, target: cls.target, source: "worksheet", sqlHash: createHash("sha256").update(sql).digest("hex") };
+  if (queryAudit) {
+    try { appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "attempt" }); }
+    catch { return res.json({ columns: [], rows: [], durationMs: 0, rowsReturned: 0, error: { message: "Audit log unavailable. No statement was executed.", line: 1, code: "AUDIT-UNAVAILABLE" } }); }
+  }
+  let querySucceeded = false;
   try {
-    const out = await oraQuery(c, sql);
+    const transactionId = req.body?.transactionId;
+    const closeTransaction = req.body?.closeTransaction === true;
+    if (closeTransaction && !/^\s*(COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql)) throw new Error('Only COMMIT or ROLLBACK can close a worksheet session.');
+    const out = transactionId
+      ? await worksheetSessions.use(String(transactionId), worksheetOwner(req), c.id, conn => oraQuery(c, sql, conn), closeTransaction)
+      : await oraQuery(c, sql);
+    querySucceeded = true;
+    if (queryAudit) appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "success" });
     // auto-version code objects on success — must never break the query path
     let versioned: VersionedInfo | null = null;
     try {
@@ -5786,6 +7514,11 @@ app.post("/api/connections/:id/query", async (req, res) => {
   } catch (e) {
     const err = e as { code?: string; errorNum?: number };
     const code = err.errorNum ? `ORA-${String(err.errorNum).padStart(5, "0")}` : err.code ?? "SQL-ERROR";
+    if (queryAudit && !querySucceeded) {
+      try { appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "failed-or-unknown", errorCode: code }); }
+      catch { console.error(`Audit completion unavailable: ${queryAudit.id}`); }
+    }
+    if (querySucceeded) return res.json({ columns: [], rows: [], durationMs: Date.now() - started, rowsReturned: 0, error: { message: `Statement succeeded, but audit completion could not be saved. Do not rerun. Audit ID: ${queryAudit?.id}`, line: 1, code: "AUDIT-INCOMPLETE" } });
     const { message, helpUrl } = splitHelpUrl(withNetworkHint(errMsg(e), c.host));
     res.json({
       columns: [], rows: [],

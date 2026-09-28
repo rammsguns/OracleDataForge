@@ -1,3 +1,6 @@
+import HorizontalScrollbar from "./HorizontalScrollbar";
+import { useCodeCompletion } from "./useCodeCompletion";
+import { useEditorTools } from "./EditorTools";
 import {
   forwardRef,
   useEffect,
@@ -23,7 +26,6 @@ const CLS: Record<string, string> = {
   ws: "",
 };
 
-const LINE_H = 20;
 
 export interface CodeEditorHandle {
   /** Move the caret to a 1-based line/column, select to end of line and scroll it into view. */
@@ -54,6 +56,9 @@ const CodeEditor = forwardRef<
   }
 >(function CodeEditor({ value, onChange, readOnly, errorLine, onCompile, ariaLabel }, ref) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const editor = useEditorTools(value, taRef, errorLine);
+  const LINE_H = editor.lineHeight;
+  const completion = useCodeCompletion(taRef, value, onChange, readOnly);
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const findRef = useRef<HTMLInputElement>(null);
@@ -286,6 +291,7 @@ const CodeEditor = forwardRef<
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (completion.onKeyDown(e)) return;
     if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "h")) {
       e.preventDefault();
       setFr((f) => ({ ...f, withReplace: e.key === "h" && !readOnly }));
@@ -326,7 +332,7 @@ const CodeEditor = forwardRef<
 
   const sharedStyle: CSSProperties = {
     fontFamily: "var(--font-mono)",
-    fontSize: 13,
+    fontSize: editor.fontSize,
     lineHeight: `${LINE_H}px`,
     tabSize: 2,
     padding: "10px 12px",
@@ -335,7 +341,8 @@ const CodeEditor = forwardRef<
   };
 
   return (
-    <div className="h-full flex flex-col min-h-0 bg-panel2 font-mono text-[13px] overflow-hidden">
+    <div className="h-full flex flex-col min-h-0 bg-panel2 font-mono text-[13px] overflow-hidden" style={editor.style}>
+      {editor.toolbar}
       {/* Find & replace strip. Always on screen, the way SQL Developer keeps its search
           visible, rather than a popover that only a keyboard shortcut could summon. */}
       <div className="shrink-0 flex flex-col gap-1 px-2 py-1.5 border-b border-bdrsoft bg-panel font-sans">
@@ -432,16 +439,16 @@ const CodeEditor = forwardRef<
         )}
       </div>
 
-      <div className="relative flex-1 min-h-0 flex">
+      <div className="relative flex-1 min-h-0 flex" style={{ background: 'var(--editor-bg, var(--panel2))' }}>
       {/* gutter */}
       <div
         ref={gutterRef}
         aria-hidden
         className="w-11 shrink-0 overflow-hidden text-right select-none border-r border-bdrsoft bg-panel"
-        style={{ ...sharedStyle, padding: "10px 8px 10px 0" }}
+        style={{ ...sharedStyle, width: Math.max(44, String(lines.length).length * editor.fontSize * 0.65 + 16), padding: "10px 8px 10px 0" }}
       >
         {lines.map((_, i) => (
-          <div key={i} className={errorLine === i + 1 ? "text-err font-bold" : "text-mute"}>
+          <div key={i} className={editor.gutterClass(i + 1)}>
             {i + 1}
           </div>
         ))}
@@ -449,7 +456,7 @@ const CodeEditor = forwardRef<
 
       <div className="relative flex-1 min-w-0">
         {/* highlight layer */}
-        <pre ref={preRef} aria-hidden className="absolute inset-0 overflow-hidden m-0 pointer-events-none text-ink" style={sharedStyle}>
+        <pre ref={preRef} aria-hidden className="absolute inset-0 overflow-hidden m-0 pointer-events-none text-ink" style={{ ...sharedStyle, color: 'var(--editor-fg, var(--ink))' }}>
           {errorLine != null && errorLine >= 1 && (
             <div
               className="absolute left-0 right-0 bg-err/10 border-l-2 border-err"
@@ -474,17 +481,22 @@ const CodeEditor = forwardRef<
           ref={taRef}
           value={value}
           readOnly={readOnly}
-          onChange={(e) => onChange(e.target.value)}
+          {...completion.inputProps}
           onKeyDown={onKeyDown}
           onSelect={syncActiveFromCaret}
-          onScroll={syncScroll}
+          onScroll={() => { syncScroll(); completion.close(); }}
+          wrap="off"
           spellCheck={false}
           aria-label={ariaLabel ?? "Code editor"}
-          className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-auto"
+          title="Code suggestions: Ctrl+Space"
+          className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-y-auto overflow-x-hidden"
           style={sharedStyle}
         />
+        {completion.popup}
         </div>
       </div>
+      <HorizontalScrollbar target={taRef} contentKey={value} />
+      {editor.problems}
     </div>
   );
 });

@@ -10,6 +10,233 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- Object copy now includes packages, standalone procedures, functions and types. Package/type
+  bodies travel with their specifications and participate in compilation warnings. Replacement
+  stays in place, without destructive fallback for dependent types. PL/SQL literals and
+  comments are preserved during schema rewriting and slash-delimited statement splitting.
+
+- **Copy objects from one connection to another.** The Migration tab now opens on a choice —
+  **Compare tables**, as before, or **Copy objects** — and the second one takes the same source
+  and target and recreates the source schema's objects of one type in the target. One type per
+  run, and there are eleven of them: **sequences**, **types**, **tables**, **indexes**, **views**,
+  **materialized views**, **synonyms**, **packages**, **procedures**, **functions** and
+  **triggers**, offered in a suggested dependency order. Reading both
+  dictionaries first shows how many there are and which of them the target already has.
+  Which ones to copy is a two-list picker, shaped after SQL Developer's own: everything the
+  source has on the left, everything this run will copy on the right, arrows between them, and a
+  name filter over the left list — the "move all" arrow moves what the filter is showing, so
+  filtering to `SALES_` and pressing it picks a whole family of tables at once. Ctrl-click and
+  shift-click pick several, double-click moves one, and a name already in the target is marked as
+  such in both lists. It opens with everything picked, which is the copy most people came for.
+  A table arrives with its columns, defaults, primary key, unique keys, check constraints and
+  foreign keys, and without its rows and its indexes. DDL is read with `EMIT_SCHEMA` off, so
+  nothing lands qualified with the source schema, and with `REF_CONSTRAINTS` off — not to drop
+  the foreign keys but to defer them. A foreign key names a second table the run may not have
+  reached yet (alphabetical order puts plenty of children before their parents), so leaving them
+  inside `CREATE TABLE` would fail every child copied before its parent. They are added instead
+  by a second pass once every table in the run is there, one constraint at a time, so a key
+  pointing at a table nobody copied is one reported line rather than a failed table. Ones the
+  target already has are left alone, which is what makes re-running a copy safe. Qualification a
+  *developer* wrote (a default calling `HR.ORDER_SEQ.NEXTVAL`) is rewritten to the target schema
+  by a scan that skips string literals and comments.
+  An index run copies the indexes somebody wrote a `CREATE INDEX` for, and only onto a table the
+  target already has. The ones Oracle made for a primary or unique key are left out: that index
+  is created by the constraint and arrives with the table, so copying it again would be a second
+  index over the same columns — as are LOB and index-organized-table internals, system-named
+  indexes and indexes on another schema's table. An index whose table is not in the target is
+  reported as a skip naming that table, and the picker marks it before the run starts rather
+  than letting Oracle answer with an ORA-00942 that names neither the index nor the table it
+  wanted. Copy the tables, then the indexes. Replacing an index is a rebuild rather than a
+  deletion, and the confirmation dialog says so instead of the sentence it uses for tables.
+  A sequence arrives at the number the source's has reached rather than at the number it
+  started from, so the copy carries on from where the source is instead of handing out values
+  the source has already used — which is also what makes replacing an existing sequence the
+  dangerous choice, since a target sequence that has gone further is reset backwards and its
+  next values collide with rows that are already there. The dialog says that in place of the
+  sentence it uses for a table. The sequences Oracle creates for identity columns are left out
+  of the listing: they belong to the table and arrive with it. And because a sequence occupies
+  no segment — nor does a view, which is text — the tablespace choice is not offered for those
+  kinds at all: the checkbox is absent and the dialog says nothing about tablespaces, rather
+  than the choice being offered and quietly ignored.
+  A view run copies the view's own `SELECT` as the source wrote it, with any schema name
+  written *inside* it repointed at the target — a body naming `HR.ORDERS` would otherwise
+  produce a view that is created, is valid, and reads the source database for ever. Oracle
+  emits view DDL as `CREATE OR REPLACE FORCE VIEW`, and `FORCE` is what makes the order views
+  are copied in irrelevant, the same bet deferring the foreign keys makes for tables: a view
+  built on a view that has not been copied yet still lands. The price is that one whose tables
+  are missing is created INVALID rather than refused, so the run asks the target which of the
+  views it just created it cannot compile and reports those apart from the ones that work —
+  a copy that reported every `CREATE` as a success would be calling a view that raises
+  ORA-04063 a green result. Nothing has to be re-run to fix one: copy what it needs, and Oracle
+  compiles the view the next time anything uses it. Replacing a view is the only replacement
+  that drops nothing — its own `CREATE OR REPLACE` lands on the old one, so the grants on it and
+  the views built on it survive, and the choice is named "Replace them with the source's"
+  rather than "Drop and recreate them" for that run alone.
+  A materialized view run brings the whole object in one statement — the container table its
+  rows live in, the index on it, and the query that fills it — which is why the table listing
+  and the index listing now leave those pieces out: `user_tables` lists the container like any
+  other table, and copying it separately would put a plain table where a materialized view
+  belongs and leave the materialized-view run to fail on the name. It is also the one type that
+  moves data. Oracle builds it as the source wrote it, and that is almost always `BUILD
+  IMMEDIATE`, so the `CREATE` runs the query against the *target's* tables and fills it before
+  returning: the rows are the target's own rather than the source's, but it is real work and one
+  materialized view can run past the copy's time budget. There is no `FORCE` for one the way
+  there is for a view, so a materialized view whose tables are not there fails outright with
+  ORA-00942 rather than landing invalid — which is why the type is offered after the views, the
+  kind that cannot recover from a missing dependency going after the kind that can. Replacing
+  one is a rebuild that throws away the rows it is holding, and the type says so. A last wrinkle
+  worth knowing: `user_objects` calls it a `MATERIALIZED VIEW` and DBMS_METADATA wants a
+  `MATERIALIZED_VIEW`, so kinds now carry both names — the listing, the existence check and the
+  `DROP` take the dictionary's, `GET_DDL` takes the other, and passing the wrong one earns an
+  ORA-31600 that names the parameter rather than the mistake.
+  A trigger run copies the trigger's PL/SQL as the source wrote it, onto the table or view it
+  fires for, enabled or disabled the way the source has it — Oracle answers `GET_DDL` for a
+  trigger with two statements, the `CREATE OR REPLACE` and an `ALTER TRIGGER … ENABLE`, and the
+  copy runs both, so a trigger somebody turned off in the source does not start firing in the
+  target. Triggers are offered last, after everything else, because one stands on more than any
+  other type does: the table or view it fires for has to exist or Oracle refuses the `CREATE`,
+  and its body can call any sequence, table, view or package in the schema. That second half is
+  not pre-checked and does not have to be — a trigger whose body calls something the target has
+  not got is created and left invalid, and is reported as created *with the sentence saying it
+  does not work yet*, the same second pass the views got. The first half is pre-checked, the
+  way an index's table is, with one difference worth having: a trigger's base object can be a
+  table **or** a view, since an `INSTEAD OF` trigger is how a view is written to at all, so the
+  target is searched for both and the sentence about what to copy first names both runs rather
+  than always saying "tables". Replacing a trigger is the other replacement that drops nothing:
+  its own `CREATE OR REPLACE` lands on the old one, so the table is never briefly running
+  without a trigger — though what it does changes at that moment, which is what the type says
+  under the replace choice. Triggers on the schema or the database itself are not offered:
+  a DDL or logon trigger is a rule about the account rather than one of its objects. Neither are
+  the ones Oracle keeps on its own tables — a materialized view log, a container table, a Text
+  index table — nor triggers on another schema's table, the same exclusion the index listing
+  makes.
+  A synonym run copies the name and what it points at, and for this type that is the whole
+  object — so the schema-repointing pass that a table barely needs *is* the copy here. A synonym
+  for one of the source's own objects arrives pointing at the target's; one for a third schema
+  is left pointing there, because that is a cross-schema reference somebody meant. Nothing is
+  pre-checked, and deliberately so: Oracle creates a synonym for an object that is not there
+  rather than refusing it, so a check would turn away objects the database was going to accept —
+  and a synonym's target can be a package or a database link, neither of which this copies, so
+  every one of those would be reported blocked by something sitting in the target already. What
+  happens instead is the second pass the views brought: whichever of the new synonyms the target
+  marks invalid is reported as created *with the sentence saying it does not work yet*. Synonyms
+  are offered after the materialized views and before the triggers, which is the one position in
+  the list that is not about a `CREATE` failing — nothing forces a synonym later, but a trigger's
+  body can call one and no synonym can name a trigger, so the only dependency there is runs that
+  way round. Public synonyms are not offered: one belongs to `PUBLIC` rather than to the schema
+  and is visible to every session on the database, so creating one is a change to the database
+  rather than to the target.
+  **Keep the source tablespace** is a choice, off by default. Off, the segment clause is
+  suppressed entirely and objects land in the target's default tablespace — which is what lets a
+  production table land on a laptop, since a `TABLESPACE "USERS_DATA"` clause fails outright on a
+  database that has no such tablespace. On, each object is created where it lives in the source,
+  for a copy between two databases laid out the same way. Storage sizing (`INITIAL`, `NEXT`) is
+  left to the target either way: where a table lives is a different question from how much room
+  the source gave it. The confirmation dialog says which of the two is about to happen.
+  Objects the target already has are left alone by default; the other choice drops and recreates
+  them, and is presented as the destructive operation it is — the confirmation dialog counts them
+  and adds the sentence belonging to the kind being copied, since a dropped table takes its rows
+  with it, a dropped index is a rebuild, a dropped sequence hands out numbers it has already
+  given away, and a view, a synonym and a trigger are not dropped at all. A
+  failure does not stop the run: unlike a table migration script, this is hundreds of independent
+  objects, so every one is attempted and every outcome — created, replaced, skipped, failed, with
+  the Oracle error — is reported, which is also what makes re-running it useful. The skipped are
+  grouped by the reason they were skipped, smallest group first: "already in the target" two
+  hundred times is one line, and the handful whose table has not been copied yet is the line
+  worth reading.
+  Both endpoints are addressed by the target connection, so read-only mode, the
+  Oracle-maintained-schema refusal, the workspace role check and the write guard already covered
+  it. The copy runs on the backend and survives switching tabs. The kind catalogue, the statement
+  preparation (a `CREATE TABLE`'s trailing `;` is a terminator, a PL/SQL block's is part of the
+  block), the whitelist that keeps a picked name honest (it ends up inside `GET_DDL` and a
+  `DROP`, so it has to be in the source's own listing) and the schema rewrite live in
+  `server/objectCopy.ts` with 87 tests, because each is a mistake that looks like a success
+  rather than an error. Caps and what the copy deliberately leaves out are in
+  [known_limitations.md](known_limitations.md#copying-objects-between-connections).
+
+- **Choose the connection's role, the way SQL Developer does.** The connection wizard now has a
+  **Role** dropdown beside the username, offering the same list SQL Developer does — `default`,
+  `SYSDBA`, `SYSOPER`, `SYSBACKUP`, `SYSDG`, `SYSKM`, `SYSASM` — and every session the
+  connection opens is opened with that privilege. It is what lets an administrator reach a
+  database that is only mounted, and what lets a backup, Data Guard, key management or ASM
+  account connect at all, without granting any of them the unrestricted `SYSDBA` that used to be
+  the only privilege the app could ask for. `SYS` still gets `SYSDBA` on its own at `default`
+  (Oracle refuses anything else for it), so connections saved before this field existed keep
+  working unchanged, and the wizard's summary names the role the session will really open with.
+  The role is stored, exported and imported with the rest of the connection, shown in the
+  Explorer tooltip and in the export and import lists, and testing the connection reports the
+  role it connected as. Because a privileged session cannot come from a pool, a connection with
+  a role opens a standalone connection per request — the behaviour `SYS` already had, now
+  reached by the same code path for every role. It describes the session rather than the
+  destination, so it is deliberately not part of the endpoint identity guarding a stored
+  password: changing the role does not force the password to be retyped.
+
+- **Connect to Oracle Autonomous Database with an Oracle Cloud wallet.** The connection wizard
+  now opens on a choice — **Host and port**, as before, or **Oracle Cloud wallet** — and the
+  second one replaces the endpoint fields with the zip Oracle Cloud hands you. Upload it and
+  the backend unpacks it, reads its `tnsnames.ora`, and offers the services inside as a list;
+  pick one (`_high`, `_medium` or `_low` are the same database at different consumer groups),
+  add the database username and password and the wallet password, and the connection behaves
+  like any other from there. Nothing else in the app had to learn about wallets: the host and
+  port shown in the Explorer are what the alias resolved to, so tabs, history, the migration
+  assistant and duplicate detection all keep working on the same fields they always used.
+  No Oracle Instant Client is involved — node-oracledb's Thin mode reads the PEM wallet
+  directly, which is also why an *auto-login* wallet (`cwallet.sso`, no `ewallet.pem`) is
+  refused at upload with a message that says what to download instead.
+  The wallet never reaches the browser. It is unpacked into `data/wallets/<id>/` (`0700`,
+  files `0600`), keeping only the two files Thin mode reads and discarding the SSO wallet, the
+  PKCS#12 wallet and the Java keystores — an unused copy of a private key is still a key to
+  lose. Wallets are reference-counted, so three connections may share one, and a wallet
+  nothing points at is swept up (after an hour's grace, so a wallet uploaded in one tab
+  survives a registry change made in another) the next time a connection is saved, edited,
+  deleted or imported — including one uploaded into a wizard that was then cancelled. The wallet password
+  is stored and replayed exactly like the database password: encrypted with the registry,
+  never returned by `GET /api/connections`, and reusable only for the endpoint it was saved
+  against — which now counts the wallet itself, since swapping in a different wallet points
+  the same alias at a different database. Connection export carries wallets inline, so an
+  exported wallet connection restores on a machine that has never seen the zip; the import
+  preview marks those entries, and the wallet lands under an id the receiving server issues.
+  [credentials.md](credentials.md#oracle-cloud-wallets) covers storage and the export format,
+  [known_limitations.md](known_limitations.md#oracle-cloud-wallets) what the wallet support
+  does not do.
+- **A zip reader and a `tnsnames.ora` parser, tested.** Both live in `server/oracleWallet.ts`,
+  apart from the rest of the backend for the same reason the export envelope is: their input
+  is a file someone uploaded. `npm test` now runs 22 more cases covering what a bad file does
+  — a non-zip, a truncated one, an encrypted one, a decompression bomb, a wallet with no PEM,
+  a PEM with no key, an entry named `../../../../etc/ewallet.pem` — alongside the parser
+  reading multi-line descriptors and not mistaking the `host=` inside one for an alias. The
+  reader supports stored and deflated entries and refuses everything else outright rather than
+  guessing, which is the whole of what an Oracle-written wallet zip needs.
+- **Export saved connections to a passphrase-encrypted JSON file.** The lock icon beside
+  **Connections** in the Explorer (and **Export connections…** in a connection's context menu)
+  picks any subset of the saved connections, asks for a passphrase twice, and downloads
+  `dataforge-connections-<date>.json`. Until now the only copy of a connection's credentials
+  was `data/connections.json`, encrypted with a key that lives in this machine's environment —
+  useless on any other machine, and nothing to hand to a colleague setting up the same
+  databases. The export is the portable form. The browser has no passwords to encrypt, so it
+  does not build the file: it sends the passphrase, and the server derives a key with scrypt
+  (N=2^15, r=8) and returns AES-256-GCM ciphertext, so nothing readable ever reaches the page.
+  Full access only, a 12-character minimum on the passphrase — an export file is attacked
+  offline, unlike an account password — and every export is logged to the server console.
+- **Import connections from an encrypted export.** The other half of the same feature: pick the
+  file, type its passphrase, and **Unlock file** shows what is inside — names, servers, users,
+  read-only flags, and nothing else, because the decryption happens on the backend and
+  passwords do not travel to the browser even in a preview. Nothing is written until you press
+  Import, so the wrong file or a mistyped passphrase costs a click. An entry pointing at a
+  server, port, user and service you already have saved is marked **ALREADY SAVED** and is
+  skipped by default; choosing *Replace with the file* overwrites that connection in place,
+  keeping its id so open tabs stay pointed at it. The uploaded file is treated as untrusted
+  input throughout — the scrypt parameters it carries are range-checked before a key is
+  derived, the payload is bounded and capped, and every entry is validated exactly like one
+  typed into the connection wizard. [credentials.md](credentials.md#exporting-connections-to-an-encrypted-file)
+  documents the format, the import rules, and how to decrypt a file by hand with Node.
+- **The project's first automated tests**, covering that export/import crypto: `npm test`,
+  21 cases on Node's built-in test runner with no new dependency and nothing to stand up.
+  They check the round trip (unicode passwords included), that a wrong passphrase or a single
+  flipped bit fails instead of returning something plausible, that no plaintext survives in a
+  written file, and that a hostile file cannot choose this process's scrypt parameters. To
+  make them possible the envelope moved to `server/connectionExport.ts` — the backend is now
+  one file plus one small pure module, rather than strictly one file.
 - **A permanent find strip in the PL/SQL editor, in SQL Developer's shape.** The object editor's
   search is now always on screen above the code rather than a popover only Ctrl+F could
   summon, and it carries the options SQL Developer offers: the **3 of 12** position of the
