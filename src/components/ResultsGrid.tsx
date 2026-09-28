@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import HorizontalScrollbar from "./HorizontalScrollbar";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -9,6 +10,7 @@ import {
   Download,
   Filter,
   Maximize2,
+  Pin,
 } from "lucide-react";
 import type { CellValue } from "../types";
 import { download, toCsv, toJson } from "../utils/sql";
@@ -35,6 +37,14 @@ export default function ResultsGrid({
   /** the server stopped at its row cap — say so permanently, not just in a toast */
   truncated?: boolean;
 }) {
+  const gridRef = useRef<HTMLDivElement>(null);
+  const [columnSearch, setColumnSearch] = useState("");
+  const [widths, setWidths] = useState<Record<number, number>>({});
+  const [pinned, setPinned] = useState<Set<number>>(new Set());
+  const [rowDetail, setRowDetail] = useState<CellValue[] | null>(null);
+  useEffect(() => {
+    setHidden(new Set()); setPinned(new Set()); setWidths({}); setSort(null); setPage(0); setRowDetail(null);
+  }, [columns, rows]);
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(0);
@@ -62,7 +72,10 @@ export default function ResultsGrid({
 
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE));
   const pageRows = filtered.slice(page * PAGE, page * PAGE + PAGE);
-  const visCols = columns.map((c, i) => ({ name: c, i })).filter((c) => !hidden.has(c.i));
+  const visCols = columns.map((c, i) => ({ name: c, i })).filter((c) => !hidden.has(c.i)).sort((a, b) => Number(pinned.has(b.i)) - Number(pinned.has(a.i)));
+  const columnWidth = (i: number) => widths[i] ?? Math.min(260, Math.max(140, columns[i].length * 8 + 60));
+  const columnStyle = (i: number) => pinned.has(i) ? { position: "sticky" as const, left: 48 + visCols.slice(0, visCols.findIndex((c) => c.i === i)).reduce((n, c) => n + columnWidth(c.i), 0), zIndex: 2 } : {};
+
 
   const fmt = (v: CellValue) => {
     if (v === null) return <span className="text-mute italic">(null)</span>;
@@ -77,7 +90,7 @@ export default function ResultsGrid({
   const cellText = (v: CellValue) => (v === null ? "" : String(v));
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
       {/* toolbar */}
       <div className="flex items-center gap-2 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
         <div className="relative">
@@ -99,9 +112,14 @@ export default function ResultsGrid({
             Columns
           </Btn>
           {colsOpen && (
-            <div className="absolute z-40 top-8 left-0 bg-panel border border-bdr rounded-lg shadow-2xl p-2 min-w-44 df-fade">
-              {columns.map((c, i) => (
-                <label key={c} className="flex items-center gap-2 px-1.5 py-1 text-[12px] font-mono hover:bg-panel2 rounded cursor-pointer">
+            <div className="absolute z-40 top-8 left-0 bg-panel border border-bdr rounded-lg shadow-2xl p-2 w-64 max-h-[60vh] overflow-auto df-fade">
+              <input aria-label="Search columns" placeholder="Search columns…" value={columnSearch} onChange={(e) => setColumnSearch(e.target.value)} className="w-full rounded border border-bdr bg-panel2 px-2 py-1 text-[12px]" />
+              <div className="flex gap-2 py-2 text-[11px]">
+                <button onClick={() => setHidden(new Set())} className="hover:text-accent">Show all</button>
+                <button onClick={() => setHidden(new Set(columns.map((_, i) => i)))} className="hover:text-accent">Hide all</button>
+              </div>
+              {columns.map((c, i) => ({ c, i })).filter(({ c }) => c.toLowerCase().includes(columnSearch.toLowerCase())).map(({ c, i }) => (
+                <label key={i} className="flex items-center gap-2 px-1.5 py-1 text-[12px] font-mono hover:bg-panel2 rounded cursor-pointer">
                   <input
                     type="checkbox"
                     checked={!hidden.has(i)}
@@ -109,7 +127,7 @@ export default function ResultsGrid({
                       setHidden((h) => {
                         const n = new Set(h);
                         if (n.has(i)) n.delete(i);
-                        else if (n.size < columns.length - 1) n.add(i);
+                        else n.add(i);
                         return n;
                       })
                     }
@@ -132,23 +150,27 @@ export default function ResultsGrid({
       </div>
 
       {/* grid */}
-      <div className="flex-1 overflow-auto min-h-0" onClick={() => colsOpen && setColsOpen(false)}>
-        <table className="w-full border-collapse text-[12px] font-mono">
+      <div ref={gridRef} className="flex-1 overflow-y-auto overflow-x-hidden min-h-0 min-w-0" onClick={() => colsOpen && setColsOpen(false)}>
+        <table className="border-separate border-spacing-0 table-fixed text-[12px] font-mono" style={{ width: 48 + visCols.reduce((n, c) => n + columnWidth(c.i), 0) }}>
+          <colgroup><col style={{ width: 48 }} />{visCols.map(({ i }) => <col key={i} style={{ width: columnWidth(i) }} />)}</colgroup>
           <thead className="sticky top-0 z-10">
             <tr>
-              <th className="bg-panel3 border-b border-r border-bdr px-2 py-1.5 text-left text-[10px] text-mute w-10 font-semibold">#</th>
+              <th style={{ position: "sticky", left: 0, zIndex: 3 }} className="bg-panel3 border-b border-r border-bdr px-2 py-1.5 text-left text-[10px] text-mute w-10 font-semibold">#</th>
               {visCols.map(({ name, i }) => (
                 <th
-                  key={name}
+                  key={i}
+                  style={columnStyle(i)}
                   className="bg-panel3 border-b border-r border-bdrsoft px-2.5 py-1.5 text-left text-[11px] font-bold text-soft cursor-pointer hover:text-ink select-none whitespace-nowrap"
                   onClick={() => setSort((s) => (s?.col === i ? (s.dir === 1 ? { col: i, dir: -1 } : null) : { col: i, dir: 1 }))}
                   title={`Sort by ${name}`}
                   aria-sort={sort?.col === i ? (sort.dir === 1 ? "ascending" : "descending") : "none"}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    {name}
+                  <div className="relative flex items-center gap-1">
+                    <button type="button" title={pinned.has(i) ? `Unpin ${name}` : `Pin ${name}`} aria-label={pinned.has(i) ? `Unpin ${name}` : `Pin ${name}`} aria-pressed={pinned.has(i)} onClick={(e) => { e.stopPropagation(); setPinned((prev) => { const next = new Set(prev); if (next.has(i)) next.delete(i); else next.add(i); return next; }); }} className={pinned.has(i) ? "text-accent shrink-0" : "text-mute shrink-0"}><Pin size={11} /></button>
+                    <span className="truncate" title={name}>{name}</span>
+                    <div role="separator" aria-orientation="vertical" aria-label={`Resize ${name}`} tabIndex={0} onClick={(e) => e.stopPropagation()} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setWidths((prev) => ({ ...prev, [i]: Math.max(90, Math.min(600, columnWidth(i) + (e.key === "ArrowRight" ? 20 : -20))) })); } }} onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (e.currentTarget.hasPointerCapture(e.pointerId)) { const th = e.currentTarget.closest("th")!; setWidths((prev) => ({ ...prev, [i]: Math.max(90, Math.min(600, e.clientX - th.getBoundingClientRect().left)) })); } }} className="absolute -right-2.5 top-0 bottom-0 w-2 cursor-col-resize touch-none hover:bg-accent" />
                     {sort?.col === i && (sort.dir === 1 ? <ArrowUp size={11} className="text-accent" /> : <ArrowDown size={11} className="text-accent" />)}
-                  </span>
+                  </div>
                 </th>
               ))}
             </tr>
@@ -156,14 +178,17 @@ export default function ResultsGrid({
           <tbody>
             {pageRows.map((r, ri) => (
               <tr key={ri} className="hover:bg-accentdim/60 group">
-                <td className="border-b border-r border-bdrsoft px-2 text-[10px] text-mute bg-panel">{page * PAGE + ri + 1}</td>
+                <td style={{ position: "sticky", left: 0, zIndex: 3 }} className="border-b border-r border-bdrsoft px-2 text-[10px] text-mute bg-panel"><button className="underline hover:text-accent" title="Open row details" aria-label={`View details for row ${page * PAGE + ri + 1}`} onClick={() => setRowDetail(r)}>{page * PAGE + ri + 1}</button></td>
                 {visCols.map(({ i }) => {
                   const raw = cellText(r[i]);
                   const long = raw.length > CELL_CLIP;
                   return (
                     <td
                       key={i}
-                      className={`border-b border-r border-bdrsoft px-2.5 whitespace-nowrap text-ink max-w-[26rem] overflow-hidden text-ellipsis ${dense ? "py-0.5" : "py-1"}`}
+                      style={columnStyle(i)}
+                      title={raw}
+                      onDoubleClick={() => { setCopied(false); setDetail({ column: columns[i], value: raw }); }}
+                      className={`border-b border-r border-bdrsoft px-2.5 bg-panel whitespace-nowrap text-ink max-w-[26rem] overflow-hidden text-ellipsis ${dense ? "py-0.5" : "py-1"}`}
                     >
                       {long ? (
                         <span className="inline-flex items-center gap-1.5 max-w-full">
@@ -201,6 +226,8 @@ export default function ResultsGrid({
           </tbody>
         </table>
       </div>
+
+      <HorizontalScrollbar target={gridRef} contentKey={visCols.map(({ i }) => `${i}:${columnWidth(i)}`).join(",")} />
 
       {/* pagination */}
       <div className="flex items-center gap-2 px-2.5 py-1 border-t border-bdrsoft text-[11.5px] text-soft shrink-0">
@@ -242,6 +269,13 @@ export default function ResultsGrid({
         </div>
       </div>
 
+      {rowDetail && (
+        <Modal title="Row details" onClose={() => setRowDetail(null)} width={760}>
+          <div className="p-4 max-h-[65vh] overflow-auto">
+            <dl className="space-y-3">{columns.map((column, i) => <div key={i} className="border-b border-bdrsoft pb-2"><dt className="font-mono text-[12px] text-accent break-all">{column}</dt><dd className="mt-1 font-mono text-[12px] whitespace-pre-wrap break-all">{rowDetail[i] === null ? "(null)" : String(rowDetail[i])}</dd></div>)}</dl>
+          </div>
+        </Modal>
+      )}
       {detail && (
         <Modal title={detail.column} onClose={() => setDetail(null)} width={760}>
           <div className="px-4 py-3 flex flex-col gap-2 min-h-0">

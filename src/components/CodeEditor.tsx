@@ -1,3 +1,4 @@
+import HorizontalScrollbar from "./HorizontalScrollbar";
 import { useCodeCompletion } from "./useCodeCompletion";
 import { useEditorTools } from "./EditorTools";
 import {
@@ -484,15 +485,17 @@ const CodeEditor = forwardRef<
           onKeyDown={onKeyDown}
           onSelect={syncActiveFromCaret}
           onScroll={() => { syncScroll(); completion.close(); }}
+          wrap="off"
           spellCheck={false}
           aria-label={ariaLabel ?? "Code editor"}
           title="Code suggestions: Ctrl+Space"
-          className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-auto"
+          className="absolute inset-0 w-full h-full resize-none bg-transparent text-transparent caret-[var(--accent)] outline-none overflow-y-auto overflow-x-hidden"
           style={sharedStyle}
         />
         {completion.popup}
         </div>
       </div>
+      <HorizontalScrollbar target={taRef} contentKey={value} />
       {editor.problems}
     </div>
   );
