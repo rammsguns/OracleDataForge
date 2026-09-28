@@ -4,7 +4,7 @@
 2. Request a Copilot review. Repository rules enable automatic review, including new pushes; verify that a review actually completes for the latest commit.
 3. Read the review comments, verify each finding, and fix confirmed problems. Document why a finding is not applicable when necessary.
 4. Push corrections and request another review if one is not triggered automatically.
-5. Wait for CI on the latest commit. CI currently checks types and builds the app; test and browser results must be reported separately.
+5. Wait for CI on the latest commit. CI checks types, runs the existing test suite, and builds the app. Browser results and any additional tests must be reported separately.
 6. Merge only after relevant findings are addressed, CI passes, and the user has authorized merging. A successful Copilot workflow run alone does not prove that review comments were posted or that the latest commit was reviewed.
 
 Copilot uses `.github/copilot-instructions.md` for project conventions and review priorities. These instructions apply after they are available on the PR base branch.
