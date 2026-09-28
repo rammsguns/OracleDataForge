@@ -158,28 +158,36 @@ kbd {
   border-radius: 4px;
 }
 
-/* Keep horizontal navigation visible, including when the result viewport is tall. */
+/* Explicit tracks remain visible when the OS hides native scrollbars. */
 .horizontal-scrollbar {
-  height: 18px;
-  overflow-x: scroll;
-  overflow-y: hidden;
-  scrollbar-width: auto;
-  scrollbar-color: var(--accent) var(--panel2);
+  height: 22px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
   background: var(--panel2);
 }
-.horizontal-scrollbar::-webkit-scrollbar { height: 16px; }
-.horizontal-scrollbar::-webkit-scrollbar-thumb { background-color: var(--accent); }
-.horizontal-scrollbar::-webkit-scrollbar-track { background: var(--panel2); }
-
-/* The worksheet uses the textarea's own scrollbar, so caret movement and
-   horizontal navigation always use the same scroll position. */
-.worksheet-sql-input {
-  overflow-x: scroll;
-  overflow-y: auto;
-  scrollbar-width: auto;
-  scrollbar-color: var(--accent) var(--panel2);
-  scrollbar-gutter: stable;
+.horizontal-scrollbar input {
+  appearance: none;
+  width: 100%;
+  height: 8px;
+  margin: 0;
+  border-radius: 4px;
+  background: var(--border);
+  cursor: ew-resize;
 }
-.worksheet-sql-input::-webkit-scrollbar { width: 16px; height: 16px; }
-.worksheet-sql-input::-webkit-scrollbar-thumb { background-color: var(--accent); }
-.worksheet-sql-input::-webkit-scrollbar-track { background: var(--panel2); }
+.horizontal-scrollbar input::-webkit-slider-thumb {
+  appearance: none;
+  width: 40px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--accent);
+}
+.horizontal-scrollbar input::-moz-range-thumb {
+  width: 40px;
+  height: 14px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+}
+.horizontal-scrollbar input:disabled { opacity: .4; cursor: default; }
+.worksheet-sql-input { overflow-x: hidden; overflow-y: auto; }

@@ -1,3 +1,4 @@
+import HorizontalScrollbar from "./HorizontalScrollbar";
 import { useCodeCompletion } from "./useCodeCompletion";
 import { useEditorTools } from "./EditorTools";
 import { useEffect, useMemo, useRef, type CSSProperties } from "react";
@@ -148,6 +149,7 @@ export default function SqlEditor({
         {completion.popup}
       </div>
       </div>
+      <HorizontalScrollbar target={taRef} contentKey={value} />
       {editor.problems}
     </div>
   );

@@ -1,22 +1,20 @@
-import { useEffect, useRef, type RefObject } from "react";
+import { useEffect, useState, type RefObject } from "react";
 
-/** A persistent bottom scrollbar synchronized with a scrollable viewport. */
+/** Always-visible horizontal navigation, independent of OS overlay scrollbars. */
 export default function HorizontalScrollbar({ target, contentKey }: {
   target: RefObject<HTMLElement>;
   contentKey?: unknown;
 }) {
-  const bar = useRef<HTMLDivElement>(null);
-  const track = useRef<HTMLDivElement>(null);
+  const [maximum, setMaximum] = useState(0);
+  const [position, setPosition] = useState(0);
   useEffect(() => {
     const viewport = target.current;
-    const scrollbar = bar.current;
-    const spacer = track.current;
-    if (!viewport || !scrollbar || !spacer) return;
+    if (!viewport) return;
     const measure = () => {
-      spacer.style.width = `${viewport.scrollWidth}px`;
-      scrollbar.scrollLeft = viewport.scrollLeft;
+      setMaximum(Math.max(0, viewport.scrollWidth - viewport.clientWidth));
+      setPosition(viewport.scrollLeft);
     };
-    const sync = () => { scrollbar.scrollLeft = viewport.scrollLeft; };
+    const sync = () => setPosition(viewport.scrollLeft);
     const observer = new ResizeObserver(measure);
     observer.observe(viewport);
     if (viewport.firstElementChild) observer.observe(viewport.firstElementChild);
@@ -25,12 +23,14 @@ export default function HorizontalScrollbar({ target, contentKey }: {
     return () => { observer.disconnect(); viewport.removeEventListener("scroll", sync); };
   }, [target, contentKey]);
   return (
-    <div ref={bar} tabIndex={0} aria-label="Horizontal scroll" className="horizontal-scrollbar shrink-0 min-w-0 border-t border-bdrsoft"
-      onScroll={() => {
-        if (target.current && bar.current && target.current.scrollLeft !== bar.current.scrollLeft)
-          target.current.scrollLeft = bar.current.scrollLeft;
-      }}>
-      <div ref={track} style={{ height: 1 }} />
+    <div className="horizontal-scrollbar shrink-0 min-w-0 border-t border-bdrsoft">
+      <input type="range" aria-label="Horizontal scroll" min={0} max={maximum} step={1}
+        value={Math.min(position, maximum)} disabled={maximum === 0}
+        onChange={(e) => {
+          const next = Number(e.currentTarget.value);
+          if (target.current) target.current.scrollLeft = next;
+          setPosition(next);
+        }} />
     </div>
   );
 }
