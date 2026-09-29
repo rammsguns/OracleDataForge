@@ -40,6 +40,8 @@ import { NEW_TABLE_SENTINEL } from "../utils/tableDdl";
 import { download, toCsv, toJson } from "../utils/sql";
 import { ContextMenu, Spinner } from "./ui";
 import type { MenuItem } from "../types";
+import PackageExport from "./PackageExport";
+import SavePackageDialog from "./SavePackageDialog";
 
 interface SchemaGroup {
   label: string;
@@ -223,6 +225,8 @@ export default function Sidebar() {
   /** how many items each group is currently rendering (see GROUP_PAGE) */
   const [shown, setShown] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const [packageExport, setPackageExport] = useState<{ object: string; spec: string; body: string | null } | null>(null);
+  const [savePackageConnId, setSavePackageConnId] = useState<string | null>(null);
   /** id of the connection currently opening/closing its session (blocks double clicks) */
   const [connBusy, setConnBusy] = useState<string | null>(null);
   /** label of the group being re-read on its own (one at a time — they share a session) */
@@ -497,6 +501,18 @@ export default function Sidebar() {
     }
   };
 
+  const savePackage = async (connId: string, name: string) => {
+    try {
+      const source = await api.source(connId, name);
+      if (source.error || !source.source || source.type !== "PACKAGE") {
+        throw new Error(source.error || "The package has no readable specification.");
+      }
+      setPackageExport({ object: name, spec: source.source, body: source.bodySource ?? null });
+    } catch (e) {
+      s.toast("error", `Could not save ${name} — ${(e as Error).message}`);
+    }
+  };
+
   const objectMenu = (name: string, kind: string, groupLabel: string): MenuItem[] => {
     const isTable = kind === "table";
     const designable = isTable && canDesignTable;
@@ -520,6 +536,9 @@ export default function Sidebar() {
         : []),
       { label: "Edit…", action: () => (designable ? openTableDesigner(name) : openObjectEditor(name, kind)) },
       { label: "Inspect DDL", action: () => openObjectEditor(name, kind) },
+      ...(activeConn?.live && kind === "package"
+        ? [{ label: "Save package code…", action: () => void savePackage(activeConn.id, name) }]
+        : []),
       ...(activeConn?.live
         ? [{ label: "View dependencies…", action: () => s.openTab("deps", `Deps: ${name}`, name) }]
         : []),
@@ -740,7 +759,7 @@ export default function Sidebar() {
                         : []),
                       // opens the tab; it previews what is broken and asks before compiling
                       ...(c.engine === "oracle" && c.live
-                        ? [{
+                        ? [{ label: "Save package code…", action: () => setSavePackageConnId(c.id) }, {
                             label: "Compile invalid objects…",
                             action: () => { s.setActiveConnId(c.id); s.openTab("compile", `Compile: ${c.name}`, "schema"); },
                           }]
@@ -1063,6 +1082,7 @@ export default function Sidebar() {
                       onContextMenu={(e) => {
                         if (g.kind === "database") return;
                         e.preventDefault();
+                        e.stopPropagation();
                         setMenu({ x: e.clientX, y: e.clientY, items: objectMenu(name, g.kind, g.label) });
                       }}
                     >
@@ -1108,6 +1128,8 @@ export default function Sidebar() {
       </div>
 
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {packageExport && <PackageExport {...packageExport} sourceDescription="saved database source" onClose={() => setPackageExport(null)} />}
+      {savePackageConnId && <SavePackageDialog key={savePackageConnId} connId={savePackageConnId} onClose={() => setSavePackageConnId(null)} />}
     </div>
   );
 }
