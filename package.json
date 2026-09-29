@@ -18,7 +18,7 @@
   "dependencies": {
     "compression": "^1.8.2",
     "express": "^4.21.2",
-    "lucide-react": "^0.469.0",
+    "lucide-react": "^1.48.0",
     "oracledb": "^7.0.1",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
