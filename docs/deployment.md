@@ -6,7 +6,7 @@ image — see [Why there is no Docker path](#why-there-is-no-docker-path).
 
 ## Prerequisites
 
-- Node.js 22 or newer (tested through 24). Declared in `package.json` as `engines`, so npm
+- Node.js 22.12 or newer (tested through 24). Declared in `package.json` as `engines`, so npm
   warns at install time on an older runtime.
 - npm.
 - A reachable Oracle Database service, if you want to connect to anything.
