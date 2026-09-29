@@ -16,7 +16,7 @@ function readSettings() {
   } catch { return defaults; }
 }
 
-export function useEditorTools(value: string, ref: RefObject<HTMLTextAreaElement>, errorLine?: number | null) {
+export function useEditorTools(value: string, ref: RefObject<HTMLTextAreaElement | null>, errorLine?: number | null) {
   const [settings, setSettings] = useState(readSettings);
   const [expanded, setExpanded] = useState(false);
   useEffect(() => {

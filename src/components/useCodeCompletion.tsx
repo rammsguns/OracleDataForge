@@ -1,7 +1,7 @@
 import { useId, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { getCompletions, type Completion } from '../utils/completions';
 
-export function useCodeCompletion(ref: RefObject<HTMLTextAreaElement>, value: string, onChange: (v: string) => void, readOnly = false) {
+export function useCodeCompletion(ref: RefObject<HTMLTextAreaElement | null>, value: string, onChange: (v: string) => void, readOnly = false) {
   const id = useId();
   const composing = useRef(false);
   const [state, setState] = useState<(NonNullable<ReturnType<typeof getCompletions>> & { source: string; caret: number; selected: number; top: number; left: number; height: number }) | null>(null);
