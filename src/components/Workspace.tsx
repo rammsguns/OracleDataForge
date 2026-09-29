@@ -5,7 +5,7 @@ import {
   FileCode2,
   Gauge,
   GitCompareArrows,
-  Github,
+  GitBranch,
   Hammer,
   History,
   ListChecks,
@@ -59,7 +59,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   compile: <Hammer size={12} />,
   joblog: <ListChecks size={12} />,
   admin: <UserCog size={12} />,
-  repository: <Github size={12} />,
+  repository: <GitBranch size={12} />,
 };
 
 const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
