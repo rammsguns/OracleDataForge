@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, CircleAlert, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, Search } from "lucide-react";
+import { CheckCircle2, CircleAlert, Download, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, Search } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, type ObjectSource } from "../utils/api";
 import CodeEditor, { type CodeEditorHandle } from "./CodeEditor";
 import { editKey, getEdits, setEdits } from "../utils/editBuffers";
 import { hintForError } from "../utils/plsqlHints";
 import { Btn, Badge, Spinner, ToolbarSep } from "./ui";
+import PackageExport from "./PackageExport";
 
 /** Oracle code types editable + compilable in place (BODY variants are reached via the SPEC/BODY toggle). */
 const EDITABLE = new Set(["PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE", "VIEW"]);
@@ -92,6 +93,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   const [body, setBody] = useState("");
   const [orig, setOrig] = useState({ spec: "", body: "" });
   const [loaded, setLoaded] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [compiling, setCompiling] = useState(false);
   const [panel, setPanel] = useState<ResultPanel | null>(null);
   const [activeErr, setActiveErr] = useState<{ part: "spec" | "body"; line: number } | null>(null);
@@ -274,6 +276,14 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             <Search size={15} />
           </Btn>
           <ToolbarSep />
+          {type === "PACKAGE" && loaded && (
+            <>
+              <Btn variant="toolbar" onClick={() => setExportOpen(true)} title="Export package specification and body">
+                <Download size={15} /> Export
+              </Btn>
+              <ToolbarSep />
+            </>
+          )}
           {canWrite && !systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
             <>
               <Btn
@@ -453,6 +463,9 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
         </div>
       )}
 
+      {exportOpen && (
+        <PackageExport object={object} spec={spec} body={hasBody ? body : null} dirty={dirty} onClose={() => setExportOpen(false)} />
+      )}
     </div>
   );
 }

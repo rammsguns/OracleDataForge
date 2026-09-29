@@ -1,8 +1,9 @@
-import { Keyboard, Moon, PanelLeft, ShieldCheck, Sun } from "lucide-react";
+import { Info, Keyboard, Moon, PanelLeft, ShieldCheck, Sun } from "lucide-react";
 import { useState } from "react";
 import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { Btn, Field, Modal, inputCls } from "./ui";
+import appPackage from "../../package.json";
 
 /**
  * Change your own password — the one account action that is not Administrator-only, so a
@@ -83,6 +84,7 @@ export function TitleBar() {
   const s = useStudio();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const conn = s.connections.find((c) => c.id === s.activeConnId);
 
   return (
@@ -123,6 +125,14 @@ export function TitleBar() {
       <div className="ml-auto flex items-center gap-1">
         <button
           type="button"
+          onClick={() => setAboutOpen(true)}
+          className="flex items-center gap-1.5 h-7 px-2 rounded-md text-[11px] text-mute hover:text-soft hover:bg-panel3 transition-colors"
+          aria-label="About Oracle DataForge"
+        >
+          <Info size={14} /> <span>About</span>
+        </button>
+        <button
+          type="button"
           onClick={() => setAccountOpen(true)}
           className="hidden md:flex items-center gap-1.5 h-7 px-2 rounded-md border border-bdr text-[10.5px] text-mute hover:text-soft hover:border-accent/60 hover:bg-accentdim transition-colors"
           title={s.session?.name ? `Signed in as ${s.session.name} — open account settings` : "Server-enforced access role for this session"}
@@ -149,6 +159,29 @@ export function TitleBar() {
           {s.theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
         </button>
       </div>
+
+      {aboutOpen && (
+        <Modal title="About Oracle DataForge" onClose={() => setAboutOpen(false)} width={500}>
+          <div className="space-y-4 text-[12.5px] text-soft">
+            <div>
+              <div className="text-[18px] font-semibold text-ink">Oracle DataForge</div>
+              <div className="font-mono text-accenthi">Version {appPackage.version}</div>
+            </div>
+            <p>A browser workspace for Oracle Database development and administration.</p>
+            <div>
+              <div className="font-semibold text-ink mb-1">What you can do</div>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Browse database objects and run SQL in worksheets.</li>
+                <li>Edit, compile, test, and export PL/SQL package code.</li>
+                <li>Inspect table data, dependencies, execution plans, and version history.</li>
+                <li>Manage Oracle connections, including Autonomous Database wallets.</li>
+              </ul>
+            </div>
+            <a className="text-accenthi hover:underline" href="https://github.com/rammsguns/OracleDataForge" target="_blank" rel="noopener noreferrer">Project repository ↗</a>
+            <div className="flex justify-end"><Btn variant="outline" onClick={() => setAboutOpen(false)}>Close</Btn></div>
+          </div>
+        </Modal>
+      )}
 
       {accountOpen && (
         <Modal title="Account" onClose={() => setAccountOpen(false)} width={440}>
