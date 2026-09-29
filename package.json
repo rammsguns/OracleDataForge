@@ -16,7 +16,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "compression": "^1.8.1",
+    "compression": "^1.8.2",
     "express": "^4.21.2",
     "lucide-react": "^0.469.0",
     "oracledb": "^7.0.1",
@@ -25,7 +25,7 @@
     "tsx": "^4.23.15"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.0.0",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/compression": "^1.8.1",
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.2",
