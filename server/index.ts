@@ -4383,6 +4383,12 @@ async function oraObjectCopy(
 
 const app = express();
 
+/** Named :id routes always have one segment; reject unexpected array parameters. */
+function routeId(req: express.Request): string {
+  const id = req.params.id;
+  return typeof id === "string" ? id : "";
+}
+
 /**
  * `req.ip` reads the raw socket address unless Express is told otherwise — behind the
  * TLS-terminating reverse proxy this app expects for anything beyond loopback (see
@@ -4735,7 +4741,7 @@ app.post("/api/users", requireAdministrator, (req, res) => {
 });
 
 app.put("/api/users/:id", requireAdministrator, (req, res) => {
-  const existing = [...users.values()].find((u) => u.id === req.params.id);
+  const existing = [...users.values()].find((u) => u.id === routeId(req));
   if (!existing) return res.status(404).json({ error: "Unknown user." });
   const body = req.body as UpdateUserBody;
   const bad = validateUserFields(body);
@@ -4759,7 +4765,7 @@ app.put("/api/users/:id", requireAdministrator, (req, res) => {
 });
 
 app.post("/api/users/:id/status", requireAdministrator, (req, res) => {
-  const existing = [...users.values()].find((u) => u.id === req.params.id);
+  const existing = [...users.values()].find((u) => u.id === routeId(req));
   if (!existing) return res.status(404).json({ error: "Unknown user." });
   const status = req.body?.status === "Suspended" ? "Suspended" : "Active";
   if (wouldOrphanAdministrators(existing.id, undefined, status)) {
@@ -4771,7 +4777,7 @@ app.post("/api/users/:id/status", requireAdministrator, (req, res) => {
 });
 
 app.delete("/api/users/:id", requireAdministrator, (req, res) => {
-  const existing = [...users.values()].find((u) => u.id === req.params.id);
+  const existing = [...users.values()].find((u) => u.id === routeId(req));
   if (!existing) return res.json({ ok: true });
   if (wouldOrphanAdministrators(existing.id, undefined, "Suspended")) {
     return res.status(400).json({ error: "This would leave the workspace with no active Administrator." });
@@ -4908,11 +4914,11 @@ app.post("/api/wallets", requireFullAccess, (req, res) => {
 
 /** The services in an already-uploaded wallet — what the edit form repopulates from. */
 app.get("/api/wallets/:id", requireFullAccess, (req, res) => {
-  if (!isWalletId(req.params.id)) return res.status(400).json({ error: "Not a wallet id." });
-  const services = walletServices(req.params.id);
+  if (!isWalletId(routeId(req))) return res.status(400).json({ error: "Not a wallet id." });
+  const services = walletServices(routeId(req));
   if (!services) return res.status(404).json({ error: "That wallet is no longer on this server — upload the wallet zip again." });
-  const pem = readWallet(req.params.id)?.["ewallet.pem"] ?? "";
-  res.json({ walletId: req.params.id, services, needsPassword: walletNeedsPassword(pem) });
+  const pem = readWallet(routeId(req))?.["ewallet.pem"] ?? "";
+  res.json({ walletId: routeId(req), services, needsPassword: walletNeedsPassword(pem) });
 });
 
 /**
@@ -4984,7 +4990,7 @@ function reuseStoredSecrets(cfg: ConnConfig, saved: LiveConnection): string | nu
 
 /** Test against an existing connection — an empty password means "use the stored one". */
 app.post("/api/connections/:id/test", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.json({ ok: false, error: "Unknown connection (backend may have restarted — recreate it)" });
   const cfg = resolveWalletEndpoint(pickConfig(req.body));
   const refused = reuseStoredSecrets(cfg, c);
@@ -5007,7 +5013,7 @@ app.post("/api/connections", requireFullAccess, (req, res) => {
 
 /** Update a saved connection — an empty password keeps the stored one. Pools are recycled. */
 app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const cfg = resolveWalletEndpoint(pickConfig(req.body));
   const refused = reuseStoredSecrets(cfg, c);
@@ -5022,7 +5028,7 @@ app.put("/api/connections/:id", requireFullAccess, async (req, res) => {
 });
 
 app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (c) {
     try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
     registry.delete(c.id);
@@ -5313,7 +5319,7 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
  * stale by a database or network restart.
  */
 app.post("/api/connections/:id/disconnect", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
     const wasOpen = await closePools(c);
@@ -5323,7 +5329,7 @@ app.post("/api/connections/:id/disconnect", async (req, res) => {
 
 /** Reconnect: close whatever is open, then prove a fresh session can be established. */
 app.post("/api/connections/:id/reconnect", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try { await closePools(c); } catch (e) { return res.status(409).json({ error: errMsg(e) }); }
   const started = Date.now();
@@ -5336,7 +5342,7 @@ app.post("/api/connections/:id/reconnect", async (req, res) => {
 });
 
 app.get("/api/connections/:id/schema", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
     res.json(await oraSchema(c));
@@ -5347,7 +5353,7 @@ app.get("/api/connections/:id/schema", async (req, res) => {
 
 /** One group of the tree, re-read on its own (the per-type Refresh in the Explorer). */
 app.get("/api/connections/:id/schema/group", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const label = String(req.query.label ?? "").trim();
   if (!label) return res.status(400).json({ error: "Missing group label (?label=...)" });
@@ -5415,9 +5421,9 @@ function copyEndpoints(sourceId: string, targetId: string): { source: LiveConnec
 
 /** What a copy would do, without doing any of it: GET ?source=<id>&kind=tables */
 app.get("/api/connections/:id/objects/copy", requireSchemaMetadataAccess, async (req, res) => {
-  const parsed = readCopyRequest(req.query as Record<string, unknown>, req.params.id);
+  const parsed = readCopyRequest(req.query as Record<string, unknown>, routeId(req));
   if ("error" in parsed) return res.status(400).json({ error: parsed.error });
-  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  const ends = copyEndpoints(parsed.sourceId, routeId(req));
   if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
   try {
     res.json(await oraObjectCopyPlan(ends.source, ends.target, parsed.kind));
@@ -5428,9 +5434,9 @@ app.get("/api/connections/:id/objects/copy", requireSchemaMetadataAccess, async 
 
 /** Run it: body { sourceId, kind?, existing?, confirm? } */
 app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res) => {
-  const parsed = readCopyRequest((req.body ?? {}) as Record<string, unknown>, req.params.id);
+  const parsed = readCopyRequest((req.body ?? {}) as Record<string, unknown>, routeId(req));
   if ("error" in parsed) return res.status(400).json({ error: parsed.error });
-  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  const ends = copyEndpoints(parsed.sourceId, routeId(req));
   if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
   const { source, target } = ends;
   const { kind, existing } = parsed;
@@ -5540,9 +5546,9 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
 
 const activeDataCopies = new Set<string>();
 app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, async (req, res) => {
-  const parsed = readCopyRequest(req.query as Record<string, unknown>, req.params.id);
+  const parsed = readCopyRequest(req.query as Record<string, unknown>, routeId(req));
   if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  const ends = copyEndpoints(parsed.sourceId, routeId(req));
   if ('error' in ends) return res.status(ends.status).json({ error: ends.error });
   let conn: oracledb.Connection | undefined;
   let src: oracledb.Connection | undefined;
@@ -5562,9 +5568,9 @@ app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, as
   finally { await Promise.allSettled([...(conn ? [conn.close()] : []), ...(src ? [src.close()] : [])]); }
 });
 app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req, res) => {
-  const parsed = readCopyRequest(req.body ?? {}, req.params.id);
+  const parsed = readCopyRequest(req.body ?? {}, routeId(req));
   if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-  const ends = copyEndpoints(parsed.sourceId, req.params.id);
+  const ends = copyEndpoints(parsed.sourceId, routeId(req));
   if ('error' in ends) return res.status(ends.status).json({ error: ends.error });
   const { source, target } = ends;
   if (target.readOnly || sameOracleSchema(source, target)) return res.status(400).json({ error: 'Choose a different, writable target schema.' });
@@ -5619,13 +5625,13 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
 
 const DBA_AUDIT_FILE = path.join(DATA_DIR, "dba-audit.jsonl");
 app.get("/api/connections/:id/dba-audit", requireFullAccess, (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   try { res.json({ entries: readDbaAudit(DBA_AUDIT_FILE, connKey(c)) }); }
   catch { res.status(500).json({ error: "Cannot read the server audit log." }); }
 });
 app.post("/api/connections/:id/dba-storage", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   if (c.readOnly) return res.status(403).json({ error: "This connection is read-only." });
   if (c.engine !== "oracle") return res.status(400).json({ error: "Oracle is required." });
@@ -5667,7 +5673,7 @@ function sessionViewUnavailable(error: unknown): boolean {
 }
 
 app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   try {
     const conn = await getOraConn(c);
@@ -5708,7 +5714,7 @@ app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => 
 });
 
 app.post("/api/connections/:id/sessions/kill", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   if (c.readOnly) return res.status(403).json({ error: "This connection is read-only. Edit it to allow killing sessions." });
   let sid: number, serial: number, instance: number;
@@ -5743,7 +5749,7 @@ app.post("/api/connections/:id/sessions/kill", requireFullAccess, async (req, re
 });
 
 app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "DBA Manager requires Oracle." });
   let queries;
@@ -5769,7 +5775,7 @@ app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, re
 });
 
 app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The DBA Performance Advisor is Oracle-only." });
   try {
@@ -5780,7 +5786,7 @@ app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
 });
 
 app.get("/api/connections/:id/perf", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
     res.json(await oraPerf(c));
@@ -5790,7 +5796,7 @@ app.get("/api/connections/:id/perf", requireFullAccess, async (req, res) => {
 });
 
 app.get("/api/connections/:id/deps", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
   if (!name) return res.status(400).json({ error: "Missing object name (?name=...)" });
@@ -5803,7 +5809,7 @@ app.get("/api/connections/:id/deps", requireSchemaMetadataAccess, async (req, re
 
 /** ER diagram model from the Oracle catalog: tables, columns, PK/FK flags, FK edges. */
 app.get("/api/connections/:id/erd", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   try {
     res.json(await oraErd(c));
@@ -5814,7 +5820,7 @@ app.get("/api/connections/:id/erd", requireSchemaMetadataAccess, async (req, res
 
 /** Real Oracle execution plan for a statement: body { sql }. */
 app.post("/api/connections/:id/explain", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const sql = String(req.body?.sql ?? "").trim();
   if (!sql) {
@@ -5844,7 +5850,7 @@ app.post("/api/connections/:id/explain", async (req, res) => {
 
 /** Import parsed CSV/JSON rows into a live Oracle table: body ImportBody. */
 app.post("/api/connections/:id/import", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — importing data is blocked. Edit the connection to disable read-only mode." });
   const parsed = readImportBody(req.body);
@@ -5960,7 +5966,7 @@ async function oraCompile(c: LiveConnection, name: string, type: string): Promis
 
 /** Compile a PL/SQL object (Oracle only): body { name, type } */
 app.post("/api/connections/:id/compile", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — ALTER … COMPILE is blocked." });
   const name = String(req.body?.name ?? "").trim().toUpperCase();
@@ -6315,7 +6321,7 @@ function readCompileScope(src: Record<string, unknown>): { ref: CompileScopeRef 
 /** Preflight: what would be compiled, and what cannot be. A read — never blocked, so the
  *  UI can disable its button with the real reason instead of guessing. */
 app.get("/api/connections/:id/compile/invalid", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const parsed = readCompileScope(req.query as Record<string, unknown>);
   if ("error" in parsed) return res.status(400).json({ error: parsed.error });
@@ -6348,7 +6354,7 @@ app.get("/api/connections/:id/compile/invalid", requireSchemaMetadataAccess, asy
 
 /** Compile the invalid objects of a scope: body { scope, group?|name?, confirm? } */
 app.post("/api/connections/:id/compile/invalid", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — ALTER … COMPILE is blocked." });
   const parsed = readCompileScope((req.body ?? {}) as Record<string, unknown>);
@@ -6427,7 +6433,7 @@ app.post("/api/connections/:id/compile/invalid", requireFullAccess, async (req, 
 
 /** Real source/DDL of one object, for the Object Editor: ?name= */
 app.get("/api/connections/:id/source", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
   if (!name) return res.status(400).json({ error: "Missing object name (?name=...)" });
@@ -6999,7 +7005,7 @@ async function oraRoutineRunBlock(
 
 /** Signature of a runnable routine (Oracle): ?name= — packages list their members. */
 app.get("/api/connections/:id/routine", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The routine runner currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7015,7 +7021,7 @@ app.get("/api/connections/:id/routine", requireSchemaMetadataAccess, async (req,
  *  (Oracle only). Body: { name, member?, overload?, args: { name, value, useDefault? }[],
  *  block?, confirm }. `block` wins: it runs verbatim and the args are ignored. */
 app.post("/api/connections/:id/routine/run", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The routine runner currently supports Oracle connections only." });
   // hard lock, same as /query: a stored routine can write, so a read-only connection never runs one
@@ -7106,7 +7112,7 @@ app.post("/api/connections/:id/routine/run", requireFullAccess, async (req, res)
 
 /** Live table metadata for the Table Designer: ?name= (Oracle only). */
 app.get("/api/connections/:id/table", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7120,7 +7126,7 @@ app.get("/api/connections/:id/table", requireSchemaMetadataAccess, async (req, r
 
 /** Apply Table Designer DDL: body { statements: string[] }. Runs in order, stops at the first error (Oracle only). */
 app.post("/api/connections/:id/table/apply", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — schema changes are blocked. Edit the connection to disable read-only mode." });
@@ -7158,7 +7164,7 @@ app.post("/api/connections/:id/table/apply", requireFullAccess, async (req, res)
  * POST below, which is Administrator/Developer only.
  */
 app.get("/api/connections/:id/table/rows", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "Editing rows currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7177,7 +7183,7 @@ app.get("/api/connections/:id/table/rows", async (req, res) => {
 
 /** Insert / update / delete one row: body { table, action, rowId?, values? } (Oracle only). */
 app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "Editing rows currently supports Oracle connections only." });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — row changes are blocked. Edit the connection to disable read-only mode." });
@@ -7240,7 +7246,7 @@ app.post("/api/connections/:id/table/rows", requireFullAccess, async (req, res) 
 
 /** Table + column + index statistics for the Statistics tab: ?name= (Oracle only). */
 app.get("/api/connections/:id/table/stats", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7254,7 +7260,7 @@ app.get("/api/connections/:id/table/stats", requireSchemaMetadataAccess, async (
 
 /** DBMS_STATS action: body { name, action: "gather"|"delete"|"lock"|"unlock" } (Oracle only). */
 app.post("/api/connections/:id/table/stats", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — gathering/deleting/locking statistics is blocked." });
@@ -7286,7 +7292,7 @@ app.post("/api/connections/:id/table/stats", requireFullAccess, async (req, res)
 
 /** Table + index segment sizes, storage attributes, and available tablespaces: ?name= (Oracle only). */
 app.get("/api/connections/:id/table/storage", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7300,7 +7306,7 @@ app.get("/api/connections/:id/table/storage", requireSchemaMetadataAccess, async
 
 /** Storage maintenance action: body { name, action, tablespace?, compression?, on?, index? } (Oracle only). */
 app.post("/api/connections/:id/table/storage", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — storage changes are blocked." });
@@ -7346,7 +7352,7 @@ app.post("/api/connections/:id/table/storage", requireFullAccess, async (req, re
 
 /** Read-only optimization findings for one table: ?name= (Oracle only). */
 app.get("/api/connections/:id/table/advisor", requireSchemaMetadataAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   const name = String(req.query.name ?? "").trim();
@@ -7360,7 +7366,7 @@ app.get("/api/connections/:id/table/advisor", requireSchemaMetadataAccess, async
 
 /** One-click maintenance: body { name, action } (Oracle only). */
 app.post("/api/connections/:id/table/maintenance", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "The Table Designer currently supports Oracle connections only." });
   if (c.readOnly) return res.status(400).json({ error: "This connection is read-only — maintenance actions are blocked." });
@@ -7391,14 +7397,14 @@ app.post("/api/connections/:id/table/maintenance", requireFullAccess, async (req
 
 /** Versioned code objects for this connection (summaries). */
 app.get("/api/connections/:id/versions", requireFullAccess, (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   res.json(listVersionedObjects(c));
 });
 
 /** Full version history (with sources) for one object: ?name=&type= */
 app.get("/api/connections/:id/versions/object", requireFullAccess, (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const name = String(req.query.name ?? "").trim();
   const type = String(req.query.type ?? "").trim().toUpperCase();
@@ -7410,7 +7416,7 @@ app.get("/api/connections/:id/versions/object", requireFullAccess, (req, res) =>
 
 /** Change log for this connection (newest first). */
 app.get("/api/connections/:id/changelog", requireFullAccess, (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const key = connKey(c);
   const log = readJsonFile<ChangeLogEntry[]>(CHANGELOG_FILE, []);
@@ -7419,7 +7425,7 @@ app.get("/api/connections/:id/changelog", requireFullAccess, (req, res) => {
 
 /** Full captured output for one DBMS_SCHEDULER run. Read-only by design. */
 app.get("/api/connections/:id/job-runs/:logId/output", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const logId = Number(req.params.logId);
   if (!Number.isSafeInteger(logId) || logId < 0) return res.status(400).json({ error: "Invalid scheduler run ID" });
@@ -7437,7 +7443,7 @@ function worksheetOwner(req: express.Request): string {
 }
 
 app.post("/api/connections/:id/worksheet-session", requireFullAccess, async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: 'Unknown connection' });
   if (c.readOnly) return res.status(403).json({ error: 'This connection is read-only.' });
   try {
@@ -7450,7 +7456,7 @@ app.post("/api/connections/:id/worksheet-session", requireFullAccess, async (req
 });
 
 app.post("/api/connections/:id/query", async (req, res) => {
-  const c = registry.get(req.params.id);
+  const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
   const sql = String(req.body?.sql ?? "").trim();
   const started = Date.now();
