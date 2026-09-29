@@ -3,7 +3,7 @@
 ## Project
 - Oracle-only browser IDE: React 18, TypeScript, Vite, and Tailwind frontend in `src/`; Express and node-oracledb backend in `server/`.
 - Keep node-oracledb in Thin mode. Do not add Oracle Instant Client, other database drivers, or application AI integrations unless explicitly requested.
-- Support Node.js 22 and newer. Follow existing component, API, state, and SQL utility patterns.
+- Support Node.js 22.12 and newer. Follow existing component, API, state, and SQL utility patterns.
 
 ## Oracle and security
 - Enforce roles, connection read-only mode, and write/destructive-operation confirmation on the server. UI visibility is not authorization.

@@ -29,7 +29,7 @@ There is no Copilot panel, AI endpoint, provider configuration, model SDK, alter
 
 ## Requirements
 
-- Node.js 22 or newer (tested through 24)
+- Node.js 22.12 or newer (tested through 24)
 - npm
 - A reachable Oracle Database service
 
