@@ -2,7 +2,7 @@ import { useEffect, useState, type RefObject } from "react";
 
 /** Always-visible horizontal navigation, independent of OS overlay scrollbars. */
 export default function HorizontalScrollbar({ target, contentKey }: {
-  target: RefObject<HTMLElement>;
+  target: RefObject<HTMLElement | null>;
   contentKey?: unknown;
 }) {
   const [maximum, setMaximum] = useState(0);
