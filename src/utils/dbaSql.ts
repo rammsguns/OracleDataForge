@@ -48,5 +48,12 @@ export function storageChangeSql(change: StorageChange) {
     const target = change.bigfile ? `ALTER TABLESPACE ${identifier(name)}` : `ALTER DATABASE ${temporary ? "TEMPFILE" : "DATAFILE"} ${literal(path)}`;
     return `${target} AUTOEXTEND ${change.autoextend ? `ON NEXT ${size(change.nextMb ?? "")} MAXSIZE ${size(change.maxMb ?? "")}` : "OFF"};`;
   }
+  if (action === "resize" && change.bigfile) {
+    // Oracle permits resizing a bigfile tablespace by name. Convert the UI's MiB
+    // value to bytes so the reviewed statement shows the exact absolute size.
+    size(mb);
+    const tablespace = /^[A-Z][A-Z0-9_$#]*$/.test(name) ? name : identifier(name);
+    return `ALTER TABLESPACE ${tablespace} RESIZE ${BigInt(mb) * 1048576n};`;
+  }
   return storageSql(action, name, path, mb, temporary);
 }

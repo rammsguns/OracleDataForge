@@ -5774,6 +5774,31 @@ app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, re
   } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });
 
+app.get("/api/connections/:id/tablespace-objects", requireFullAccess, async (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "Oracle is required." });
+  const tablespace = req.query.tablespace;
+  const search = req.query.search ?? "";
+  const offset = Number(req.query.offset ?? 0);
+  if (typeof tablespace !== "string" || !tablespace || tablespace.length > 128 || typeof search !== "string" || search.length > 200 || !Number.isSafeInteger(offset) || offset < 0 || offset > 1000000) {
+    return res.status(400).json({ error: "Invalid tablespace search." });
+  }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      const result = await conn.execute(`SELECT owner AS "OWNER", segment_name AS "NAME", segment_type AS "TYPE", partition_name AS "PARTITION", ROUND(SUM(bytes)/1048576, 2) AS "SIZE_MIB"
+        FROM dba_segments
+        WHERE tablespace_name = :tablespace ${search ? "AND (INSTR(UPPER(owner), :search) > 0 OR INSTR(UPPER(segment_name), :search) > 0 OR INSTR(UPPER(segment_type), :search) > 0)" : ""}
+        GROUP BY owner, segment_name, segment_type, partition_name
+        ORDER BY SUM(bytes) DESC, owner, segment_name, partition_name
+        OFFSET :offset ROWS FETCH NEXT 101 ROWS ONLY`, { tablespace, ...(search ? { search: search.toUpperCase() } : {}), offset }, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      const rows = (result.rows ?? []) as Record<string, unknown>[];
+      res.json({ rows: rows.slice(0, 100).map(row => ({ owner: row.OWNER, name: row.NAME, type: row.TYPE, partition: row.PARTITION, sizeMiB: row.SIZE_MIB })), hasMore: rows.length > 100 });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
 app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
   const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });

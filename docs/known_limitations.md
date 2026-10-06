@@ -18,29 +18,28 @@ Verified against the source, not just the README:
   the reasoning: the first thing a new user saw was fabricated performance data, and *"an
   empty state is the honest answer"*.
 - **No container image.** See [deployment.md](deployment.md).
-- **No object-name autocomplete.** Completions are keyword-only; object names previously came
-  from mock data that no longer exists.
-- **Almost no tests.** `npm test` covers four pure modules — the connection-export envelope,
-  the Oracle Cloud wallet reader, the connection role and the object copy — on Node's built-in
-  runner. Everything else is verified by `npm run typecheck`, `npm run build`, a health check,
-  and hand.
+- **No live schema autocomplete.** Completions include keywords, built-in functions and
+  package members, snippets, and identifiers already present in the document. They do not
+  query Oracle for schema objects.
+- **Automated coverage is concentrated in backend and frontend utilities.** `npm test`
+  runs without Oracle or a browser; live SQL behavior and UI interactions require separate
+  verification.
 
 ## SQL execution
 
 ### One statement per run
 
-**The worksheet executes the entire buffer as a single statement.** There is no statement
-splitter and no "run selection" — the text is sent verbatim, with only a single trailing
-semicolon stripped.
-
-Two `;`-separated statements will fail to parse. Scripts must be run one statement at a time.
+**Run executes the selection or the statement at the cursor.** Multiple selected SQL
+statements are rejected. Semicolons inside comments and literals do not split statements;
+PL/SQL blocks retain their internal semicolons and use a standalone slash as the delimiter
+when another statement follows. There is no whole-script execution.
 
 ### No cancel, no timeout
 
-**A running statement cannot be cancelled or killed.** There is no `break()`, no
-`AbortController`, no statement timeout, and no `callTimeout` anywhere. The only timeout of
-any kind is an 8-second *connect* timeout. A long query simply blocks its HTTP request until
-Oracle returns.
+**A running worksheet statement cannot be cancelled from the UI.** Worksheet queries
+have no configured call timeout. Table-data copy does set a 30-second Oracle call timeout;
+this limits individual calls rather than the total operation. Connections have an 8-second
+connect timeout.
 
 The compile batch is the one exception, and it self-limits rather than cancelling: three
 passes, a 120-second budget checked per object, and a DDL lock timeout — because *"one busy
@@ -48,18 +47,16 @@ package would eat the whole time budget."* The UI is upfront that the run *"can 
 and cannot be cancelled"*, and that the elapsed counter is *"the only honest progress signal
 we have (nothing streams)."*
 
-### Transactions cannot span statements
+### Manual transactions have a limited lifetime
 
-This is the most surprising limitation, and it follows from the connection model rather than
-from a decision about transactions.
+Auto-commit is on by default. Turning it off opens a private Oracle session shared by the
+worksheet and table browser for that connection. Queries and row edits use that session,
+and Commit/Rollback act on its transaction. Sessions are isolated by owner and connection,
+limited to 32 server-wide, and rolled back on disconnect or after 30 minutes idle. Busy
+sessions are not expired. An expired token fails instead of retrying with auto-commit.
 
-**Every call acquires its own pooled connection and closes it when finished**, and everything
-runs with `autoCommit: true`. Consequently:
-
-- A `COMMIT` or `ROLLBACK` typed into the worksheet lands on a **different session** than the
-  DML that preceded it, and does nothing useful.
-- `SELECT … FOR UPDATE` releases its locks immediately.
-- There is no way to hold an open transaction across statements.
+Oracle DDL commits implicitly even in manual mode. Imports, routine calls, and other
+operations outside the worksheet/table session do not join its transaction.
 
 Autocommit on routine calls is deliberate, and the reasoning is worth repeating:
 

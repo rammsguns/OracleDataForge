@@ -8,6 +8,16 @@ Dates are the date the change landed on `main`.
 
 ## Unreleased
 
+### Fixed
+
+- Autocomplete now matches the opening delimiter of Oracle alternative string literals,
+  keeping text inside those literals out of identifier suggestions.
+
+### Documentation
+
+- Updated worksheet selection, manual transaction, autocomplete, timeout, and automated
+  test coverage descriptions to match the implementation.
+
 ### Added
 
 - Object copy now includes packages, standalone procedures, functions and types. Package/type

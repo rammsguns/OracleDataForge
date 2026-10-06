@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import {
   Activity,
   Clock3,
@@ -80,6 +81,15 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
 export default function Workspace() {
   const s = useStudio();
   const active = s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0];
+  const activeTabRef = useRef<HTMLDivElement>(null);
+  const focusLaunchedTab = useRef(false);
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (focusLaunchedTab.current) {
+      activeTabRef.current?.focus({ preventScroll: true });
+      focusLaunchedTab.current = false;
+    }
+  }, [active.id]);
   const fullAccess = s.accessRole === "Administrator" || s.accessRole === "Developer";
   const viewerTabs: TabKind[] = ["worksheet", "data", "object", "history", "deps", "versions"];
   const canView = (kind: TabKind) => fullAccess || (s.accessRole === "Viewer" ? viewerTabs.includes(kind) : kind === "data");
@@ -100,7 +110,7 @@ export default function Workspace() {
               { label: "Database administration", kinds: ["perf", "dba", "dbamanager", "sessions", "joblog", "admin"] },
             ].map((group) => <div key={group.label}>
               <div className="px-2 py-2 text-[10px] uppercase text-mute">{group.label}</div>
-              {LAUNCHERS.filter((l) => group.kinds.includes(l.kind) && canView(l.kind)).map((l) => <button key={l.kind} className="w-full flex items-center gap-2 rounded px-2 py-2 text-left text-[12px] hover:bg-panel3" onClick={(e) => { s.openTab(l.kind, l.title); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{TAB_ICON[l.kind]}{l.label}</button>)}
+              {LAUNCHERS.filter((l) => group.kinds.includes(l.kind) && canView(l.kind)).map((l) => <button key={l.kind} className="w-full flex items-center gap-2 rounded px-2 py-2 text-left text-[12px] hover:bg-panel3" onClick={(e) => { if (active.kind === l.kind && !active.payload) activeTabRef.current?.focus({ preventScroll: true }); else focusLaunchedTab.current = true; s.openTab(l.kind, l.title); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{TAB_ICON[l.kind]}{l.label}</button>)}
             </div>)}
           </div>
         </details>
@@ -110,6 +120,7 @@ export default function Workspace() {
         {s.tabs.map((t) => (
           <div
             key={t.id}
+            ref={t.id === active.id ? activeTabRef : undefined}
             role="tab"
             aria-selected={t.id === active.id}
             tabIndex={0}

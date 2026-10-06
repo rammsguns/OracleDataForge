@@ -36,3 +36,15 @@ test('offers document members and PL/SQL snippets', () => {
   assert.ok(getCompletions(source, source.length)?.items.some(i => i.label === 'salary'));
   assert.ok(getCompletions('beg', 3)?.items.some(i => i.text.includes('END;')));
 });
+
+test('alternative literals close only with their matching delimiter', () => {
+  for (const [open, close] of [['[', ']'], ['{', '}'], ['(', ')'], ['<', '>'], ['!', '!']]) {
+    const otherClose = close === '}' ? ']' : '}';
+    const unfinished = `SELECT q'${open}text ${otherClose}' hidden_identifier sel`;
+    assert.equal(getCompletions(unfinished, unfinished.length, true), null);
+    const source = `SELECT q'${open}text ${otherClose}' hidden_identifier${close}' FROM hi`;
+    assert.equal(getCompletions(source, source.length)?.items.some(i => i.label === 'hidden_identifier') ?? false, false);
+    const completed = `SELECT q'${open}text${close}' FROM du`;
+    assert.ok(getCompletions(completed, completed.length)?.items.some(i => i.label === 'DUAL'));
+  }
+});

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import TablespaceOverview from "./TablespaceOverview";
+import TablespaceObjects from "./TablespaceObjects";
 import DbaAuditHistory from "./DbaAuditHistory";
 import { storageDestinations } from "../utils/storageDestinations";
 import { Database, RefreshCcw } from "lucide-react";
@@ -32,13 +33,21 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   const [typedName, setTypedName] = useState("");
   const [applying, setApplying] = useState(false);
   const [lastAudit, setLastAudit] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [dialogTab, setDialogTab] = useState<"change" | "objects">("change");
   const fileAction = action === "resize" || action === "autoextend";
   const tablespaceOnly = ["drop", "readOnly", "readWrite"].includes(action);
   const change = { action, name, path, mb, temporary, autoextend, nextMb, maxMb, deleteFiles, bigfile: report?.sections.tablespaces?.rows.find(row => row.Name === name)?.Bigfile === "YES" };
   const formRef = useRef<HTMLElement>(null);
   const destinations = storageDestinations(report?.sections.files?.rows ?? [], name, temporary);
   const selectedFile = report?.sections.files?.rows.find(file => file.File === path);
-  useEffect(() => { setPath(""); setName(""); setPreview(""); setTypedName(""); setLastAudit(""); }, [conn?.id]);
+  useEffect(() => { setPath(""); setName(""); setPreview(""); setTypedName(""); setLastAudit(""); setEditing(false); }, [conn?.id]);
+  useEffect(() => {
+    if (!editing) return;
+    const onEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setEditing(false); };
+    window.addEventListener("keydown", onEscape);
+    return () => window.removeEventListener("keydown", onEscape);
+  }, [editing]);
   useEffect(() => {
     let cancelled = false;
     setReport(null);
@@ -82,7 +91,7 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
     setApplying(true); setFormError("");
     try {
       const result = await api.dbaStorage(conn.id, change, typedName, confirmed);
-      setLastAudit(result.auditId); setPreview(""); refresh(n => n + 1);
+      setLastAudit(result.auditId); setPreview(""); setEditing(false); refresh(n => n + 1);
       s.toast("success", "Tablespace change applied and recorded in the audit log.");
     } catch (e) {
       if (e instanceof ConfirmRequiredError) s.askConfirm({ ...e.confirmation, onConfirm: () => { void apply(true); } });
@@ -95,17 +104,21 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
     {error && <p role="alert" className="text-err">{error}</p>}
     {report && <><p className="text-xs text-mute">Snapshot: {new Date(report.capturedAt).toLocaleString()} · Current connection/container</p>
       {page === "Storage" && <TablespaceOverview report={report} readOnly={!!conn?.readOnly || applying} onManage={(operation, tablespace, file) => {
+        setDialogTab("change");
+        setEditing(true);
         setAction(operation); setName(String(tablespace.Name ?? "")); setTemporary(tablespace.Contents === "TEMPORARY");
         setPath(String(file?.File ?? "")); setMb(file ? String(Math.ceil(Number(file["Allocated MiB"]))) : "1024");
         setAutoextend(file?.Autoextend === "YES"); setMaxMb(String(Math.floor(Number(file?.["Max MiB"])) || 32767)); setDeleteFiles(false); setTypedName("");
         setPreview(""); setFormError("");
-        formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-        formRef.current?.focus({ preventScroll: true });
-      }} />}
+        requestAnimationFrame(() => formRef.current?.focus({ preventScroll: true }));
+      }} onInspect={tablespace => { setName(String(tablespace.Name ?? "")); setAction("resize"); setPath(""); setTemporary(tablespace.Contents === "TEMPORARY"); setDialogTab("objects"); setEditing(true); requestAnimationFrame(() => formRef.current?.focus({ preventScroll: true })); }} />}
       {page === "Memory" && <>{section("memory", "Memory parameters")}{section("sga", "SGA allocation")}{section("pga", "PGA statistics")}</>}
       </>}
-    <section ref={formRef} tabIndex={-1} aria-label="Management form" className="border border-bdr rounded-xl p-4 space-y-3">
-      <h3 className="font-semibold">{page === "Storage" ? `${action === "create" ? "Create tablespace" : `Edit ${name || "tablespace"}`} · ${conn.name}` : "Change memory parameter"}</h3>
+    {(page === "Memory" || editing) && <div className={page === "Storage" ? "fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" : ""} onMouseDown={e => { if (e.target === e.currentTarget) setEditing(false); }}>
+    <section ref={formRef} tabIndex={-1} role={page === "Storage" ? "dialog" : undefined} aria-modal={page === "Storage" ? true : undefined} aria-label={page === "Storage" ? `Manage ${name || "tablespace"}` : "Management form"} className={`border border-bdr rounded-xl p-4 space-y-3 bg-panel ${page === "Storage" ? "w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-xl" : ""}`}>
+      <div className="flex items-center gap-3"><h3 className="font-semibold">{page === "Storage" ? `${action === "create" ? "Create tablespace" : `Edit ${name || "tablespace"}`} · ${conn.name}` : "Change memory parameter"}</h3>{page === "Storage" && <Btn className="ml-auto" variant="outline" onClick={() => setEditing(false)}>Close</Btn>}</div>
+      {page === "Storage" && name && action !== "create" && <div className="flex gap-2 border-b border-bdr pb-2"><Btn variant={dialogTab === "change" ? "primary" : "outline"} onClick={() => setDialogTab("change")}>Change storage</Btn><Btn variant={dialogTab === "objects" ? "primary" : "outline"} onClick={() => setDialogTab("objects")}>Objects</Btn></div>}
+      {page === "Storage" && dialogTab === "objects" && name ? <TablespaceObjects connectionId={conn.id} tablespace={name} /> : <>
       <p className="text-xs text-mute">{page === "Storage" ? "1. Choose a change and edit its settings. 2. Review SQL. 3. Confirm and apply. Every applied change is logged on the server." : "Prepare a statement, then review and run it in the SQL worksheet."} DDL commits implicitly.</p>
       {conn?.readOnly && <p className="text-warn">This connection is read-only. Changes are disabled.</p>}
       <fieldset disabled={applying || !!conn.readOnly} className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">
@@ -138,8 +151,8 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
       {formError && <p role="alert" className="text-err">{formError}</p>}
       {preview && <><pre className="bg-bg border border-bdr p-3 rounded-lg whitespace-pre-wrap break-all font-mono text-xs">{preview}</pre>{page === "Storage" ? <>{action === "drop" && <Field label={`Type ${name} to enable deletion`}><input className={inputCls} value={typedName} disabled={applying} onChange={e => setTypedName(e.target.value)} autoComplete="off" /></Field>}<Btn variant="primary" disabled={!!conn.readOnly || applying || (action === "drop" && typedName !== name)} onClick={() => { void apply(); }}>{applying ? "Applying…" : "Confirm and apply…"}</Btn></> : <Btn variant="primary" disabled={!!conn?.readOnly} onClick={() => { s.setSql(preview); s.openTab("worksheet", "Worksheet 1"); }}>Open in worksheet</Btn>}</>}
       {lastAudit && <p role="status" className="text-ok text-xs">Change applied. Audit ID: {lastAudit} · Server log: data/dba-audit.jsonl</p>}
-    </section>
+      </>}
+    </section></div>}
     <DbaAuditHistory connectionId={conn.id} revision={revision} />
   </div>;
 }
-
