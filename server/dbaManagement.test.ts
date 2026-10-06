@@ -28,6 +28,13 @@ test("automatic growth uses bounded integer sizes and preserves tempfile syntax"
   assert.equal(storageChangeSql({ ...change, action: "readWrite" }), 'ALTER TABLESPACE "APP" READ WRITE;');
 });
 
+test("bigfile resize uses tablespace syntax and an exact byte size", () => {
+  const change = { action: "resize", name: "TBS_SAP_POSICION_POLIZAS_INX", path: "+DATA/file", mb: "92160", temporary: false };
+  assert.equal(storageChangeSql({ ...change, bigfile: true }), "ALTER TABLESPACE TBS_SAP_POSICION_POLIZAS_INX RESIZE 96636764160;");
+  assert.equal(storageChangeSql(change), "ALTER DATABASE DATAFILE '+DATA/file' RESIZE 92160M;");
+  assert.throws(() => storageChangeSql({ ...change, bigfile: true, mb: "92160; DROP TABLE X" }));
+});
+
 test("audit persists separate attempt/outcome records and isolates connections", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dataforge-audit-"));
   const file = path.join(directory, "audit.jsonl");

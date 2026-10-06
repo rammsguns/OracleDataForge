@@ -17,7 +17,32 @@ const snippets: Completion[] = [
 ];
 // Mask literals/comments without changing offsets; unfinished regions are masked too.
 export function completionCode(source: string): string {
-  return source.replace(/--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|q'([\[({<]|[^\s'])[\s\S]*?(?:[\])}>]'|\1'|$)|'(?:[^']|'')*(?:'|$)|"(?:[^"]|"")*(?:"|$)/gi, s => s.replace(/[^\n]/g, ' '));
+  const chars = source.split('');
+  for (let i = 0; i < source.length;) {
+    const start = i;
+    if (source.startsWith('--', i)) {
+      const end = source.indexOf('\n', i);
+      i = end < 0 ? source.length : end;
+    } else if (source.startsWith('/*', i)) {
+      const end = source.indexOf('*/', i + 2);
+      i = end < 0 ? source.length : end + 2;
+    } else if (/[qQ]/.test(source[i]) && source[i + 1] === "'") {
+      const open = source[i + 2];
+      const close = ({ '[': ']', '{': '}', '(': ')', '<': '>' } as Record<string, string>)[open] ?? open;
+      const end = source.indexOf(close + "'", i + 3);
+      i = end < 0 ? source.length : end + 2;
+    } else if (source[i] === "'" || source[i] === '"') {
+      const quote = source[i++];
+      while (i < source.length) {
+        if (source[i++] === quote) {
+          if (source[i] === quote) i++;
+          else break;
+        }
+      }
+    } else { i++; continue; }
+    for (let j = start; j < i; j++) if (chars[j] !== '\n' && chars[j] !== '\r') chars[j] = ' ';
+  }
+  return chars.join('');
 }
 export function getCompletions(source: string, caret: number, explicit = false) {
   caret = Math.max(0, Math.min(caret, source.length));

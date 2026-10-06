@@ -157,6 +157,17 @@ export interface DbaManagementReport {
   capturedAt: string;
   sections: Record<string, { rows: Record<string, string | number | null>[]; error?: string; truncated?: boolean }>;
 }
+export interface TablespaceObject {
+  owner: string;
+  name: string;
+  type: string;
+  partition: string | null;
+  sizeMiB: number;
+}
+export interface TablespaceObjectsPage {
+  rows: TablespaceObject[];
+  hasMore: boolean;
+}
 export interface OracleSession {
   instance: number;
   sid: number;
@@ -920,6 +931,7 @@ export const api = {
   schemaGroup: (id: string, label: string) =>
     request<SchemaGroupResult>(`/api/connections/${id}/schema/group?label=${encodeURIComponent(label)}`),
   dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`),
+  tablespaceObjects: (id: string, tablespace: string, search: string, offset: number) => request<TablespaceObjectsPage>(`/api/connections/${id}/tablespace-objects?tablespace=${encodeURIComponent(tablespace)}&search=${encodeURIComponent(search)}&offset=${offset}`),
   sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`),
   killSession: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
     request<{ ok: boolean }>(`/api/connections/${id}/sessions/kill`, session),

@@ -411,16 +411,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       toast("warning", accessRole === "Analyst" ? "Analyst access is limited to table data" : "Your role does not have access to this feature");
       return;
     }
-    setTabs((prev) => {
-      const existing = prev.find((t) => t.kind === kind && t.payload === payload);
-      if (existing) {
-        setActiveTabId(existing.id);
-        return prev;
-      }
-      const id = `t${tabSeq++}`;
-      setActiveTabId(id);
-      return [...prev, { id, kind, title, payload }];
-    });
+    const existing = tabsRef.current.find((t) => t.kind === kind && t.payload === payload);
+    if (existing) {
+      setActiveTabId(existing.id);
+      return;
+    }
+    const id = `t${tabSeq++}`;
+    setTabs((prev) => [...prev, { id, kind, title, payload }]);
+    setActiveTabId(id);
   }, [accessRole, toast]);
 
   const doCloseTab = useCallback((id: string) => {

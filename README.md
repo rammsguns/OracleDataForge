@@ -110,10 +110,12 @@ npm run build
 curl http://127.0.0.1:3001/api/health
 ```
 
-`npm test` runs the connection-export crypto tests, the connection-role tests, the Oracle
-Cloud wallet tests and the object-copy tests (Node's built-in test runner, no framework, no
-network or database needed). They are the only automated suites in the project; everything
-else is checked by hand.
+`npm test` runs the backend and frontend utility suites using Node's built-in test
+runner. Coverage includes connection export, wallets, roles and users, authentication
+concurrency, session ownership, object and table-data copy, DBA management, worksheet
+statement selection, autocomplete, diagnostics, transaction requests, and routine inputs.
+These tests need no network or database. Live Oracle behavior and browser interactions
+still require separate verification.
 
 The health response is JSON with `ok: true` and the number of saved Oracle connections.
 
