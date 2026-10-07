@@ -20,6 +20,10 @@ Dates are the date the change landed on `main`.
 
 ### Added
 
+- Tablespace objects show the indexed table for index segments and support searching by table name.
+- New tablespaces and added files can enable automatic growth with a growth increment and maximum size.
+- Tablespaces can be sorted by used, unused, and total capacity in either direction.
+- Sessions has filters for every grid column, sortable headers, and wider scrollbars.
 - Object copy now includes packages, standalone procedures, functions and types. Package/type
   bodies travel with their specifications and participate in compilation warnings. Replacement
   stays in place, without destructive fallback for dependent types. PL/SQL literals and
@@ -377,6 +381,25 @@ Dates are the date the change landed on `main`.
   zero active Administrators. Until the first account is created, the app behaves exactly as
   before. See [security.md](security.md#workspace-roles).
   ([#10](https://github.com/rammsguns/OracleDataForge/pull/10))
+
+## 2026-10-06
+
+### Added
+
+- DBA Manager → Storage now has a tablespace name search and an **Objects** view. The view
+  shows allocated segment sizes by owner, name, type, and partition, with search and
+  100-row pagination.
+
+### Changed
+
+- Clicking a tablespace name opens a prefilled storage edit dialog. Bigfile resize previews
+  use `ALTER TABLESPACE <name> RESIZE <bytes>`; smallfile resize previews continue to use
+  `ALTER DATABASE DATAFILE '<path>' RESIZE <MiB>M`.
+
+### Fixed
+
+- Choosing an item from Tools now activates and focuses that item's tab instead of leaving
+  Worksheet selected.
 
 ## 2026-08-22
 

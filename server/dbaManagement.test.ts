@@ -28,6 +28,14 @@ test("automatic growth uses bounded integer sizes and preserves tempfile syntax"
   assert.equal(storageChangeSql({ ...change, action: "readWrite" }), 'ALTER TABLESPACE "APP" READ WRITE;');
 });
 
+test("new tablespace and added files can enable automatic growth", () => {
+  const change = { action: "create", name: "APP", path: "/db/app.dbf", mb: "1024", temporary: false, autoextend: true, nextMb: "128", maxMb: "4096" };
+  assert.equal(storageChangeSql(change), 'CREATE TABLESPACE "APP" DATAFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
+  assert.equal(storageChangeSql({ ...change, action: "add", temporary: true }), 'ALTER TABLESPACE "APP" ADD TEMPFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
+  assert.match(storageChangeSql({ ...change, autoextend: false }), /AUTOEXTEND OFF;$/);
+  for (const maxMb of ["0", "127", "1023", "1; DROP TABLE X"]) assert.throws(() => storageChangeSql({ ...change, maxMb }));
+});
+
 test("bigfile resize uses tablespace syntax and an exact byte size", () => {
   const change = { action: "resize", name: "TBS_SAP_POSICION_POLIZAS_INX", path: "+DATA/file", mb: "92160", temporary: false };
   assert.equal(storageChangeSql({ ...change, bigfile: true }), "ALTER TABLESPACE TBS_SAP_POSICION_POLIZAS_INX RESIZE 96636764160;");

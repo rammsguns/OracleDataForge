@@ -124,7 +124,7 @@ lookup and 404.
 | Table design | `table`, `table/apply`, `table/stats`, `table/storage`, `table/advisor`, `table/maintenance` |
 | Row editor | `GET …/table/rows?name=` (rows + their ROWIDs), `POST …/table/rows` (insert / update / delete one row) |
 | Import | `POST …/import` |
-| Analysis | `dba`, `perf`, `deps`, `erd` |
+| Analysis | `dba`, `perf`, `deps`, `erd`; `GET …/tablespace-objects?tablespace=&search=&offset=` — 100 allocated-segment rows per page from `DBA_SEGMENTS`, with index table names from `DBA_INDEXES` |
 | Versions | `versions`, `versions/object`, `changelog` |
 | Jobs | `GET …/job-runs/:logId/output` |
 | GitHub sync | `POST /api/github/sync` — writes compiled PL/SQL to the repository pinned by `GITHUB_REPOSITORY` |
