@@ -12,10 +12,18 @@ const size = (value: string, allowZero = false) => {
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < (allowZero ? 0 : 1)) throw new Error("Size must be a whole number of MiB.");
   return `${Number(value)}M`;
 };
-export function storageSql(action: string, name: string, path: string, mb: string, temporary: boolean) {
+function autoextendClause(enabled: boolean, nextMb?: string, maxMb?: string, initialMb?: string) {
+  if (!enabled) return "AUTOEXTEND OFF";
+  const next = size(nextMb ?? "");
+  const max = size(maxMb ?? "");
+  if (Number(maxMb) < Number(nextMb)) throw new Error("Maximum size must be at least the growth increment.");
+  if (initialMb !== undefined && Number(maxMb) < Number(initialMb)) throw new Error("Maximum size must be at least the initial file size.");
+  return `AUTOEXTEND ON NEXT ${next} MAXSIZE ${max}`;
+}
+export function storageSql(action: string, name: string, path: string, mb: string, temporary: boolean, autoextend = false, nextMb?: string, maxMb?: string) {
   const file = temporary ? "TEMPFILE" : "DATAFILE";
-  if (action === "create") return `CREATE ${temporary ? "TEMPORARY " : ""}TABLESPACE ${identifier(name)} ${file} ${literal(path)} SIZE ${size(mb)} AUTOEXTEND OFF;`;
-  if (action === "add") return `ALTER TABLESPACE ${identifier(name)} ADD ${file} ${literal(path)} SIZE ${size(mb)} AUTOEXTEND OFF;`;
+  if (action === "create") return `CREATE ${temporary ? "TEMPORARY " : ""}TABLESPACE ${identifier(name)} ${file} ${literal(path)} SIZE ${size(mb)} ${autoextendClause(autoextend, nextMb, maxMb, mb)};`;
+  if (action === "add") return `ALTER TABLESPACE ${identifier(name)} ADD ${file} ${literal(path)} SIZE ${size(mb)} ${autoextendClause(autoextend, nextMb, maxMb, mb)};`;
   if (action === "resize") return `ALTER DATABASE ${file} ${literal(path)} RESIZE ${size(mb)};`;
   throw new Error("Unknown storage operation.");
 }
@@ -44,9 +52,8 @@ export function storageChangeSql(change: StorageChange) {
     return `ALTER TABLESPACE ${identifier(name)} READ ${action === "readOnly" ? "ONLY" : "WRITE"};`;
   }
   if (action === "autoextend") {
-    if (change.autoextend && Number(change.maxMb) < Number(change.nextMb)) throw new Error("Maximum size must be at least the growth increment.");
     const target = change.bigfile ? `ALTER TABLESPACE ${identifier(name)}` : `ALTER DATABASE ${temporary ? "TEMPFILE" : "DATAFILE"} ${literal(path)}`;
-    return `${target} AUTOEXTEND ${change.autoextend ? `ON NEXT ${size(change.nextMb ?? "")} MAXSIZE ${size(change.maxMb ?? "")}` : "OFF"};`;
+    return `${target} ${autoextendClause(!!change.autoextend, change.nextMb, change.maxMb)};`;
   }
   if (action === "resize" && change.bigfile) {
     // Oracle permits resizing a bigfile tablespace by name. Convert the UI's MiB
@@ -55,5 +62,5 @@ export function storageChangeSql(change: StorageChange) {
     const tablespace = /^[A-Z][A-Z0-9_$#]*$/.test(name) ? name : identifier(name);
     return `ALTER TABLESPACE ${tablespace} RESIZE ${BigInt(mb) * 1048576n};`;
   }
-  return storageSql(action, name, path, mb, temporary);
+  return storageSql(action, name, path, mb, temporary, change.autoextend, change.nextMb, change.maxMb);
 }

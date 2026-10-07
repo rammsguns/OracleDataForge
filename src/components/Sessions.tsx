@@ -6,6 +6,19 @@ import { sessionClient } from "../utils/sessionClient";
 import { Badge, Btn, EmptyState, inputCls, Spinner } from "./ui";
 
 const keyOf = (row: OracleSession) => `${row.instance}:${row.sid}:${row.serial}`;
+const gridColumns = [
+  { key: "instance", label: "Instance", value: (row: OracleSession) => row.instance },
+  { key: "sid", label: "SID", value: (row: OracleSession) => row.sid },
+  { key: "serial", label: "Serial", value: (row: OracleSession) => row.serial },
+  { key: "username", label: "User", value: (row: OracleSession) => row.username },
+  { key: "status", label: "Status", value: (row: OracleSession) => row.status },
+  { key: "client", label: "Client", value: (row: OracleSession) => sessionClient(row) },
+  { key: "machine", label: "Machine", value: (row: OracleSession) => row.machine },
+  { key: "program", label: "Program", value: (row: OracleSession) => row.program },
+  { key: "sqlId", label: "SQL ID", value: (row: OracleSession) => row.sqlId },
+  { key: "event", label: "Wait event", value: (row: OracleSession) => row.event },
+] as const;
+type GridColumnKey = typeof gridColumns[number]["key"];
 const detailFields: [keyof OracleSession, string][] = [
   ["instance", "Instance"], ["sid", "SID"], ["serial", "Serial"],
   ["username", "Database user"], ["status", "Status"], ["machine", "Machine"],
@@ -29,6 +42,9 @@ export default function Sessions() {
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const [filter, setFilter] = useState("");
+  const [columnFilters, setColumnFilters] = useState<Partial<Record<GridColumnKey, string>>>({});
+  const [sortKey, setSortKey] = useState<GridColumnKey>("instance");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [killing, setKilling] = useState(false);
 
@@ -46,9 +62,22 @@ export default function Sessions() {
     return () => { cancelled = true; };
   }, [conn?.id, conn?.status, revision]);
 
-  const rows = useMemo(() => report?.sessions.filter(row =>
-    [sessionClient(row), ...Object.values(row)].some(value => String(value ?? "").toLowerCase().includes(filter.toLowerCase()))
-  ) ?? [], [report, filter]);
+  const rows = useMemo(() => {
+    const search = filter.trim().toLowerCase();
+    const sortColumn = gridColumns.find(column => column.key === sortKey)!;
+    return (report?.sessions ?? []).filter(row =>
+      (!search || [sessionClient(row), ...Object.values(row)].some(value => String(value ?? "").toLowerCase().includes(search))) &&
+      gridColumns.every(column => !columnFilters[column.key]?.trim() || String(column.value(row) ?? "").toLowerCase().includes(columnFilters[column.key]!.trim().toLowerCase()))
+    ).sort((a, b) => {
+      const left = sortColumn.value(a);
+      const right = sortColumn.value(b);
+      if (left == null) return right == null ? keyOf(a).localeCompare(keyOf(b)) : 1;
+      if (right == null) return -1;
+      const order = typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: "base" });
+      return (sortDirection === "asc" ? order : -order) || keyOf(a).localeCompare(keyOf(b));
+    });
+  }, [report, filter, columnFilters, sortKey, sortDirection]);
+  const hasFilter = !!filter.trim() || Object.values(columnFilters).some(value => !!value?.trim());
   const selected = report?.sessions.find(row => keyOf(row) === selectedKey);
   const canKill = !!selected && !!conn && !conn.readOnly && !killing;
 
@@ -94,12 +123,12 @@ export default function Sessions() {
       {loading && <div className="p-4"><Spinner label="Reading sessions…" /></div>}
       {error && <div role="alert" className="m-4 p-3 rounded border border-err/30 text-err">{error}</div>}
       {report && <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
-        <div className="flex-1 min-w-0 overflow-auto">
-          {!rows.length ? <p className="p-8 text-center text-mute">{filter ? "No sessions match your filter." : "No user sessions were returned."}</p> :
-          <table className="w-full text-left whitespace-nowrap"><thead className="sticky top-0 bg-panel2 z-10"><tr>{["Instance", "SID", "Serial", "User", "Status", "Client", "Machine", "Program", "SQL ID", "Wait event"].map(label => <th key={label} className="px-3 py-2 border-b border-bdr text-mute font-medium">{label}</th>)}</tr></thead>
+        <div className="sessions-scroll flex-1 min-w-0 overflow-auto">
+          <table className="w-full text-left whitespace-nowrap"><thead className="sticky top-0 bg-panel2 z-10"><tr>{gridColumns.map(column => <th key={column.key} className="px-3 py-2 border-b border-bdr text-mute font-medium" aria-sort={sortKey === column.key ? (sortDirection === "asc" ? "ascending" : "descending") : undefined}><button type="button" className="hover:text-ink" aria-label={`Sort by ${column.label}`} onClick={() => { setSortDirection(sortKey === column.key && sortDirection === "asc" ? "desc" : "asc"); setSortKey(column.key); }}>{column.label}{sortKey === column.key ? (sortDirection === "asc" ? " ↑" : " ↓") : ""}</button></th>)}</tr><tr>{gridColumns.map(column => <th key={column.key} className="px-2 py-1 border-b border-bdr"><input className={`${inputCls} min-w-24 !w-full`} aria-label={`Filter ${column.label}`} placeholder={`Filter ${column.label.toLowerCase()}…`} value={columnFilters[column.key] ?? ""} onChange={event => setColumnFilters(current => ({ ...current, [column.key]: event.target.value }))} /></th>)}</tr></thead>
             <tbody>{rows.map(row => <tr key={keyOf(row)} onClick={() => setSelectedKey(keyOf(row))} tabIndex={0} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedKey(keyOf(row)); } }} aria-selected={keyOf(row) === selectedKey} className={`cursor-pointer border-b border-bdrsoft hover:bg-accentdim ${keyOf(row) === selectedKey ? "bg-accentdim" : ""}`}>
-              {[row.instance, row.sid, row.serial, row.username, row.status, sessionClient(row), row.machine, row.program, row.sqlId, row.event].map((value, index) => <td key={index} className="px-3 py-2 max-w-56 truncate font-mono" title={String(value ?? "")}>{value ?? "—"}</td>)}
-            </tr>)}</tbody></table>}
+              {gridColumns.map(column => <td key={column.key} className="px-3 py-2 max-w-56 truncate font-mono" title={String(column.value(row) ?? "")}>{column.value(row) ?? "—"}</td>)}
+            </tr>)}</tbody></table>
+          {!rows.length && <p className="p-8 text-center text-mute">{hasFilter ? "No sessions match your filters." : "No user sessions were returned."}</p>}
         </div>
         {selected && <aside className="w-full lg:w-80 shrink-0 border-t lg:border-t-0 lg:border-l border-bdr overflow-auto bg-panel2" aria-label="Session details">
           <div className="sticky top-0 bg-panel2 border-b border-bdr p-3 flex items-center gap-2"><h3 className="font-semibold">Session details</h3><Badge tone={selected.status === "ACTIVE" ? "ok" : "neutral"}>{selected.status}</Badge><button className="ml-auto text-mute hover:text-ink" aria-label="Close session details" onClick={() => setSelectedKey(null)}><X size={15} /></button></div>

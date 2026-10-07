@@ -162,6 +162,7 @@ export interface TablespaceObject {
   name: string;
   type: string;
   partition: string | null;
+  tableName: string | null;
   sizeMiB: number;
 }
 export interface TablespaceObjectsPage {

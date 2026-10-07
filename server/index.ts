@@ -5787,14 +5787,15 @@ app.get("/api/connections/:id/tablespace-objects", requireFullAccess, async (req
   try {
     const conn = await getOraConn(c);
     try {
-      const result = await conn.execute(`SELECT owner AS "OWNER", segment_name AS "NAME", segment_type AS "TYPE", partition_name AS "PARTITION", ROUND(SUM(bytes)/1048576, 2) AS "SIZE_MIB"
-        FROM dba_segments
-        WHERE tablespace_name = :tablespace ${search ? "AND (INSTR(UPPER(owner), :search) > 0 OR INSTR(UPPER(segment_name), :search) > 0 OR INSTR(UPPER(segment_type), :search) > 0)" : ""}
-        GROUP BY owner, segment_name, segment_type, partition_name
-        ORDER BY SUM(bytes) DESC, owner, segment_name, partition_name
+      const result = await conn.execute(`SELECT s.owner AS "OWNER", s.segment_name AS "NAME", s.segment_type AS "TYPE", s.partition_name AS "PARTITION", i.table_name AS "TABLE_NAME", ROUND(SUM(s.bytes)/1048576, 2) AS "SIZE_MIB"
+        FROM dba_segments s
+        LEFT JOIN dba_indexes i ON s.segment_type IN ('INDEX', 'INDEX PARTITION', 'INDEX SUBPARTITION') AND i.owner = s.owner AND i.index_name = s.segment_name
+        WHERE s.tablespace_name = :tablespace ${search ? "AND (INSTR(UPPER(s.owner), :search) > 0 OR INSTR(UPPER(s.segment_name), :search) > 0 OR INSTR(UPPER(s.segment_type), :search) > 0 OR INSTR(UPPER(i.table_name), :search) > 0)" : ""}
+        GROUP BY s.owner, s.segment_name, s.segment_type, s.partition_name, i.table_name
+        ORDER BY SUM(s.bytes) DESC, s.owner, s.segment_name, s.partition_name
         OFFSET :offset ROWS FETCH NEXT 101 ROWS ONLY`, { tablespace, ...(search ? { search: search.toUpperCase() } : {}), offset }, { outFormat: oracledb.OUT_FORMAT_OBJECT });
       const rows = (result.rows ?? []) as Record<string, unknown>[];
-      res.json({ rows: rows.slice(0, 100).map(row => ({ owner: row.OWNER, name: row.NAME, type: row.TYPE, partition: row.PARTITION, sizeMiB: row.SIZE_MIB })), hasMore: rows.length > 100 });
+      res.json({ rows: rows.slice(0, 100).map(row => ({ owner: row.OWNER, name: row.NAME, type: row.TYPE, partition: row.PARTITION, tableName: row.TABLE_NAME, sizeMiB: row.SIZE_MIB })), hasMore: rows.length > 100 });
     } finally { await conn.close(); }
   } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });
