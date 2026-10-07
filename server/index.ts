@@ -5749,6 +5749,7 @@ app.post("/api/connections/:id/sessions/kill", requireFullAccess, async (req, re
 });
 
 app.get("/api/connections/:id/dba-management", requireFullAccess, async (req, res) => {
+  res.set("Cache-Control", "no-store");
   const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection" });
   if (c.engine !== "oracle") return res.status(400).json({ error: "DBA Manager requires Oracle." });

@@ -852,11 +852,12 @@ export class ConfirmRequiredError extends Error {
   }
 }
 
-async function request<T>(url: string, body?: unknown, method?: string, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(url, body === undefined && !method && !headers
+async function request<T>(url: string, body?: unknown, method?: string, headers?: Record<string, string>, cache?: RequestCache): Promise<T> {
+  const res = await fetch(url, body === undefined && !method && !headers && !cache
     ? undefined
     : {
         method: method ?? (body === undefined ? 'GET' : 'POST'),
+        ...(cache ? { cache } : {}),
         headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...headers },
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
@@ -931,15 +932,15 @@ export const api = {
   /** re-read a single group of the tree (Procedures, Packages, …) instead of the whole catalog */
   schemaGroup: (id: string, label: string) =>
     request<SchemaGroupResult>(`/api/connections/${id}/schema/group?label=${encodeURIComponent(label)}`),
-  dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`),
-  tablespaceObjects: (id: string, tablespace: string, search: string, offset: number) => request<TablespaceObjectsPage>(`/api/connections/${id}/tablespace-objects?tablespace=${encodeURIComponent(tablespace)}&search=${encodeURIComponent(search)}&offset=${offset}`),
-  sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`),
+  dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`, undefined, undefined, undefined, "no-store"),
+  tablespaceObjects: (id: string, tablespace: string, search: string, offset: number) => request<TablespaceObjectsPage>(`/api/connections/${id}/tablespace-objects?tablespace=${encodeURIComponent(tablespace)}&search=${encodeURIComponent(search)}&offset=${offset}`, undefined, undefined, undefined, "no-store"),
+  sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`, undefined, undefined, undefined, "no-store"),
   killSession: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
     request<{ ok: boolean }>(`/api/connections/${id}/sessions/kill`, session),
   dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),
-  dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`),
-  dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`),
-  perf: (id: string) => request<PerfReport>(`/api/connections/${id}/perf`),
+  dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`, undefined, undefined, undefined, "no-store"),
+  dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`, undefined, undefined, undefined, "no-store"),
+  perf: (id: string) => request<PerfReport>(`/api/connections/${id}/perf`, undefined, undefined, undefined, "no-store"),
   deps: (id: string, name: string) => request<DepsReport>(`/api/connections/${id}/deps?name=${encodeURIComponent(name)}`),
   erd: (id: string) => request<ErdResult>(`/api/connections/${id}/erd`),
   /** `type` disambiguates objects whose names differ only in case (lowercase synonym vs uppercase view). */

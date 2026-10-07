@@ -5,7 +5,7 @@ import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { selectManagementQueries } from "./dbaManagement.ts";
+import { managementQueries, selectManagementQueries } from "./dbaManagement.ts";
 import { dbaModules } from "../src/utils/dbaModules.ts";
 import { tablespaceCapacity, type StorageRow } from "../src/utils/tablespaceCapacity.ts";
 import { storageDestinations } from "../src/utils/storageDestinations.ts";
@@ -96,6 +96,15 @@ test("DBA request selection rejects arbitrary SQL, inherited keys, and oversized
   for (const value of ["", "SELECT * FROM dba_users", "__proto__", "constructor", ["users"], "users,unknown", Array(7).fill("users").join(",")]) assert.throws(() => selectManagementQueries(value));
   assert.deepEqual(selectManagementQueries("users,users,roles").map(([key]) => key), ["users", "roles"]);
   assert.equal(selectManagementQueries(undefined).length, 6);
+});
+
+test("tablespace current size aggregates all datafiles and tempfiles before the row limit", () => {
+  const query = managementQueries.tablespaceFileSizes;
+  assert.match(query, /SUM\(bytes\)\/1048576 AS "Allocated MiB"/);
+  assert.match(query, /CASE WHEN autoextensible = 'YES' THEN GREATEST\(bytes, maxbytes\) ELSE bytes END/);
+  assert.match(query, /FROM dba_data_files UNION ALL SELECT tablespace_name, bytes, maxbytes, autoextensible FROM dba_temp_files/);
+  assert.match(query, /GROUP BY tablespace_name/);
+  assert.deepEqual(selectManagementQueries("tablespaces,files,tablespaceUsage,tablespaceFileSizes").map(([name]) => name), ["tablespaces", "files", "tablespaceUsage", "tablespaceFileSizes"]);
 });
 
 test("all eleven DBA modules resolve to implemented views or allowlisted queries", () => {

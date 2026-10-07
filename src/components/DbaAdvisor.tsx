@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -76,21 +76,31 @@ export default function DbaAdvisor() {
   const [report, setReport] = useState<DbaReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(() => {
     if (!isOracleLive || !conn) return;
+    const current = ++requestId.current;
     setLoading(true);
     setError(null);
     api
       .dba(conn.id)
-      .then(setReport)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [conn, isOracleLive]);
+      .then(data => { if (current === requestId.current) setReport(data); })
+      .catch((e: Error) => { if (current === requestId.current) setError(e.message); })
+      .finally(() => { if (current === requestId.current) setLoading(false); });
+  }, [conn?.id, isOracleLive]);
 
   useEffect(() => {
     load();
+    return () => { requestId.current++; };
   }, [load]);
+  useEffect(() => {
+    if (!isOracleLive) return;
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") load(); }, 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [isOracleLive, load]);
 
   if (!isOracleLive) {
     return (

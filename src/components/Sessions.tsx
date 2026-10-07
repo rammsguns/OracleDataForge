@@ -61,6 +61,15 @@ export default function Sessions() {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [conn?.id, conn?.status, revision]);
+  useEffect(() => {
+    if (!conn || conn.status !== "connected" || killing) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !loading) setRevision(value => value + 1);
+    }, 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible" && !loading) setRevision(value => value + 1); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [conn?.id, conn?.status, killing, loading]);
 
   const rows = useMemo(() => {
     const search = filter.trim().toLowerCase();
