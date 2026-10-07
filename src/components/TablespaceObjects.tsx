@@ -9,6 +9,7 @@ export default function TablespaceObjects({ connectionId, tablespace }: { connec
   const [page, setPage] = useState<TablespaceObjectsPage | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [revision, refresh] = useState(0);
   useEffect(() => { setSearch(""); setOffset(0); }, [connectionId, tablespace]);
   useEffect(() => {
     let cancelled = false;
@@ -20,9 +21,9 @@ export default function TablespaceObjects({ connectionId, tablespace }: { connec
         .finally(() => { if (!cancelled) setLoading(false); });
     }, search ? 250 : 0);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [connectionId, tablespace, search, offset]);
+  }, [connectionId, tablespace, search, offset, revision]);
   return <div className="space-y-3">
-    <p className="text-xs text-mute">Allocated segment space in {tablespace}. Partitions, indexes, and LOB segments appear separately. Sizes are allocated space, not the amount of row data.</p>
+    <div className="flex items-start gap-2"><p className="text-xs text-mute flex-1">Allocated segment space in {tablespace}. Partitions, indexes, and LOB segments appear separately. Sizes are allocated space, not the amount of row data.</p><Btn variant="outline" disabled={loading} onClick={() => refresh(value => value + 1)}>Refresh objects</Btn></div>
     <input className={inputCls} aria-label="Search objects in tablespace" placeholder="Search owner, object, table, or segment type…" value={search} onChange={event => { setSearch(event.target.value); setOffset(0); }} />
     {loading && <p role="status" className="text-xs text-mute">Loading objects…</p>}
     {error && <p role="alert" className="text-xs text-err">{error}</p>}

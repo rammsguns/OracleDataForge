@@ -42,6 +42,7 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   const destinations = storageDestinations(report?.sections.files?.rows ?? [], name, temporary);
   const selectedFile = report?.sections.files?.rows.find(file => file.File === path);
   useEffect(() => { setPath(""); setName(""); setPreview(""); setTypedName(""); setLastAudit(""); setEditing(false); }, [conn?.id]);
+  useEffect(() => { setReport(null); }, [conn?.id, page]);
   useEffect(() => {
     if (!editing) return;
     const onEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setEditing(false); };
@@ -50,15 +51,23 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   }, [editing]);
   useEffect(() => {
     let cancelled = false;
-    setReport(null);
     setError("");
     if (!connected || !conn) return;
     setLoading(true);
-    api.dbaManagement(conn.id, page === "Storage" ? ["tablespaces", "files", "tablespaceUsage"] : ["memory", "sga", "pga"]).then(data => { if (!cancelled) setReport(data); })
-      .catch((e: Error) => { if (!cancelled) setError(e.message); })
+    api.dbaManagement(conn.id, page === "Storage" ? ["tablespaces", "files", "tablespaceUsage", "tablespaceFileSizes"] : ["memory", "sga", "pga"]).then(data => { if (!cancelled) setReport(data); })
+      .catch((e: Error) => { if (!cancelled) { setReport(null); setError(e.message); } })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [conn?.id, connected, revision, page]);
+  useEffect(() => {
+    if (!connected || page !== "Storage") return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") refresh(n => n + 1);
+    }, 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(n => n + 1); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [connected, page, conn?.id]);
   // A preview always corresponds to the current form values.
   useEffect(() => { setPreview(""); setFormError(""); setTypedName(""); }, [page, action, name, path, mb, temporary, parameter, scope, autoextend, nextMb, maxMb, deleteFiles]);
 
@@ -98,11 +107,11 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
       else { setFormError((e as Error).message); refresh(n => n + 1); }
     } finally { setApplying(false); }
   };
-  return <div className="h-full overflow-auto p-4 space-y-4 text-[13px]">
+  return <div className="sessions-scroll h-full min-w-0 overflow-auto p-4 space-y-4 text-[13px]">
     <header className="flex items-center gap-3"><h2 className="font-semibold">{page === "Storage" ? "Tablespaces & datafiles" : "Memory management"}</h2><Btn className="ml-auto" variant="outline" disabled={loading} onClick={() => refresh(n => n + 1)}><RefreshCcw size={13} /> Refresh</Btn></header>
     {loading && <Spinner label="Reading database configuration…" />}
     {error && <p role="alert" className="text-err">{error}</p>}
-    {report && <><p className="text-xs text-mute">Snapshot: {new Date(report.capturedAt).toLocaleString()} · Current connection/container</p>
+    {report && <><p className="text-xs text-mute">Snapshot: {new Date(report.capturedAt).toLocaleString()} · Current connection/container{page === "Storage" ? " · Refreshes every 30 seconds while visible" : ""}</p>
       {page === "Storage" && <TablespaceOverview report={report} readOnly={!!conn?.readOnly || applying} onManage={(operation, tablespace, file) => {
         setDialogTab("change");
         setEditing(true);

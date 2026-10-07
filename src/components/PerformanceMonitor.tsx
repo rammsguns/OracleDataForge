@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, AlertTriangle, CircleCheck, CircleX, HardDrive, Info, RefreshCcw, Timer, Users } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, type PerfReport } from "../utils/api";
@@ -70,13 +70,23 @@ function LivePerf({ connId, connName }: { connId: string; connName: string }) {
   const [report, setReport] = useState<PerfReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(() => {
+    const current = ++requestId.current;
     setLoading(true);
     setError(null);
-    api.perf(connId).then(setReport).catch((e: Error) => setError(e.message)).finally(() => setLoading(false));
+    api.perf(connId).then(data => { if (current === requestId.current) setReport(data); })
+      .catch((e: Error) => { if (current === requestId.current) setError(e.message); })
+      .finally(() => { if (current === requestId.current) setLoading(false); });
   }, [connId]);
-  useEffect(() => load(), [load]);
+  useEffect(() => { load(); return () => { requestId.current++; }; }, [load]);
+  useEffect(() => {
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") load(); }, 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [load]);
 
   if (loading && !report) return <div className="h-full flex items-center justify-center"><Spinner label="Reading live performance data…" /></div>;
   if (error)
