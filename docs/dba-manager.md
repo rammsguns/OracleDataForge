@@ -28,7 +28,7 @@ For storage, search or filter the tablespace list, then click a tablespace name 
 
 The read endpoint accepts an optional `sections` query parameter containing one to six allowlisted section names. Only the selected page's views are queried, sequentially on one Oracle session. Each query returns at most 500 rows with an explicit truncation notice; filters apply to loaded rows. Recent job and backup history is ordered newest first. Each failed query displays its Oracle error independently. Missing privileges and database-version/container differences do not prevent browsing other pages. Switching connection or page discards pending UI responses from the previous selection.
 
-New files default to AUTOEXTEND OFF. Additional files are not supported for bigfile tablespaces. File paths refer to the database server, not the browser machine. Oracle checks storage limits and whether a file can shrink. SPFILE/BOTH requires an SPFILE; static memory parameters require restart. PDB changes and memory combinations remain subject to Oracle restrictions. No automatic restart is performed.
+New tablespaces default to BIGFILE, with SMALLFILE available in the create form. New files default to AUTOEXTEND OFF. Additional files are not supported for bigfile tablespaces. File paths refer to the database server, not the browser machine. Oracle checks storage limits and whether a file can shrink. SPFILE/BOTH requires an SPFILE; static memory parameters require restart. PDB changes and memory combinations remain subject to Oracle restrictions. No automatic restart is performed.
 
 Oracle references: [ALTER TABLESPACE](https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/ALTER-TABLESPACE.html) and [ALTER SYSTEM](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/ALTER-SYSTEM.html).
 
@@ -40,6 +40,6 @@ Contextual file and tablespace shortcuts prefill the edit dialog. Resize starts 
 
 The **Objects** tab lists allocated segments in the selected tablespace by owner, name, type, indexed table, and partition, ordered by allocated size. Its search matches owner, segment name, segment type, or indexed table and pages through 100 rows at a time. The sizes come from `DBA_SEGMENTS` and describe allocated space, not row data. Index table names come from `DBA_INDEXES`. Indexes, LOB segments, and partitions appear separately; objects without allocated segments do not appear. Access requires the relevant dictionary-view privilege.
 
-New tablespaces and added files can enable automatic growth with a growth increment and maximum file size. Existing files can change automatic growth through the file action. The Sessions grid has per-column filters, sortable headers, and wider scrollbars.
+New tablespaces and added files can enable automatic growth with a growth increment and maximum file size. The maximum size field stays visible but disabled while automatic growth is off. Existing autoextensible files have a **Set max size** action that preserves their exact current growth increment, including sub-MiB increments. Fixed-size files must first enable automatic growth. The Sessions grid has per-column filters, sortable headers, and wider scrollbars.
 
 Oracle metric semantics: https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/DBA_TABLESPACE_USAGE_METRICS.html

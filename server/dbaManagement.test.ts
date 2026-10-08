@@ -28,9 +28,21 @@ test("automatic growth uses bounded integer sizes and preserves tempfile syntax"
   assert.equal(storageChangeSql({ ...change, action: "readWrite" }), 'ALTER TABLESPACE "APP" READ WRITE;');
 });
 
+test("setting a maximum file size preserves an existing sub-MiB growth increment", () => {
+  const change = { action: "maxSize", name: "LOG_SIS_DF_2016", path: "/db/log.dbf", mb: "10", temporary: false, autoextend: true, nextBytes: "16384", maxMb: "150528" };
+  assert.equal(storageChangeSql(change), "ALTER DATABASE DATAFILE '/db/log.dbf' AUTOEXTEND ON NEXT 16384 MAXSIZE 150528M;");
+  assert.equal(storageChangeSql({ ...change, bigfile: true }), 'ALTER TABLESPACE "LOG_SIS_DF_2016" AUTOEXTEND ON NEXT 16384 MAXSIZE 150528M;');
+  assert.equal(storageChangeSql({ ...change, temporary: true }), "ALTER DATABASE TEMPFILE '/db/log.dbf' AUTOEXTEND ON NEXT 16384 MAXSIZE 150528M;");
+  for (const bad of [{ autoextend: false }, { nextBytes: "0" }, { nextBytes: "1; DROP TABLE X" }, { maxMb: "9" }]) {
+    assert.throws(() => storageChangeSql({ ...change, ...bad }));
+  }
+});
+
 test("new tablespace and added files can enable automatic growth", () => {
   const change = { action: "create", name: "APP", path: "/db/app.dbf", mb: "1024", temporary: false, autoextend: true, nextMb: "128", maxMb: "4096" };
   assert.equal(storageChangeSql(change), 'CREATE TABLESPACE "APP" DATAFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
+  assert.equal(storageChangeSql({ ...change, bigfile: true }), 'CREATE BIGFILE TABLESPACE "APP" DATAFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
+  assert.equal(storageChangeSql({ ...change, bigfile: true, temporary: true }), 'CREATE BIGFILE TEMPORARY TABLESPACE "APP" TEMPFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
   assert.equal(storageChangeSql({ ...change, action: "add", temporary: true }), 'ALTER TABLESPACE "APP" ADD TEMPFILE \'/db/app.dbf\' SIZE 1024M AUTOEXTEND ON NEXT 128M MAXSIZE 4096M;');
   assert.match(storageChangeSql({ ...change, autoextend: false }), /AUTOEXTEND OFF;$/);
   for (const maxMb of ["0", "127", "1023", "1; DROP TABLE X"]) assert.throws(() => storageChangeSql({ ...change, maxMb }));

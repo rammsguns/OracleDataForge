@@ -20,9 +20,9 @@ function autoextendClause(enabled: boolean, nextMb?: string, maxMb?: string, ini
   if (initialMb !== undefined && Number(maxMb) < Number(initialMb)) throw new Error("Maximum size must be at least the initial file size.");
   return `AUTOEXTEND ON NEXT ${next} MAXSIZE ${max}`;
 }
-export function storageSql(action: string, name: string, path: string, mb: string, temporary: boolean, autoextend = false, nextMb?: string, maxMb?: string) {
+export function storageSql(action: string, name: string, path: string, mb: string, temporary: boolean, autoextend = false, nextMb?: string, maxMb?: string, bigfile = false) {
   const file = temporary ? "TEMPFILE" : "DATAFILE";
-  if (action === "create") return `CREATE ${temporary ? "TEMPORARY " : ""}TABLESPACE ${identifier(name)} ${file} ${literal(path)} SIZE ${size(mb)} ${autoextendClause(autoextend, nextMb, maxMb, mb)};`;
+  if (action === "create") return `CREATE ${bigfile ? "BIGFILE " : ""}${temporary ? "TEMPORARY " : ""}TABLESPACE ${identifier(name)} ${file} ${literal(path)} SIZE ${size(mb)} ${autoextendClause(autoextend, nextMb, maxMb, mb)};`;
   if (action === "add") return `ALTER TABLESPACE ${identifier(name)} ADD ${file} ${literal(path)} SIZE ${size(mb)} ${autoextendClause(autoextend, nextMb, maxMb, mb)};`;
   if (action === "resize") return `ALTER DATABASE ${file} ${literal(path)} RESIZE ${size(mb)};`;
   throw new Error("Unknown storage operation.");
@@ -35,7 +35,7 @@ export function memorySql(name: string, mb: string, scope: string) {
 
 export interface StorageChange {
   action: string; name: string; path: string; mb: string; temporary: boolean;
-  autoextend?: boolean; nextMb?: string; maxMb?: string; deleteFiles?: boolean; bigfile?: boolean;
+  autoextend?: boolean; nextMb?: string; nextBytes?: string; maxMb?: string; deleteFiles?: boolean; bigfile?: boolean;
 }
 export function storageChangeSql(change: StorageChange) {
   if (!change || typeof change !== "object") throw new Error("Missing storage change.");
@@ -55,6 +55,17 @@ export function storageChangeSql(change: StorageChange) {
     const target = change.bigfile ? `ALTER TABLESPACE ${identifier(name)}` : `ALTER DATABASE ${temporary ? "TEMPFILE" : "DATAFILE"} ${literal(path)}`;
     return `${target} ${autoextendClause(!!change.autoextend, change.nextMb, change.maxMb)};`;
   }
+  if (action === "maxSize") {
+    if (change.autoextend !== true) throw new Error("Enable automatic growth before setting a maximum size.");
+    const max = size(change.maxMb ?? "");
+    size(mb);
+    if (Number(change.maxMb) < Number(mb)) throw new Error("Maximum size must be at least the current file size.");
+    const nextBytes = change.nextBytes;
+    if (!nextBytes || !/^\d+$/.test(nextBytes) || !Number.isSafeInteger(Number(nextBytes)) || Number(nextBytes) < 1) throw new Error("Current growth increment is unavailable. Use Change automatic growth instead.");
+    if (Number(nextBytes) > Number(change.maxMb) * 1048576) throw new Error("Maximum size must be at least the growth increment.");
+    const target = change.bigfile ? `ALTER TABLESPACE ${identifier(name)}` : `ALTER DATABASE ${temporary ? "TEMPFILE" : "DATAFILE"} ${literal(path)}`;
+    return `${target} AUTOEXTEND ON NEXT ${nextBytes} MAXSIZE ${max};`;
+  }
   if (action === "resize" && change.bigfile) {
     // Oracle permits resizing a bigfile tablespace by name. Convert the UI's MiB
     // value to bytes so the reviewed statement shows the exact absolute size.
@@ -62,5 +73,5 @@ export function storageChangeSql(change: StorageChange) {
     const tablespace = /^[A-Z][A-Z0-9_$#]*$/.test(name) ? name : identifier(name);
     return `ALTER TABLESPACE ${tablespace} RESIZE ${BigInt(mb) * 1048576n};`;
   }
-  return storageSql(action, name, path, mb, temporary, change.autoextend, change.nextMb, change.maxMb);
+  return storageSql(action, name, path, mb, temporary, change.autoextend, change.nextMb, change.maxMb, change.bigfile);
 }
