@@ -22,12 +22,14 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   const [path, setPath] = useState("");
   const [mb, setMb] = useState("1024");
   const [temporary, setTemporary] = useState(false);
+  const [createBigfile, setCreateBigfile] = useState(true);
   const [parameter, setParameter] = useState<string>("sga_target");
   const [scope, setScope] = useState("MEMORY");
   const [preview, setPreview] = useState("");
   const [formError, setFormError] = useState("");
   const [autoextend, setAutoextend] = useState(false);
   const [nextMb, setNextMb] = useState("128");
+  const [nextBytes, setNextBytes] = useState("");
   const [maxMb, setMaxMb] = useState("32767");
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [typedName, setTypedName] = useState("");
@@ -35,9 +37,9 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   const [lastAudit, setLastAudit] = useState("");
   const [editing, setEditing] = useState(false);
   const [dialogTab, setDialogTab] = useState<"change" | "objects">("change");
-  const fileAction = action === "resize" || action === "autoextend";
+  const fileAction = action === "resize" || action === "autoextend" || action === "maxSize";
   const tablespaceOnly = ["drop", "readOnly", "readWrite"].includes(action);
-  const change = { action, name, path, mb, temporary, autoextend, nextMb, maxMb, deleteFiles, bigfile: report?.sections.tablespaces?.rows.find(row => row.Name === name)?.Bigfile === "YES" };
+  const change = { action, name, path, mb, temporary, autoextend, nextMb, nextBytes, maxMb, deleteFiles, bigfile: action === "create" ? createBigfile : report?.sections.tablespaces?.rows.find(row => row.Name === name)?.Bigfile === "YES" };
   const formRef = useRef<HTMLElement>(null);
   const destinations = storageDestinations(report?.sections.files?.rows ?? [], name, temporary);
   const selectedFile = report?.sections.files?.rows.find(file => file.File === path);
@@ -69,7 +71,7 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
   }, [connected, page, conn?.id]);
   // A preview always corresponds to the current form values.
-  useEffect(() => { setPreview(""); setFormError(""); setTypedName(""); }, [page, action, name, path, mb, temporary, parameter, scope, autoextend, nextMb, maxMb, deleteFiles]);
+  useEffect(() => { setPreview(""); setFormError(""); setTypedName(""); }, [page, action, name, path, mb, temporary, createBigfile, parameter, scope, autoextend, nextMb, nextBytes, maxMb, deleteFiles]);
 
   if (!connected) return <EmptyState icon={<Database />} title="Connect to Oracle to manage your database" hint="Select a connected Oracle connection in the Explorer. DBA Manager reads storage, memory, and resource views for that connection." />;
 
@@ -116,8 +118,9 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
         setDialogTab("change");
         setEditing(true);
         setAction(operation); setName(String(tablespace.Name ?? "")); setTemporary(tablespace.Contents === "TEMPORARY");
+        if (operation === "create") setCreateBigfile(true);
         setPath(String(file?.File ?? "")); setMb(file ? String(Math.ceil(Number(file["Allocated MiB"]))) : "1024");
-        setAutoextend(file?.Autoextend === "YES"); setMaxMb(String(Math.floor(Number(file?.["Max MiB"])) || 32767)); setDeleteFiles(false); setTypedName("");
+        setAutoextend(file?.Autoextend === "YES"); setMaxMb(String(Math.floor(Number(file?.["Max MiB"])) || 32767)); setNextBytes(String(file?.["Increment bytes"] ?? "")); setDeleteFiles(false); setTypedName("");
         setPreview(""); setFormError("");
         requestAnimationFrame(() => formRef.current?.focus({ preventScroll: true }));
       }} onInspect={tablespace => { setName(String(tablespace.Name ?? "")); setAction("resize"); setPath(""); setTemporary(tablespace.Contents === "TEMPORARY"); setDialogTab("objects"); setEditing(true); requestAnimationFrame(() => formRef.current?.focus({ preventScroll: true })); }} />}
@@ -132,10 +135,11 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
       {conn?.readOnly && <p className="text-warn">This connection is read-only. Changes are disabled.</p>}
       <fieldset disabled={applying || !!conn.readOnly} className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">
         {page === "Storage" ? <>
-          <Field label="Change"><select className={inputCls} value={action} onChange={e => { setAction(e.target.value); setPath(""); setDeleteFiles(false); }}><option value="create">Create tablespace</option><option value="add">Add file</option><option value="resize">Resize file</option><option value="autoextend">Change automatic growth</option><option value="readOnly">Make read-only</option><option value="readWrite">Allow writes</option><option value="drop">Delete tablespace…</option></select></Field>
+          <Field label="Change"><select className={inputCls} value={action} onChange={e => { setAction(e.target.value); setPath(""); setDeleteFiles(false); }}><option value="create">Create tablespace</option><option value="add">Add file</option><option value="resize">Resize file</option><option value="maxSize">Set maximum size</option><option value="autoextend">Configure autoextend and limit</option><option value="readOnly">Make read-only</option><option value="readWrite">Allow writes</option><option value="drop">Delete tablespace…</option></select></Field>
           <Field label="Tablespace">{action === "create" ? <input className={inputCls} value={name} onChange={e => setName(e.target.value)} /> : <select className={inputCls} value={name} onChange={e => { setName(e.target.value); setPath(""); const row = report?.sections.tablespaces?.rows.find(r => r.Name === e.target.value); setTemporary(row?.Contents === "TEMPORARY"); }}><option value="">Select a tablespace…</option>{report?.sections.tablespaces?.rows.map(r => <option key={String(r.Name)} value={String(r.Name)}>{r.Name}</option>)}</select>}</Field>
           {action === "create" && <Field label="File type"><select className={inputCls} value={temporary ? "temp" : "data"} onChange={e => setTemporary(e.target.value === "temp")}><option value="data">Datafile (permanent)</option><option value="temp">Tempfile (temporary)</option></select></Field>}
-          {fileAction && <Field label="Existing file"><select className={inputCls} value={path} onChange={e => { setPath(e.target.value); const file = report?.sections.files?.rows.find(r => r.File === e.target.value); setTemporary(file?.Kind === "TEMPFILE"); setMb(String(Math.ceil(Number(file?.["Allocated MiB"])) || 1024)); setAutoextend(file?.Autoextend === "YES"); setMaxMb(String(Math.floor(Number(file?.["Max MiB"])) || 32767)); }}><option value="">Select a file…</option>{report?.sections.files?.rows.filter(r => r.Tablespace === name).map(r => <option key={String(r.File)} value={String(r.File)}>{r.File} · {r["Allocated MiB"]} MiB</option>)}</select></Field>}
+          {action === "create" && <Field label="Tablespace type"><select className={inputCls} value={createBigfile ? "bigfile" : "smallfile"} onChange={e => setCreateBigfile(e.target.value === "bigfile")}><option value="bigfile">BIGFILE (one file)</option><option value="smallfile">SMALLFILE (multiple files)</option></select></Field>}
+          {fileAction && <Field label="Existing file"><select className={inputCls} value={path} onChange={e => { setPath(e.target.value); const file = report?.sections.files?.rows.find(r => r.File === e.target.value); setTemporary(file?.Kind === "TEMPFILE"); setMb(String(Math.ceil(Number(file?.["Allocated MiB"])) || 1024)); setAutoextend(file?.Autoextend === "YES"); setMaxMb(String(Math.floor(Number(file?.["Max MiB"])) || 32767)); setNextBytes(String(file?.["Increment bytes"] ?? "")); }}><option value="">Select a file…</option>{report?.sections.files?.rows.filter(r => r.Tablespace === name).map(r => <option key={String(r.File)} value={String(r.File)}>{r.File} · {r["Allocated MiB"]} MiB</option>)}</select></Field>}
           {!fileAction && !tablespaceOnly && <Field label="Database-server file path / ASM destination">
             <input className={inputCls} value={path} onChange={e => setPath(e.target.value)} placeholder={action === "resize" ? "Existing database file" : destinations[0] ?? "Enter a server file path or +DISKGROUP"} />
             {action !== "resize" && <div className="mt-2 space-y-2">
@@ -146,16 +150,17 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
               <p className="text-xs text-mute">{destinations.length ? "Based on this database’s existing files, with matching file types first. Filenames use the current tablespace name; ASM disk groups let Oracle name the file. You can edit the selected destination." : "Enter a destination manually; suggestions require existing file information."} Server access and available space must be checked before running.</p>
             </div>}
           </Field>}
-          {["create", "add", "autoextend"].includes(action) && <><Field label="Automatic growth"><select className={inputCls} value={autoextend ? "on" : "off"} onChange={e => setAutoextend(e.target.value === "on")}><option value="off">Disabled — fixed file size</option><option value="on">Enabled — grow up to a limit</option></select></Field>{autoextend && <><Field label="Grow by (MiB)"><input className={inputCls} type="number" min="1" step="1" value={nextMb} onChange={e => setNextMb(e.target.value)} /></Field><Field label="Maximum file size (MiB)"><input className={inputCls} type="number" min="1" step="1" value={maxMb} onChange={e => setMaxMb(e.target.value)} /></Field></>}</>}
+          {["create", "add", "autoextend"].includes(action) && <><Field label="Automatic growth"><select className={inputCls} value={autoextend ? "on" : "off"} onChange={e => setAutoextend(e.target.value === "on")}><option value="off">Disabled — fixed file size</option><option value="on">Enabled — grow up to a limit</option></select></Field>{autoextend && <Field label="Grow by (MiB)"><input className={inputCls} type="number" min="1" step="1" value={nextMb} onChange={e => setNextMb(e.target.value)} /></Field>}{["create", "add", "autoextend"].includes(action) && <Field label="Maximum file size (MiB)"><input className={inputCls} type="number" min="1" step="1" value={maxMb} disabled={!autoextend} onChange={e => setMaxMb(e.target.value)} /></Field>}</>}
+          {action === "maxSize" && <Field label="Maximum file size (MiB)"><input className={inputCls} type="number" min="1" step="1" value={maxMb} onChange={e => setMaxMb(e.target.value)} /></Field>}
           {action === "drop" && <div className="sm:col-span-2 border border-err rounded-lg p-3 space-y-2"><p className="text-err">Deletes the tablespace and ALL its objects. This cannot be undone.</p><label className="flex gap-2"><input type="checkbox" checked={deleteFiles} onChange={e => setDeleteFiles(e.target.checked)} />Also delete physical datafiles from storage</label><p className="text-xs text-mute">Physical files are kept unless selected above. SYSTEM and SYSAUX are protected.</p></div>}
         </> : <>
           <Field label="Parameter"><select className={inputCls} value={parameter} onChange={e => setParameter(e.target.value)}>{memoryParameters.map(p => <option key={p}>{p}</option>)}</select></Field>
           <Field label="Scope"><select className={inputCls} value={scope} onChange={e => setScope(e.target.value)}><option value="MEMORY">Memory — until restart</option><option value="SPFILE">SPFILE — after restart</option><option value="BOTH">Both — now and after restart</option></select></Field>
         </>}
-        {(page === "Memory" || (!tablespaceOnly && action !== "autoextend")) && <Field label={page === "Storage" && action === "resize" ? "New total file size (MiB)" : "Size (MiB)"}><input type="number" min={page === "Memory" ? 0 : 1} step="1" className={inputCls} value={mb} onChange={e => setMb(e.target.value)} /></Field>}
+        {(page === "Memory" || (!tablespaceOnly && action !== "autoextend" && action !== "maxSize")) && <Field label={page === "Storage" && action === "resize" ? "New total file size (MiB)" : "Size (MiB)"}><input type="number" min={page === "Memory" ? 0 : 1} step="1" className={inputCls} value={mb} onChange={e => setMb(e.target.value)} /></Field>}
       </fieldset>
       {page === "Storage" && fileAction && selectedFile && <p className="text-xs text-mute">Current file size: {selectedFile["Allocated MiB"]} MiB · Automatic growth: {selectedFile.Autoextend} · Current limit: {selectedFile["Max MiB"]} MiB{action === "resize" && Number(mb) < Number(selectedFile["Allocated MiB"]) ? " · Warning: this will shrink the file." : ""}</p>}
-      <p className="text-xs text-mute">{page === "Storage" ? "Set automatic growth for new files here or change it later for an existing file. Bigfile tablespaces cannot accept additional files. Shrinking a file requires sufficient unused space at its end." : "SPFILE/BOTH requires an SPFILE. Static settings require restart; PDB changes require a PDB-modifiable parameter. Check available host memory and related parameter limits before running."}</p>
+      <p className="text-xs text-mute">{page === "Storage" ? "Maximum size controls how far a file can autoextend; it does not immediately resize the file. Set maximum size preserves the file’s current growth increment. Enable automatic growth first for fixed-size files. Bigfile tablespaces cannot accept additional files." : "SPFILE/BOTH requires an SPFILE. Static settings require restart; PDB changes require a PDB-modifiable parameter. Check available host memory and related parameter limits before running."}</p>
       <Btn variant="outline" disabled={!!conn?.readOnly || applying} onClick={generate}>Review SQL</Btn>
       {formError && <p role="alert" className="text-err">{formError}</p>}
       {preview && <><pre className="bg-bg border border-bdr p-3 rounded-lg whitespace-pre-wrap break-all font-mono text-xs">{preview}</pre>{page === "Storage" ? <>{action === "drop" && <Field label={`Type ${name} to enable deletion`}><input className={inputCls} value={typedName} disabled={applying} onChange={e => setTypedName(e.target.value)} autoComplete="off" /></Field>}<Btn variant="primary" disabled={!!conn.readOnly || applying || (action === "drop" && typedName !== name)} onClick={() => { void apply(); }}>{applying ? "Applying…" : "Confirm and apply…"}</Btn></> : <Btn variant="primary" disabled={!!conn?.readOnly} onClick={() => { s.setSql(preview); s.openTab("worksheet", "Worksheet 1"); }}>Open in worksheet</Btn>}</>}
