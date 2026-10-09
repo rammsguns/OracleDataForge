@@ -1,3 +1,4 @@
+import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import express from "express";
 import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies } from './tableDataCopy.ts';
 import { tableDataSelection } from '../src/utils/tableDataDependencies.ts';
@@ -5,7 +6,7 @@ import { WorksheetSessions } from "./worksheetSessions.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
 import { selectManagementQueries } from "./dbaManagement.ts";
-import { globalSessionsSql, localSessionsSql, globalConnectInfoSql, localConnectInfoSql, killSessionSql, sessionIdentifier } from "./oracleSessions.ts";
+import { globalSessionsSql, localSessionsSql, globalConnectInfoSql, localConnectInfoSql, killSessionSql, sessionIdentifier, sessionResourcesSql, sessionResourceStats } from "./oracleSessions.ts";
 import compression from "compression";
 import { AuthConcurrency } from "./authConcurrency.ts";
 import { loadUserStore, type Role, type StoredUser } from "./userStore.ts";
@@ -1281,6 +1282,7 @@ async function oraRows(conn: oracledb.Connection, sql: string, binds: Record<str
 const numOf = (v: unknown) => (typeof v === "number" ? v : Number(v) || 0);
 
 export interface PerfReport {
+  resources: ResourceReport;
   engine: "oracle";
   scope: string;
   tiles: { label: string; value: string; sub?: string; tone?: "ok" | "warn" | "err" }[];
@@ -1324,7 +1326,7 @@ async function oraPerf(c: LiveConnection): Promise<PerfReport> {
            ORDER BY begin_time`
         );
         if (pts.length) {
-          series = { label: metric, unit: "/sec", points: pts.map((p) => ({ t: String(p.t), v: numOf(p.v) })) };
+          series = { label: metric, unit: metric === "Average Active Sessions" ? "sessions" : "/sec", points: pts.map((p) => ({ t: String(p.t), v: numOf(p.v) })) };
           break outer;
         }
       }
@@ -1351,9 +1353,9 @@ async function oraPerf(c: LiveConnection): Promise<PerfReport> {
     const ts = await oraRows(
       conn,
       `SELECT tablespace_name AS "name",
-              ROUND(used_space*8192/1048576,1) AS "usedMb",
-              ROUND(tablespace_size*8192/1048576,1) AS "totalMb", ROUND(used_percent,1) AS "pct"
-       FROM dba_tablespace_usage_metrics ORDER BY used_percent DESC`
+              ROUND(m.used_space*t.block_size/1048576,1) AS "usedMb",
+              ROUND(m.tablespace_size*t.block_size/1048576,1) AS "totalMb", ROUND(used_percent,1) AS "pct"
+       FROM dba_tablespace_usage_metrics m JOIN dba_tablespaces t USING (tablespace_name) ORDER BY used_percent DESC`
     );
 
     const acts = await oraRows(
@@ -1364,7 +1366,10 @@ async function oraPerf(c: LiveConnection): Promise<PerfReport> {
        ORDER BY last_active_time DESC FETCH FIRST 8 ROWS ONLY`
     );
 
+    const resources = await readPerformanceResources(sql => oraRows(conn, sql));
+
     return {
+      resources,
       engine: "oracle",
       scope: `${c.database} · ${c.user.toUpperCase()}`,
       tiles: [
@@ -5708,7 +5713,20 @@ app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => 
         // values even when this database does not expose the driver metadata.
         clientDetailsAvailable = false;
       }
-      res.json({ sessions, scope, clientDetailsAvailable, capturedAt: new Date().toISOString() });
+      let resourceDetailsAvailable = true;
+      try {
+        const stats = await conn.execute(sessionResourcesSql(scope === "all-instances"), [],
+          { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 0 });
+        const bySession = new Map((stats.rows as Record<string, unknown>[] ?? []).map(row =>
+          [`${row.instance}:${row.sid}:${row.serial}`, row]));
+        for (const session of sessions) {
+          const row = bySession.get(`${session.instance}:${session.sid}:${session.serial}`);
+          for (const [field] of sessionResourceStats) session[field] = mapVal(row?.[field]);
+        }
+      } catch {
+        resourceDetailsAvailable = false;
+      }
+      res.json({ sessions, scope, clientDetailsAvailable, resourceDetailsAvailable, capturedAt: new Date().toISOString() });
     } finally { await conn.close(); }
   } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });

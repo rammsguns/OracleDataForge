@@ -125,6 +125,50 @@ function LivePerf({ connId, connName }: { connId: string; connName: string }) {
         ))}
       </div>
 
+      {report.resources && (
+        <>
+          <div className="text-[11.5px] text-mute flex items-center gap-2">
+            <Info size={13} /> Database server metrics · sampled {new Date(report.resources.sampledAt).toLocaleTimeString()} · refreshes every 30 seconds
+          </div>
+          <div className="grid xl:grid-cols-2 gap-4">
+            {report.resources.groups.map(group => (
+              <section key={group.title} className="bg-panel border border-bdr rounded-xl p-4">
+                <h3 className="text-[13px] font-semibold mb-1">{group.title}</h3>
+                <p className="text-[11.5px] text-mute mb-3">{group.description}</p>
+                <dl className="grid sm:grid-cols-2 gap-x-5">
+                  {group.metrics.map(metric => (
+                    <div key={metric.label} className="py-2.5 border-t border-bdrsoft min-w-0">
+                      <dt className="text-[11.5px] text-soft">{metric.label}</dt>
+                      <dd className={`text-[18px] font-semibold tabular-nums ${metric.value === "Unavailable" ? "text-mute text-[12px]" : "text-ink"}`}>{metric.value}</dd>
+                      <dd className="text-[10.5px] text-mute mt-0.5">{metric.detail}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            ))}
+          </div>
+          <section className="bg-panel border border-bdr rounded-xl p-4">
+            <h3 className="text-[12.5px] font-semibold mb-1">Top non-idle waits</h3>
+            <p className="text-[11.5px] text-mute mb-3">Cumulative since instance startup, ranked by total wait time.</p>
+            {report.resources.waits.length === 0 ? <p className="text-[12px] text-mute">No wait statistics available for this connection.</p> : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-[11.5px] min-w-[600px]">
+                  <thead><tr className="text-mute text-left border-b border-bdrsoft">
+                    <th className="py-2">Event</th><th>Wait class</th><th className="text-right">Waits</th><th className="text-right">Total (s)</th><th className="text-right">Average (ms)</th>
+                  </tr></thead>
+                  <tbody>{report.resources.waits.map(wait => <tr key={wait.event} className="border-b border-bdrsoft">
+                    <td className="py-2 font-mono">{wait.event}</td><td>{wait.waitClass}</td>
+                    <td className="text-right tabular-nums">{wait.waits.toLocaleString()}</td>
+                    <td className="text-right tabular-nums">{wait.totalSeconds.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="text-right tabular-nums">{wait.averageMs.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                  </tr>)}</tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
+      )}
+
       {report.series && report.series.points.length > 1 && (
         <section className="bg-panel border border-bdr rounded-xl p-4">
           <h3 className="text-[12.5px] font-semibold mb-1">{report.series.label}</h3>

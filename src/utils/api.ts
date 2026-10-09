@@ -170,6 +170,25 @@ export interface TablespaceObjectsPage {
   hasMore: boolean;
 }
 export interface OracleSession {
+  ageSeconds?: number | null;
+  activeSeconds?: number | null;
+  sqlExecStart?: string | null;
+  blockingInstance?: number | null;
+  cpuSeconds?: number | null;
+  cpuPercent?: number | null;
+  pgaMb?: number | null;
+  pgaPeakMb?: number | null;
+  ugaMb?: number | null;
+  readMb?: number | null;
+  writeMb?: number | null;
+  readRequests?: number | null;
+  writeRequests?: number | null;
+  logicalReads?: number | null;
+  redoMb?: number | null;
+  executions?: number | null;
+  hardParses?: number | null;
+  readMbps?: number | null;
+  writeMbps?: number | null;
   instance: number;
   sid: number;
   serial: number;
@@ -204,6 +223,7 @@ export interface OracleSessionsReport {
   sessions: OracleSession[];
   scope: "all-instances" | "local-instance";
   clientDetailsAvailable: boolean;
+  resourceDetailsAvailable?: boolean;
   capturedAt: string;
 }
 export interface DbaMetric { name: string; value: number; unit: string; }
@@ -228,6 +248,11 @@ export interface DbaReport {
 }
 
 export interface PerfReport {
+  resources?: {
+    sampledAt: string;
+    groups: { title: string; description: string; metrics: { label: string; value: string; detail: string }[] }[];
+    waits: { event: string; waitClass: string; waits: number; totalSeconds: number; averageMs: number }[];
+  };
   engine: "oracle";
   scope: string;
   tiles: { label: string; value: string; sub?: string; tone?: "ok" | "warn" | "err" }[];

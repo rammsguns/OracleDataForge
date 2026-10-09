@@ -258,11 +258,11 @@ export default function Sidebar() {
     setOpenGroups((groups) => ({ ...groups, Tables: false }));
   }, [s.activeConnId]);
 
-  // fetch the real schema when a live connection becomes active
-  useEffect(() => {
-    const c = activeConn;
+  // Read the catalog only when the user requests it.
+  const refreshSchema = (connId: string) => {
+    const c = s.connections.find(connection => connection.id === connId);
     // "idle" = disconnected on purpose — don't re-open a pool behind the user's back
-    if (!c?.live || c.status === "idle" || liveSchemas[c.id]) return;
+    if (!c?.live || c.status !== "connected" || liveSchemas[c.id]?.status === "loading") return;
     setLiveSchemas((m) => ({ ...m, [c.id]: { status: "loading" } }));
     api
       .schema(c.id)
@@ -286,14 +286,7 @@ export default function Sidebar() {
       .catch((e: Error) =>
         setLiveSchemas((m) => ({ ...m, [c.id]: { status: "error", message: e.message } }))
       );
-  }, [activeConn, liveSchemas]);
-
-  const refreshSchema = (connId: string) =>
-    setLiveSchemas((m) => {
-      const n = { ...m };
-      delete n[connId];
-      return n;
-    });
+  };
 
   /**
    * Re-read one group (Procedures, Packages, …) and splice it back into the loaded tree.
@@ -342,7 +335,7 @@ export default function Sidebar() {
   useEffect(() => {
     const { labels } = s.groupRefresh;
     const connId = s.activeConnId;
-    if (!labels.length || !connId) return;
+    if (!labels.length || !connId || liveSchemas[connId]?.status !== "ready") return;
     let cancelled = false;
     setGroupBusy(labels[0]);
     void (async () => {
@@ -384,7 +377,7 @@ export default function Sidebar() {
   // successful DDL or an edited connection bumps this counter — drop all cached schemas.
   // Compared against the module-level `cachedBump` rather than "> 0": this effect also runs on
   // every *mount*, and the panel now mounts again each time it is expanded, so a plain
-  // "bump > 0" would wipe the cache on expand and refetch the whole catalog.
+  // "bump > 0" would wipe the cache on expand and discard the loaded catalog.
   useEffect(() => {
     if (s.schemaBump !== cachedBump) {
       cachedBump = s.schemaBump;
@@ -884,7 +877,7 @@ export default function Sidebar() {
                 aria-label="Refresh schema"
                 title="Refresh schema (re-reads the data dictionary)"
                 onClick={() => refreshSchema(activeConn.id)}
-                disabled={liveState?.status === "loading"}
+                disabled={activeConn.status !== "connected" || liveState?.status === "loading"}
                 className="p-0.5 rounded hover:bg-panel3 hover:text-accenthi disabled:opacity-50 transition-colors"
               >
                 <RefreshCcw size={12} className={liveState?.status === "loading" ? "df-spin" : ""} />
@@ -926,15 +919,16 @@ export default function Sidebar() {
             </div>
             <button
               className="mt-1.5 text-accenthi hover:underline text-[11.5px]"
-              onClick={() =>
-                setLiveSchemas((m) => {
-                  const n = { ...m };
-                  delete n[activeConn!.id];
-                  return n;
-                })
-              }
+              onClick={() => refreshSchema(activeConn!.id)}
             >
               Retry
+            </button>
+          </div>
+        ) : !liveState ? (
+          <div className="mx-2.5 my-1.5 border border-bdr rounded-lg px-2.5 py-2 text-[11.5px] text-mute">
+            Schema has not been loaded.
+            <button className="mt-1.5 flex items-center gap-1 text-accenthi hover:underline" onClick={() => refreshSchema(activeConn.id)}>
+              <RefreshCcw size={12} /> Load schema
             </button>
           </div>
         ) : liveState?.status === "ready" &&
@@ -956,13 +950,7 @@ export default function Sidebar() {
             in the worksheet, then refresh below.
             <button
               className="block mt-1.5 text-accenthi hover:underline text-[11.5px]"
-              onClick={() =>
-                setLiveSchemas((m) => {
-                  const n = { ...m };
-                  delete n[activeConn!.id];
-                  return n;
-                })
-              }
+              onClick={() => refreshSchema(activeConn!.id)}
             >
               Refresh schema
             </button>

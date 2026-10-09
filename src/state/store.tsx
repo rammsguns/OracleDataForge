@@ -815,7 +815,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         }
         setConnStatus(id, "connected");
         setActiveConnId(id); // reconnecting is also how you connect — focus it
-        setSchemaBump((b) => b + 1); // re-read the catalog through the new session
+        setSchemaBump((b) => b + 1); // invalidate the catalog; Explorer loads it on request
         toast("success", `"${conn.name}" connected — ${r.version} (${r.ms} ms)`);
       } catch (e) {
         setConnStatus(id, "error");

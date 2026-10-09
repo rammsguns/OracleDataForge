@@ -20,7 +20,10 @@ export const sessionColumns = `
   s.module AS "module", s.action AS "action", s.osuser AS "osUser",
   s.process AS "process", s.terminal AS "terminal", s.client_info AS "clientInfo",
   s.schemaname AS "schemaName", s.logon_time AS "logonTime",
-  s.last_call_et AS "lastCallSeconds", s.sql_id AS "sqlId",
+  s.last_call_et AS "lastCallSeconds",
+  ROUND((SYSDATE-s.logon_time)*86400) AS "ageSeconds",
+  CASE WHEN s.status = 'ACTIVE' THEN s.last_call_et END AS "activeSeconds",
+  s.sql_exec_start AS "sqlExecStart", s.blocking_instance AS "blockingInstance", s.sql_id AS "sqlId",
   s.prev_sql_id AS "previousSqlId", s.event AS "event",
   s.wait_class AS "waitClass", s.state AS "waitState",
   s.blocking_session AS "blockingSid", s.client_identifier AS "clientIdentifier",
@@ -44,3 +47,33 @@ export const globalConnectInfoSql = `SELECT c.inst_id AS "instance", ${connectIn
 
 export const localConnectInfoSql = `SELECT TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE')) AS "instance", ${connectInfoColumns}
   FROM v$session_connect_info c GROUP BY c.sid, c.serial#`;
+
+
+// Session counters are cumulative; memory counters describe current/peak allocation.
+export const sessionResourceStats = [
+  ["cpuSeconds", "CPU used by this session", 100],
+  ["pgaMb", "session pga memory", 1048576],
+  ["pgaPeakMb", "session pga memory max", 1048576],
+  ["ugaMb", "session uga memory", 1048576],
+  ["readMb", "physical read total bytes", 1048576],
+  ["writeMb", "physical write total bytes", 1048576],
+  ["readRequests", "physical read total IO requests", 1],
+  ["writeRequests", "physical write total IO requests", 1],
+  ["logicalReads", "session logical reads", 1],
+  ["redoMb", "redo size", 1048576],
+  ["executions", "execute count", 1],
+  ["hardParses", "parse count (hard)", 1],
+] as const;
+
+export function sessionResourcesSql(global: boolean): string {
+  const prefix = global ? "gv$" : "v$";
+  return `SELECT ${global ? 's.inst_id' : "TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE'))"} AS "instance",
+    s.sid AS "sid", s.serial# AS "serial",
+    ${sessionResourceStats.map(([key, name, divisor]) =>
+      `MAX(CASE WHEN n.name = '${name}' THEN st.value END)/${divisor} AS "${key}"`).join(", ")}
+    FROM ${prefix}session s
+    JOIN ${prefix}sesstat st ON st.sid = s.sid ${global ? "AND st.inst_id = s.inst_id" : ""}
+    JOIN ${prefix}statname n ON n.statistic# = st.statistic# ${global ? "AND n.inst_id = st.inst_id" : ""}
+    WHERE s.type = 'USER' AND n.name IN (${sessionResourceStats.map(([,name]) => `'${name}'`).join(",")})
+    GROUP BY ${global ? "s.inst_id," : ""} s.sid, s.serial#`;
+}
