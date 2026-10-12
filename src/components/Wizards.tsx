@@ -309,7 +309,7 @@ export function ConnectionWizard() {
                   )}
                 </>
               )}
-              {!walletBusy && !services.length && !walletError && editing?.authMode === "wallet" && (
+              {!walletBusy && !services.length && !walletError && editing?.authMode === "wallet" && walletId && (
                 <p className="flex items-center gap-1.5 text-[12px] text-mute">
                   <Loader2 size={13} className="df-spin" /> Reading the saved wallet…
                 </p>
@@ -990,8 +990,10 @@ export function ExportConnectionsDialog() {
  */
 export function ImportConnectionsDialog() {
   const s = useStudio();
+  const [importKind, setImportKind] = useState<"dataforge" | "sqldeveloper" | null>(null);
   const [fileName, setFileName] = useState("");
   const [envelope, setEnvelope] = useState<unknown>(null);
+  const [sqlDeveloperFile, setSqlDeveloperFile] = useState(false);
   const [pass, setPass] = useState("");
   const [reveal, setReveal] = useState(false);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
@@ -1006,16 +1008,23 @@ export function ImportConnectionsDialog() {
     if (!f) return;
     setError("");
     setPreview(null);
+    setSqlDeveloperFile(false);
     setFileName(f.name);
     try {
       const parsed = JSON.parse(await f.text());
       // named here rather than left to the server so the obvious mistake — picking the wrong
       // .json — is answered before a passphrase is typed
-      if (!parsed || parsed.format !== "oracle-dataforge-connections") {
+      const isDataForge = parsed?.format === "oracle-dataforge-connections";
+      const isSqlDeveloper = Array.isArray(parsed?.connections);
+      if ((importKind === "dataforge" && !isDataForge) || (importKind === "sqldeveloper" && !isSqlDeveloper)) {
         setEnvelope(null);
-        setError(`${f.name} is not an Oracle DataForge connection export.`);
+        setError(importKind === "dataforge"
+          ? `${f.name} is not an Oracle DataForge connection export.`
+          : `${f.name} is not an Oracle SQL Developer connection export.`);
         return;
       }
+      setSqlDeveloperFile(isSqlDeveloper);
+      if (isSqlDeveloper) setPass("");
       setEnvelope(parsed);
     } catch {
       setEnvelope(null);
@@ -1065,9 +1074,32 @@ export function ImportConnectionsDialog() {
   };
 
   return (
-    <Modal title="Import connections from an encrypted file" onClose={close} width={640}>
+    <Modal title={importKind ? `Import ${importKind === "dataforge" ? "Oracle DataForge" : "Oracle SQL Developer"} connections` : "Import connections"} onClose={close} width={640}>
       <div className="space-y-4">
-        <Field label="Export file" hint="The dataforge-connections-….json written by Export connections">
+        {!importKind ? (
+          <div className="space-y-3">
+            <p className="text-[12.5px] text-mute">Which kind of connection export would you like to import?</p>
+            <button
+              className="w-full text-left border border-bdr rounded-lg p-3 hover:border-accent/60 hover:bg-panel2 transition-colors"
+              onClick={() => setImportKind("dataforge")}
+            >
+              <span className="block text-[13px] font-medium text-ink">Oracle DataForge</span>
+              <span className="block text-[11.5px] text-mute mt-0.5">Import a passphrase-encrypted DataForge connections file.</span>
+            </button>
+            <button
+              className="w-full text-left border border-bdr rounded-lg p-3 hover:border-accent/60 hover:bg-panel2 transition-colors"
+              onClick={() => setImportKind("sqldeveloper")}
+            >
+              <span className="block text-[13px] font-medium text-ink">Oracle SQL Developer</span>
+              <span className="block text-[11.5px] text-mute mt-0.5">Import a SQL Developer connections JSON export.</span>
+            </button>
+            <div className="flex justify-end pt-3 border-t border-bdrsoft">
+              <Btn variant="ghost" onClick={close}>Cancel</Btn>
+            </div>
+          </div>
+        ) : (
+        <>
+        <Field label="Export file" hint={importKind === "dataforge" ? "Select the JSON file created by DataForge's Export connections option" : "Select a JSON file created by SQL Developer's Export Connections wizard"}>
           <input
             type="file"
             accept="application/json,.json"
@@ -1076,7 +1108,14 @@ export function ImportConnectionsDialog() {
           />
         </Field>
 
-        {envelope != null && !preview && (
+        {importKind === "sqldeveloper" && sqlDeveloperFile && (
+          <div className="border border-warn/40 bg-warn/10 rounded-lg p-3 text-[11.5px] text-soft leading-snug">
+            SQL Developer passwords are protected with its export key format and will be left blank during import. You can
+            edit each saved connection in DataForge to enter its password. Cloud wallet connections also need their wallet ZIP uploaded in Edit connection before connecting.
+          </div>
+        )}
+
+        {envelope != null && !preview && importKind === "dataforge" && (
           <>
             <Field label="Passphrase" hint="The one used when the file was exported">
               <input
@@ -1133,7 +1172,7 @@ export function ImportConnectionsDialog() {
                           {e.database ? `/${e.database}` : ""} as {e.user}
                           {e.role && e.role !== "default" ? ` · ${e.role}` : ""}
                           {e.readOnly ? " · read-only" : ""}
-                          {e.authMode === "wallet" ? " · restores its wallet" : ""}
+                          {e.authMode === "wallet" ? (sqlDeveloperFile ? " · upload wallet after import" : " · restores its wallet") : ""}
                         </span>
                         {e.error && <span className="block text-[11px] text-err">Cannot import: {e.error}</span>}
                         {e.duplicateOfId && e.duplicateOfName !== e.name && (
@@ -1186,18 +1225,25 @@ export function ImportConnectionsDialog() {
         )}
 
         <div className="flex items-center justify-between pt-4 border-t border-bdrsoft">
-          <Btn variant="ghost" onClick={close}>Cancel</Btn>
+          <Btn variant="ghost" onClick={() => {
+            setImportKind(null);
+            setEnvelope(null);
+            setPreview(null);
+            setError("");
+          }}>Back</Btn>
           {preview ? (
             <Btn variant="primary" onClick={run} disabled={busy || chosen.length === 0}>
               {busy ? <Loader2 size={13} className="df-spin" /> : <CheckCircle2 size={13} />} Import {chosen.length || ""}{" "}
               connection{chosen.length === 1 ? "" : "s"}
             </Btn>
           ) : (
-            <Btn variant="primary" onClick={unlock} disabled={busy || envelope == null || !pass}>
-              {busy ? <Loader2 size={13} className="df-spin" /> : <KeyRound size={13} />} Unlock file
+            <Btn variant="primary" onClick={unlock} disabled={busy || envelope == null || (!sqlDeveloperFile && !pass)}>
+              {busy ? <Loader2 size={13} className="df-spin" /> : <KeyRound size={13} />} {sqlDeveloperFile ? "Preview connections" : "Unlock file"}
             </Btn>
           )}
         </div>
+        </>
+        )}
       </div>
     </Modal>
   );
