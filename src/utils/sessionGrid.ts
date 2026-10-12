@@ -10,6 +10,7 @@ export const sessionGridColumns = [
   { key: "client", label: "Client", value: (row: OracleSession) => sessionClient(row) },
   { key: "machine", label: "Machine", value: (row: OracleSession) => row.machine },
   { key: "program", label: "Program", value: (row: OracleSession) => row.program },
+  { key: "module", label: "Module", value: (row: OracleSession) => row.module },
   { key: "ageSeconds", label: "Age (s)", value: (row: OracleSession) => row.ageSeconds },
   { key: "activeSeconds", label: "Active call (s)", value: (row: OracleSession) => row.activeSeconds },
   { key: "cpuPercent", label: "CPU (% of one core)", value: (row: OracleSession) => row.cpuPercent },

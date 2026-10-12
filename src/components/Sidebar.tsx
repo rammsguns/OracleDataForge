@@ -8,6 +8,7 @@ import {
   Database,
   FileCode2,
   FileLock2,
+  FileText,
   FileUp,
   FolderOpen,
   FunctionSquare,
@@ -38,10 +39,12 @@ import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { NEW_TABLE_SENTINEL } from "../utils/tableDdl";
 import { download, toCsv, toJson } from "../utils/sql";
-import { ContextMenu, Spinner } from "./ui";
+import { Btn, ContextMenu, Modal, Spinner } from "./ui";
 import type { MenuItem } from "../types";
 import PackageExport from "./PackageExport";
 import SavePackageDialog from "./SavePackageDialog";
+import CreateJobDialog from "./CreateJobDialog";
+import JobActionDialog from "./JobActionDialog";
 
 interface SchemaGroup {
   label: string;
@@ -227,6 +230,10 @@ export default function Sidebar() {
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [packageExport, setPackageExport] = useState<{ object: string; spec: string; body: string | null } | null>(null);
   const [savePackageConnId, setSavePackageConnId] = useState<string | null>(null);
+  const [createJobConnId, setCreateJobConnId] = useState<string | null>(null);
+  const [jobAction, setJobAction] = useState<{ connId: string; name: string; mode: "drop" | "copy" } | null>(null);
+  const [jobRunPreview, setJobRunPreview] = useState<{ connId: string; name: string; sql: string } | null>(null);
+  const [jobRunBusy, setJobRunBusy] = useState(false);
   /** id of the connection currently opening/closing its session (blocks double clicks) */
   const [connBusy, setConnBusy] = useState<string | null>(null);
   /** label of the group being re-read on its own (one at a time — they share a session) */
@@ -467,12 +474,17 @@ export default function Sidebar() {
 
   /** Starts a scheduler job asynchronously. The API's write guard supplies the confirmation
    * wording; after approval Oracle owns the run and its outcome appears in Job Run Log. */
-  const runJobNow = async (name: string, confirmed = false) => {
+  const previewJobRun = (name: string) => {
     if (!activeConn) return;
-    const jobName = name.replace(/'/g, "''");
-    const statement = `BEGIN DBMS_SCHEDULER.RUN_JOB(job_name => '${jobName}', use_current_session => FALSE); END;`;
+    setJobRunPreview({ connId: activeConn.id, name,
+      sql: `BEGIN\n  DBMS_SCHEDULER.RUN_JOB(\n    job_name => '${name.replace(/'/g, "''")}',\n    use_current_session => FALSE\n  );\nEND;` });
+  };
+  const runJobNow = async (preview: { connId: string; name: string; sql: string }, confirmed = false) => {
+    if (jobRunBusy) return;
+    const { connId, name, sql } = preview;
+    setJobRunBusy(true);
     try {
-      const result = await api.query(activeConn.id, statement, confirmed);
+      const result = await api.query(connId, sql, confirmed);
       if (result.confirmation) {
         const confirmation = result.confirmation;
         s.askConfirm({
@@ -480,7 +492,7 @@ export default function Sidebar() {
           body: `${confirmation.body} Oracle will start the job in the background; its outcome will appear in Job Run Log.`,
           confirmLabel: "Run job",
           danger: false,
-          onConfirm: () => { void runJobNow(name, true); },
+          onConfirm: () => { void runJobNow(preview, true); },
         });
         return;
       }
@@ -489,9 +501,10 @@ export default function Sidebar() {
         return;
       }
       s.toast("success", `${name} started — refresh Job Run Log to see its outcome`);
+      setJobRunPreview(null);
     } catch (e) {
       s.toast("error", `Could not start ${name} — ${(e as Error).message}`);
-    }
+    } finally { setJobRunBusy(false); }
   };
 
   const savePackage = async (connId: string, name: string) => {
@@ -520,7 +533,11 @@ export default function Sidebar() {
       ...(runnable ? [{ label: "Run / Test…", action: () => openRoutineRunner(name) }] : []),
       ...(activeConn?.live && kind === "job"
         ? [
-            ...(!activeConn.readOnly ? [{ label: "Run now…", action: () => void runJobNow(name) }] : []),
+            ...(!activeConn.readOnly ? [{ label: "Run now…", action: () => previewJobRun(name) }] : []),
+            ...(!activeConn.readOnly && activeConn.status === "connected" && fullAccess ? [
+              { label: "Create similar…", action: () => setJobAction({ connId: activeConn.id, name, mode: "copy" }) },
+              { label: "Drop job…", danger: true, action: () => setJobAction({ connId: activeConn.id, name, mode: "drop" }) },
+            ] : []),
             { label: "View run log…", action: () => s.openTab("joblog", `${name} (Run Log)`, name) },
           ]
         : []),
@@ -970,6 +987,14 @@ export default function Sidebar() {
                   className="flex-1 min-w-0 flex items-center gap-1.5 pl-4 pr-1 py-1 text-[12px] font-semibold text-soft hover:text-ink"
                   onClick={() => setOpenGroups((o) => ({ ...o, [g.label]: !open }))}
                   aria-expanded={open}
+                  onContextMenu={(e) => {
+                    if (g.kind !== "job" || !activeConn?.live || activeConn.status !== "connected") return;
+                    e.preventDefault();
+                    setMenu({ x: e.clientX, y: e.clientY, items: [
+                      ...(!activeConn.readOnly && fullAccess ? [{ label: "Create job…", action: () => setCreateJobConnId(activeConn.id) }] : []),
+                      { label: "View job run logs…", action: () => s.openTab("joblog", "Job Run Log") },
+                    ] });
+                  }}
                 >
                   {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                   <span className="text-accenthi">{KIND_ICON[g.kind]}</span>
@@ -1020,6 +1045,14 @@ export default function Sidebar() {
                   >
                     <Plus size={13} />
                   </button>
+                )}
+                {g.kind === "job" && activeConn?.live && activeConn.status === "connected" && (
+                  <button className="ml-1 p-0.5 rounded text-mute hover:text-accenthi hover:bg-accentdim shrink-0"
+                    title="View job run logs…" aria-label="View job run logs" onClick={() => s.openTab("joblog", "Job Run Log")}><FileText size={13} /></button>
+                )}
+                {g.kind === "job" && activeConn?.live && activeConn.status === "connected" && !activeConn.readOnly && fullAccess && (
+                  <button className="ml-1 p-0.5 rounded text-mute hover:text-accenthi hover:bg-accentdim shrink-0"
+                    title="Create job…" aria-label="Create job" onClick={() => setCreateJobConnId(activeConn.id)}><Plus size={13} /></button>
                 )}
               </div>
               {open &&
@@ -1116,6 +1149,22 @@ export default function Sidebar() {
       </div>
 
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {jobRunPreview && <Modal title={`Run ${jobRunPreview.name}`} onClose={() => { if (!jobRunBusy) setJobRunPreview(null); }} width={640}>
+        <div className="space-y-4">
+          <p className="text-[12px] text-mute">Review the SQL below. Run job starts it in the background; view its outcome in Job Run Log.</p>
+          <pre className="p-3 rounded border border-bdr bg-bg text-[12px] font-mono whitespace-pre-wrap break-all">{jobRunPreview.sql}</pre>
+          <div className="flex justify-end gap-2">
+            <Btn variant="outline" disabled={jobRunBusy} onClick={() => setJobRunPreview(null)}>Cancel</Btn>
+            <Btn variant="primary" disabled={jobRunBusy} onClick={() => void runJobNow(jobRunPreview)}>{jobRunBusy ? "Starting…" : "Run job"}</Btn>
+          </div>
+        </div>
+      </Modal>}
+      {jobAction?.mode === "copy" && <CreateJobDialog key={`${jobAction.connId}:${jobAction.name}`} connId={jobAction.connId} sourceJob={jobAction.name}
+        onClose={() => setJobAction(null)} onCreated={() => { void refreshGroupAsync(jobAction.connId, "Scheduler"); }} />}
+      {jobAction?.mode === "drop" && <JobActionDialog key={`${jobAction.connId}:${jobAction.name}:${jobAction.mode}`} {...jobAction}
+        onClose={() => setJobAction(null)} onDone={() => { void refreshGroupAsync(jobAction.connId, "Scheduler"); }} />}
+      {createJobConnId && <CreateJobDialog key={createJobConnId} connId={createJobConnId} onClose={() => setCreateJobConnId(null)}
+        onCreated={() => { setOpenGroups((groups) => ({ ...groups, Scheduler: true })); void refreshGroupAsync(createJobConnId, "Scheduler"); }} />}
       {packageExport && <PackageExport {...packageExport} sourceDescription="saved database source" onClose={() => setPackageExport(null)} />}
       {savePackageConnId && <SavePackageDialog key={savePackageConnId} connId={savePackageConnId} onClose={() => setSavePackageConnId(null)} />}
     </div>

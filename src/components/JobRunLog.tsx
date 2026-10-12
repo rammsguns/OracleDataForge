@@ -23,6 +23,23 @@ const RUN_LOG_SQL = `SELECT * FROM (
 ) WHERE ROWNUM <= 500`;
 
 const text = (value: Cell) => value == null ? "" : String(value);
+function durationText(value: unknown): string {
+  if (value == null || value === "") return "—";
+  let interval = value;
+  if (typeof interval === "string") {
+    try { interval = JSON.parse(interval); } catch { return String(value); }
+  }
+  if (typeof interval !== "object" || interval === null) return String(value);
+  const fields = interval as Record<string, unknown>;
+  if (!["days", "hours", "minutes", "seconds"].some((key) => key in fields)) return String(value);
+  const parts: string[] = [];
+  for (const [key, unit] of [["days", "d"], ["hours", "h"], ["minutes", "m"], ["seconds", "s"]]) {
+    const amount = Number(fields[key] ?? 0);
+    if (!Number.isFinite(amount)) return String(value);
+    if (amount) parts.push(`${amount}${unit}`);
+  }
+  return parts.join(" ") || "0s";
+}
 const statusTone = (status: string): "ok" | "err" | "warn" | "neutral" =>
   status === "SUCCEEDED" ? "ok" : status === "FAILED" || status === "STOPPED" ? "err" : status === "RUNNING" ? "warn" : "neutral";
 
@@ -144,7 +161,7 @@ export default function JobRunLog({ initialJob }: { initialJob?: string }) {
                   <td className="px-3 py-2 whitespace-nowrap text-mute tabular-nums">{text(run.date) || "—"}</td>
                   <td className="px-3 py-2 font-mono text-soft">{text(run.job) || "—"}</td>
                   <td className="px-3 py-2"><Badge tone={statusTone(status)}>{status === "SUCCEEDED" ? <CheckCircle2 size={10} /> : failed ? <XCircle size={10} /> : <CircleAlert size={10} />}{status || "UNKNOWN"}</Badge></td>
-                  <td className="px-3 py-2 whitespace-nowrap text-mute tabular-nums">{text(run.duration) || "—"}</td>
+                  <td className="px-3 py-2 whitespace-nowrap text-mute tabular-nums">{durationText(run.duration)}</td>
                   <td className={`px-3 py-2 font-mono ${failed ? "text-err" : "text-mute"}`}>{text(run.error) && text(run.error) !== "0" ? text(run.error) : "—"}</td>
                   <td className="px-3 py-2 max-w-[420px] whitespace-pre-wrap break-words text-mute" title={text(run.info)}>{text(run.info) || "—"}</td>
                   <td className="px-3 py-2"><Btn variant="ghost" onClick={() => void openOutput(run)} title="View captured output"><FileText size={13} /> Output</Btn></td>
