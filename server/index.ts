@@ -20,6 +20,7 @@ import {
   encryptExport,
   EXPORT_MIN_PASSPHRASE,
 } from "./connectionExport.ts";
+import { parseSqlDeveloperExport } from "./sqlDeveloperImport.ts";
 import {
   extractWallet,
   parseTnsNames,
@@ -898,7 +899,9 @@ const oraConnectString = (c: ConnConfig) =>
   // In wallet mode the descriptor lives in the wallet's tnsnames.ora and `database` is the
   // alias into it — the host and port on the config are what that alias resolved to, kept
   // for display, not for dialling.
-  c.authMode === "wallet" ? c.database : `${c.host}:${c.port}/${c.database}`;
+  c.authMode === "wallet" || c.database.trimStart().startsWith("(")
+    ? c.database
+    : `${c.host}:${c.port}/${c.database}`;
 
 /**
  * The connection attributes that make an Oracle Cloud wallet work in Thin mode: the
@@ -5070,7 +5073,7 @@ app.delete("/api/connections/:id", requireFullAccess, async (req, res) => {
  * to a connection pointing at nothing; the wallet is a few kilobytes, and the envelope it
  * travels in is the same passphrase-encrypted one already carrying the passwords.
  */
-type ExportedConnection = ConnConfig & { wallet?: WalletFiles };
+type ExportedConnection = ConnConfig & { wallet?: WalletFiles; needsWallet?: boolean };
 
 /** The wallet files of an entry in an uploaded export, or null — every field is untrusted. */
 function pickWalletFiles(entry: unknown): WalletFiles | null {
@@ -5147,6 +5150,13 @@ app.post("/api/connections/export", requireFullAccess, async (req, res) => {
  *  shaped — so an entry from a later export carrying extra fields lands as the fields this
  *  build understands rather than going into the registry unexamined. */
 async function decryptExportFile(raw: unknown, passphrase: string): Promise<ExportedConnection[]> {
+  const sqlDeveloperEntries = parseSqlDeveloperExport(raw);
+  if (sqlDeveloperEntries) {
+    return sqlDeveloperEntries.map((entry) => ({
+      ...pickConfig(entry),
+      ...(entry.needsWallet ? { needsWallet: true } : {}),
+    }));
+  }
   return (await decryptExport(raw, passphrase)).map((e) => {
     const cfg = pickConfig(e) as ExportedConnection;
     // The id inside the file names a directory on the machine that wrote it and means
@@ -5167,6 +5177,7 @@ async function decryptExportFile(raw: unknown, passphrase: string): Promise<Expo
  */
 function validateImport(cfg: ExportedConnection): string | null {
   if (cfg.authMode !== "wallet") return validate(cfg);
+  if (cfg.needsWallet) return cfg.user ? null : "Username is required";
   if (!cfg.wallet) return "This connection uses an Oracle Cloud wallet that the export file does not carry";
   if (!cfg.database) return "The export does not say which service of the wallet to use";
   if (!parseTnsNames(cfg.wallet["tnsnames.ora"]).some((s) => s.alias.toLowerCase() === cfg.database.trim().toLowerCase())) {
@@ -5208,6 +5219,7 @@ interface ImportPreviewEntry {
   authMode: AuthMode;
   /** why this entry cannot be imported, when it cannot */
   error?: string;
+  needsWallet?: boolean;
   /** the saved connection this entry points at the same place as */
   duplicateOfId?: string;
   duplicateOfName?: string;
@@ -5227,6 +5239,7 @@ function describeImport(entries: ExportedConnection[]): ImportPreviewEntry[] {
       role: cfg.role,
       authMode: cfg.authMode,
       error: validateImport(cfg) ?? undefined,
+      needsWallet: cfg.needsWallet,
       duplicateOfId: existing?.id,
       duplicateOfName: existing?.name,
     };
@@ -5286,7 +5299,7 @@ app.post("/api/connections/import", requireFullAccess, async (req, res) => {
     // The wallet lands on disk under an id this server issues, replacing the exporting
     // machine's. Written only once the entry is going to be saved, so a skipped duplicate
     // leaves nothing behind.
-    const { wallet, ...cfg } = entry;
+    const { wallet, needsWallet: _needsWallet, ...cfg } = entry;
     if (cfg.authMode === "wallet" && wallet) {
       try {
         cfg.walletId = storeWallet(wallet);
