@@ -48,3 +48,13 @@ export function worksheetStatement(sql: string, start = 0, end = start): string 
   const range = ranges.find(r => start <= r.end) ?? ranges.at(-1);
   return range ? sql.slice(range.start, range.end).trim() : '';
 }
+
+/** Run the selected script in order; without a selection, run only the cursor statement. */
+export function worksheetStatements(sql: string, start = 0, end = start): string[] {
+  if (start === end) {
+    const statement = worksheetStatement(sql, start, end);
+    return statement ? [statement] : [];
+  }
+  const selected = sql.slice(start, end);
+  return statementRanges(selected).map(range => selected.slice(range.start, range.end).trim());
+}

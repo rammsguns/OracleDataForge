@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { worksheetStatement, statementRanges } from './worksheetStatement';
+import { worksheetStatement, worksheetStatements, statementRanges } from './worksheetStatement';
 test('runs either query from the reported worksheet', () => {
   const sql = '-- worksheet\n-- Ctrl+Enter\nSELECT * FROM categories;\nSELECT * FROM customers;';
   assert.equal(worksheetStatement(sql, sql.indexOf('categories')), 'SELECT * FROM categories;');
@@ -29,4 +29,16 @@ test('preserves PL/SQL internal semicolons and strips slash terminators', () => 
 test('empty or comment-only worksheets do not execute', () => {
   assert.equal(worksheetStatement('-- test\n/* comment */'), '');
   assert.equal(worksheetStatement(''), '');
+});
+
+test('selected scripts split SQL and standalone slashes without repeating statements', () => {
+  const sql = "-- heading\nCREATE TABLE t (id NUMBER);\n/\nINSERT INTO t VALUES (1);\nCOMMIT;";
+  assert.deepEqual(worksheetStatements(sql, 0, sql.length), [
+    'CREATE TABLE t (id NUMBER);', 'INSERT INTO t VALUES (1);', 'COMMIT;',
+  ]);
+  assert.deepEqual(worksheetStatements(sql, sql.indexOf('INSERT')), ['INSERT INTO t VALUES (1);']);
+});
+test('selected scripts preserve PL/SQL blocks and literal delimiters', () => {
+  const sql = "BEGIN NULL; END;\n/\nSELECT ';' FROM dual;";
+  assert.deepEqual(worksheetStatements(sql, 0, sql.length), ['BEGIN NULL; END;', "SELECT ';' FROM dual;"]);
 });
