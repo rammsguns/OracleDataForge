@@ -171,10 +171,13 @@ export function TitleBar() {
             <div>
               <div className="font-semibold text-ink mb-1">What you can do</div>
               <ul className="list-disc pl-5 space-y-1">
-                <li>Browse database objects and run SQL in worksheets.</li>
+                <li>Browse database objects and select a connection directly in the SQL worksheet.</li>
                 <li>Edit, compile, test, and export PL/SQL package code.</li>
                 <li>Inspect table data, dependencies, execution plans, and version history.</li>
-                <li>Manage Oracle connections, including Autonomous Database wallets.</li>
+                <li>Import Oracle DataForge and SQL Developer connections, including Autonomous Database wallets.</li>
+                <li>Create, copy, run, disable, and drop Scheduler jobs; inspect their run logs.</li>
+                <li>Inspect sessions, active SQL, cached execution plans, and waits.</li>
+                <li>Disable triggers and identify disabled triggers and jobs by their gray appearance.</li>
               </ul>
             </div>
             <a className="text-accenthi hover:underline" href="https://github.com/rammsguns/OracleDataForge" target="_blank" rel="noopener noreferrer">Project repository ↗</a>
