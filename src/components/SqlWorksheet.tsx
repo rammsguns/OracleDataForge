@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlignLeft,
   Maximize2,
@@ -26,6 +26,15 @@ export default function SqlWorksheet() {
   const [editorPct, setEditorPct] = useState(46);
   const [view, setView] = useState<"results" | "plan">("results");
   const dragRef = useRef<HTMLDivElement>(null);
+  const connectionInitialized = useRef(false);
+  useEffect(() => {
+    if (connectionInitialized.current || s.running || s.transactionBusy) return;
+    const active = s.connections.find((c) => c.id === s.activeConnId);
+    const connected = active?.status === "connected" ? active : s.connections.find((c) => c.status === "connected");
+    if (!connected) return;
+    connectionInitialized.current = true;
+    if (connected.id !== s.activeConnId) s.setActiveConnId(connected.id);
+  }, [s.connections, s.activeConnId, s.setActiveConnId, s.running, s.transactionBusy]);
 
   const startDrag = useCallback((e: React.PointerEvent) => {
     e.preventDefault();
@@ -77,10 +86,24 @@ export default function SqlWorksheet() {
           <Save size={13} />
           Save
         </Btn>
-        <div className="ml-auto flex items-center gap-2 text-[11.5px] text-mute">
+        <div className="ml-2 flex items-center gap-2 text-[11.5px] text-mute">
           <Database size={12} />
-          <span>{s.connections.find((c) => c.id === s.activeConnId)?.name ?? "—"}</span>
-          <span className="hidden md:inline">·</span>
+          <select
+            aria-label="Worksheet connection"
+            title="Connection used for worksheet SQL and transactions"
+            value={s.activeConnId}
+            disabled={s.running || s.transactionBusy || !s.connections.length}
+            onChange={(e) => {
+              connectionInitialized.current = true;
+              s.setActiveConnId(e.target.value);
+            }}
+            className="max-w-64 rounded border border-bdr bg-panel px-2 py-1 text-[12px] text-ink disabled:opacity-50"
+          >
+            {!s.connections.some((c) => c.id === s.activeConnId) && <option value="">Select connection</option>}
+            {s.connections.map((c) => <option key={c.id} value={c.id}>{c.name}{c.status === "connected" ? " (connected)" : ""}</option>)}
+          </select>
+        </div>
+        <div className="ml-auto hidden md:flex items-center gap-2 text-[11.5px] text-mute">
           <kbd className="hidden md:inline">Ctrl</kbd>
           <span className="hidden md:inline -mx-1">+</span>
           <kbd className="hidden md:inline">Enter</kbd>

@@ -135,7 +135,7 @@ export interface LiveSchema {
   tables: { name: string; rowCount: number }[];
   views: string[];
   /** additional object categories (procedures, packages, jobs, …) */
-  extras?: { label: string; kind: string; items: string[]; invalid?: string[] }[];
+  extras?: { label: string; kind: string; items: string[]; invalid?: string[]; disabled?: string[] }[];
   /** Oracle: `[]` — a table is never INVALID, but saying so marks the group as *checked* */
   invalidTables?: string[];
   /** Oracle: views the dictionary reports as INVALID */
@@ -149,6 +149,7 @@ export interface SchemaGroupResult {
   items: string[];
   /** names reported INVALID (UNUSABLE for indexes). */
   invalid?: string[];
+  disabled?: string[];
   /** Tables only */
   rowCounts?: Record<string, number>;
 }
@@ -217,6 +218,15 @@ export interface OracleSession {
   blockingSid: number | null;
   clientIdentifier: string | null;
   serviceName: string | null;
+}
+
+export interface OracleSessionDetails {
+  status: string; sqlId: string | null; childNumber: number | null; sqlText: string | null;
+  event: string | null; waitClass: string | null; waitState: string | null; waitSeconds: number | null;
+  blockingInstance: number | null; blockingSid: number | null; capturedAt: string;
+  plan: { id: number; parentId: number | null; depth: number; operation: string; options: string | null; owner: string | null; object: string | null; cost: number | null; rows: number | null; access: string | null; filter: string | null }[];
+  waits: { event: string; waitClass: string; waits: number; timeSeconds: number; averageMs: number | null }[];
+  sqlError?: string; planError?: string; waitsError?: string;
 }
 
 export interface OracleSessionsReport {
@@ -960,6 +970,8 @@ export const api = {
   dbaManagement: (id: string, sections?: string[]) => request<DbaManagementReport>(`/api/connections/${id}/dba-management${sections ? `?sections=${encodeURIComponent(sections.join(","))}` : ""}`, undefined, undefined, undefined, "no-store"),
   tablespaceObjects: (id: string, tablespace: string, search: string, offset: number) => request<TablespaceObjectsPage>(`/api/connections/${id}/tablespace-objects?tablespace=${encodeURIComponent(tablespace)}&search=${encodeURIComponent(search)}&offset=${offset}`, undefined, undefined, undefined, "no-store"),
   sessions: (id: string) => request<OracleSessionsReport>(`/api/connections/${id}/sessions`, undefined, undefined, undefined, "no-store"),
+  sessionDetails: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
+    request<OracleSessionDetails>(`/api/connections/${id}/sessions/details?instance=${session.instance}&sid=${session.sid}&serial=${session.serial}`, undefined, undefined, undefined, "no-store"),
   killSession: (id: string, session: Pick<OracleSession, "instance" | "sid" | "serial">) =>
     request<{ ok: boolean }>(`/api/connections/${id}/sessions/kill`, session),
   dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),

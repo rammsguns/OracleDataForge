@@ -45,12 +45,14 @@ import PackageExport from "./PackageExport";
 import SavePackageDialog from "./SavePackageDialog";
 import CreateJobDialog from "./CreateJobDialog";
 import JobActionDialog from "./JobActionDialog";
+import DisableObjectDialog from "./DisableObjectDialog";
 
 interface SchemaGroup {
   label: string;
   kind: string;
   items: string[];
   invalid?: string[];
+  disabled?: string[];
 }
 
 interface SchemaDef {
@@ -232,6 +234,7 @@ export default function Sidebar() {
   const [savePackageConnId, setSavePackageConnId] = useState<string | null>(null);
   const [createJobConnId, setCreateJobConnId] = useState<string | null>(null);
   const [jobAction, setJobAction] = useState<{ connId: string; name: string; mode: "drop" | "copy" } | null>(null);
+  const [disableObject, setDisableObject] = useState<{ connId: string; name: string; kind: "trigger" | "job"; schema: string; groupLabel: string } | null>(null);
   const [jobRunPreview, setJobRunPreview] = useState<{ connId: string; name: string; sql: string } | null>(null);
   const [jobRunBusy, setJobRunBusy] = useState(false);
   /** id of the connection currently opening/closing its session (blocks double clicks) */
@@ -314,7 +317,7 @@ export default function Sidebar() {
             schema: {
               ...cur.schema,
               groups: cur.schema.groups.map((x) =>
-                x.label === label ? { ...x, items: g.items, invalid: g.invalid } : x
+                x.label === label ? { ...x, items: g.items, invalid: g.invalid, disabled: g.disabled } : x
               ),
             },
             rowCounts: g.rowCounts ? { ...cur.rowCounts, ...g.rowCounts } : cur.rowCounts,
@@ -407,6 +410,7 @@ export default function Sidebar() {
           // null (not an empty Set) when the group reports no validity — the icons must stay
           // neutral there, since "nothing is invalid" and "we didn't check" are different claims
           invalidSet: g.invalid ? new Set(g.invalid) : null,
+          disabledSet: new Set(g.disabled ?? []),
         }))
         // empty categories stay visible (like SQL Developer) except while searching
         .filter((g) => (objectQuery ? g.items.length > 0 : true)),
@@ -531,6 +535,9 @@ export default function Sidebar() {
       ...(isTable && canEditRows ? [{ label: "Edit data…", action: () => openRowEditor(name) }] : []),
       ...(designable ? [{ label: "Design table…", action: () => openTableDesigner(name) }] : []),
       ...(runnable ? [{ label: "Run / Test…", action: () => openRoutineRunner(name) }] : []),
+      ...(activeConn?.live && !activeConn.readOnly && activeConn.status === "connected" && fullAccess && (kind === "trigger" || kind === "job")
+        ? [{ label: "Disable…", action: () => setDisableObject({ connId: activeConn.id, name, kind, schema: browsed, groupLabel }) }]
+        : []),
       ...(activeConn?.live && kind === "job"
         ? [
             ...(!activeConn.readOnly ? [{ label: "Run now…", action: () => previewJobRun(name) }] : []),
@@ -1059,6 +1066,7 @@ export default function Sidebar() {
                 visible.map((name) => {
                   const rowCount = liveRowCounts?.[name];
                   const bad = g.invalidSet?.has(name) ?? false;
+                  const disabled = g.disabledSet.has(name);
                   const hint =
                     g.kind === "database"
                       ? name
@@ -1072,7 +1080,9 @@ export default function Sidebar() {
                       key={name}
                       className="w-full flex items-center gap-2 pl-10 pr-2.5 py-[3px] text-[12px] text-soft hover:bg-panel2 hover:text-ink font-mono transition-colors"
                       title={
-                        bad
+                        disabled
+                          ? `${hint}\nDISABLED${bad ? " — INVALID" : ""}`
+                          : bad
                           ? `${hint}\n${g.kind === "index" ? "UNUSABLE or INVALID" : "INVALID"} — the database reports this object as broken`
                           : hint
                       }
@@ -1110,12 +1120,12 @@ export default function Sidebar() {
                       {/* same icon, three states: green = the dictionary says VALID, red = INVALID
                           or UNUSABLE, muted = this group has no validity to report */}
                       <span
-                        className={bad ? "text-err" : g.invalidSet ? "text-ok" : "text-mute"}
-                        {...(bad ? { role: "img", "aria-label": "invalid" } : {})}
+                        className={disabled ? "text-mute" : bad ? "text-err" : g.invalidSet ? "text-ok" : "text-mute"}
+                        {...(disabled ? { role: "img", "aria-label": "disabled" } : bad ? { role: "img", "aria-label": "invalid" } : {})}
                       >
                         {KIND_ICON[g.kind]}
                       </span>
-                      <span className="truncate">{name}</span>
+                      <span className={`truncate${disabled ? " text-mute" : ""}`}>{name}</span>
                       {rowCount != null && <span className="ml-auto text-[10px] text-mute font-sans">{Intl.NumberFormat("en", { notation: "compact" }).format(rowCount)}</span>}
                     </button>
                   );
@@ -1149,6 +1159,8 @@ export default function Sidebar() {
       </div>
 
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {disableObject && <DisableObjectDialog key={`${disableObject.connId}:${disableObject.kind}:${disableObject.schema}:${disableObject.name}`} {...disableObject}
+        onClose={() => setDisableObject(null)} onDone={() => { void refreshGroupAsync(disableObject.connId, disableObject.groupLabel); }} />}
       {jobRunPreview && <Modal title={`Run ${jobRunPreview.name}`} onClose={() => { if (!jobRunBusy) setJobRunPreview(null); }} width={640}>
         <div className="space-y-4">
           <p className="text-[12px] text-mute">Review the SQL below. Run job starts it in the background; view its outcome in Job Run Log.</p>

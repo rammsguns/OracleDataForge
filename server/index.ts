@@ -991,6 +991,10 @@ const ORA_OBJ_TYPES = ORA_OBJ_GROUPS.map((g) => g.type);
  */
 const ORA_INVALID_OBJECTS = `SELECT object_type, object_name FROM user_objects
    WHERE status = 'INVALID' AND object_name NOT LIKE 'BIN$%'`;
+const ORA_DISABLED_SQL: Record<string, string> = {
+  trigger: "SELECT trigger_name FROM user_triggers WHERE status = 'DISABLED'",
+  job: "SELECT job_name FROM user_scheduler_jobs WHERE enabled = 'FALSE'",
+};
 const ORA_UNUSABLE_INDEXES = `SELECT index_name FROM user_indexes WHERE status = 'UNUSABLE'
    UNION SELECT index_name FROM user_ind_partitions WHERE status = 'UNUSABLE'`;
 
@@ -1097,10 +1101,12 @@ async function oraSchema(c: LiveConnection) {
       if (g.type === "INDEX") names.push(...unusableIdx);
       return [...new Set(names)];
     };
+    const disabledByKind: Record<string, string[]> = {};
+    for (const [kind, sql] of Object.entries(ORA_DISABLED_SQL)) disabledByKind[kind] = await tryList(sql);
     /** an object-type group, with the names the dictionary says are broken */
     const og = (label: string) => {
       const g = ORA_OBJ_GROUPS.find((x) => x.label === label)!;
-      return { label: g.label, kind: g.kind, items: byType(g.type), invalid: invalidFor(g) };
+      return { label: g.label, kind: g.kind, items: byType(g.type), invalid: invalidFor(g), disabled: disabledByKind[g.kind] };
     };
 
     // The dedicated-type queries are independent, so a second pooled connection runs half
@@ -1190,6 +1196,7 @@ interface SchemaGroupResult {
   kind: string;
   items: string[];
   invalid?: string[];
+  disabled?: string[];
   rowCounts?: Record<string, number>;
 }
 
@@ -1252,6 +1259,7 @@ async function oraGroup(c: LiveConnection, label: string): Promise<SchemaGroupRe
         label, kind: g.kind,
         items: rows.filter((x) => x[0] === g.type).map((x) => x[1]),
         invalid: [...invalid],
+        disabled: ORA_DISABLED_SQL[g.kind] ? await list(ORA_DISABLED_SQL[g.kind], true) : undefined,
       };
     }
     const d = ORA_DEDICATED.find((x) => x.label === label);
@@ -5740,6 +5748,61 @@ app.get("/api/connections/:id/sessions", requireFullAccess, async (req, res) => 
         resourceDetailsAvailable = false;
       }
       res.json({ sessions, scope, clientDetailsAvailable, resourceDetailsAvailable, capturedAt: new Date().toISOString() });
+    } finally { await conn.close(); }
+  } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
+});
+
+app.get("/api/connections/:id/sessions/details", requireFullAccess, async (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection" });
+  let identity: { sid: number; serial: number; instance: number };
+  try { identity = { sid: sessionIdentifier(req.query.sid), serial: sessionIdentifier(req.query.serial), instance: sessionIdentifier(req.query.instance) }; }
+  catch (error) { return res.status(400).json({ error: errMsg(error) }); }
+  try {
+    const conn = await getOraConn(c);
+    try {
+      let global = true;
+      const targetSql = (all: boolean) => `SELECT s.sql_id AS "sqlId", s.sql_child_number AS "childNumber", s.status AS "status",
+        s.event AS "event", s.wait_class AS "waitClass", s.state AS "waitState", s.wait_time_micro / 1000000 AS "waitSeconds",
+        s.blocking_instance AS "blockingInstance", s.blocking_session AS "blockingSid"
+        FROM ${all ? "gv$session" : "v$session"} s WHERE s.sid = :sid AND s.serial# = :serial
+        AND ${all ? "s.inst_id" : "TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE'))"} = :instance AND s.type = 'USER'`;
+      let target;
+      try { target = await conn.execute(targetSql(true), identity, { outFormat: oracledb.OUT_FORMAT_OBJECT }); }
+      catch (error) {
+        if (!sessionViewUnavailable(error)) throw error;
+        global = false;
+        target = await conn.execute(targetSql(false), identity, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      }
+      const session = (target.rows as Record<string, unknown>[] | undefined)?.[0];
+      if (!session) return res.status(404).json({ error: "Session ended or is unavailable on this instance." });
+      const details: Record<string, unknown> = { ...session, sqlText: null, plan: [], waits: [], capturedAt: new Date().toISOString() };
+      const prefix = global ? "gv$" : "v$";
+      const instanceWhere = global ? "AND inst_id = :instance" : "";
+      const sqlBinds = { sqlId: session.sqlId as string, child: session.childNumber as number, ...(global ? { instance: identity.instance } : {}) };
+      if (session.sqlId && session.status === "ACTIVE") {
+        try {
+          const sql = await conn.execute(`SELECT sql_fulltext AS "sqlText" FROM ${prefix}sql WHERE sql_id = :sqlId AND child_number = :child ${instanceWhere}`,
+            sqlBinds, { outFormat: oracledb.OUT_FORMAT_OBJECT, fetchInfo: { sqlText: { type: oracledb.STRING } }, maxRows: 1 });
+          details.sqlText = (sql.rows as Record<string, unknown>[] | undefined)?.[0]?.sqlText ?? null;
+        } catch (error) { details.sqlError = errMsg(error); }
+        try {
+          const plan = await conn.execute(`SELECT id AS "id", parent_id AS "parentId", depth AS "depth", operation AS "operation", options AS "options",
+            object_owner AS "owner", object_name AS "object", cost AS "cost", cardinality AS "rows", access_predicates AS "access", filter_predicates AS "filter"
+            FROM ${prefix}sql_plan WHERE sql_id = :sqlId AND child_number = :child ${instanceWhere} ORDER BY id`,
+            sqlBinds, { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 1000 });
+          details.plan = plan.rows ?? [];
+        } catch (error) { details.planError = errMsg(error); }
+      }
+      try {
+        const waits = await conn.execute(`SELECT e.event AS "event", e.wait_class AS "waitClass", e.total_waits AS "waits",
+          e.time_waited_micro / 1000000 AS "timeSeconds", CASE WHEN e.total_waits > 0 THEN e.time_waited_micro / e.total_waits / 1000 END AS "averageMs"
+          FROM ${prefix}session_event e JOIN ${prefix}session s ON s.sid = e.sid ${global ? "AND s.inst_id = e.inst_id" : ""}
+          WHERE s.sid = :sid AND s.serial# = :serial AND ${global ? "s.inst_id" : "TO_NUMBER(SYS_CONTEXT('USERENV','INSTANCE'))"} = :instance
+          ORDER BY e.time_waited_micro DESC`, identity, { outFormat: oracledb.OUT_FORMAT_OBJECT, maxRows: 100 });
+        details.waits = waits.rows ?? [];
+      } catch (error) { details.waitsError = errMsg(error); }
+      res.json(details);
     } finally { await conn.close(); }
   } catch (error) { res.status(500).json({ error: withNetworkHint(errMsg(error), c.host) }); }
 });

@@ -5,6 +5,7 @@ import { api, type OracleSession, type OracleSessionsReport } from "../utils/api
 import { sessionClient } from "../utils/sessionClient";
 import { matchesSessionColumnFilters, matchesSessionThresholds, sampleSessionRates, formatSessionValue, sessionThresholds, type SessionThresholds, sessionGridColumns as gridColumns, type SessionGridColumnKey as GridColumnKey } from "../utils/sessionGrid";
 import SessionMetrics from "./SessionMetrics";
+import SessionSqlDetails from "./SessionSqlDetails";
 import { Badge, Btn, EmptyState, inputCls, Spinner } from "./ui";
 
 const keyOf = (row: OracleSession) => `${row.instance}:${row.sid}:${row.serial}`;
@@ -166,6 +167,7 @@ export default function Sessions() {
         {selected && <aside className="w-full lg:w-1/2 xl:w-[58%] min-h-0 flex-1 lg:flex-none shrink-0 border-t lg:border-t-0 lg:border-l border-bdr overflow-auto bg-panel2" aria-label="Session performance and details">
           <div className="sticky top-0 bg-panel2 border-b border-bdr p-3 flex items-center gap-2"><h3 className="font-semibold">Session performance</h3><Badge tone={selected.status === "ACTIVE" ? "ok" : "neutral"}>{selected.status}</Badge><button className="ml-auto text-mute hover:text-ink" aria-label="Close session details" onClick={() => setSelectedKey(null)}><X size={15} /></button></div>
           <SessionMetrics session={selected} capturedAt={report.capturedAt} available={report.resourceDetailsAvailable} />
+          <SessionSqlDetails key={`${conn.id}:${keyOf(selected)}`} connId={conn.id} session={selected} capturedAt={report.capturedAt} />
           <details className="mx-4 mb-4 border border-bdr rounded-xl bg-panel">
             <summary className="p-3 cursor-pointer font-semibold">Connection & session details</summary>
           <dl className="p-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-2"><div className="contents"><dt className="text-mute">Client</dt><dd className="font-semibold">{sessionClient(selected)}</dd></div>{detailFields.map(([field, label]) => <div key={field} className="contents"><dt className="text-mute">{label}</dt><dd className="font-mono break-all">{formatSessionValue(selected[field] ?? (field.startsWith("client") || field === "program" || field === "module" ? "Not reported" : "—"))}</dd></div>)}</dl>
