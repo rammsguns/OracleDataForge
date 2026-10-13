@@ -62,7 +62,7 @@ export default function SqlWorksheet() {
     <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
-        <Btn variant="primary" onClick={() => s.runSql()} title="Run selection or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
+        <Btn variant="primary" onClick={() => s.runSql()} title="Run selected statements in order or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
           <Play size={12} fill="currentColor" />
           Run
         </Btn>

@@ -1,4 +1,4 @@
-import { worksheetStatement } from "../utils/worksheetStatement";
+import { worksheetStatement, worksheetStatements } from "../utils/worksheetStatement";
 import {
   createContext,
   useCallback,
@@ -557,7 +557,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [toast, finishTransaction, setConnStatus]);
 
   const reallyRun = useCallback(
-    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? '']) => {
+    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = []) => {
       if (worksheetBusy.current) return;
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
@@ -575,6 +575,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       worksheetBusy.current = true;
       setRunning(true);
       setPlanVisible(false);
+      let continueScript = false;
       (async () => {
         if (!transactionId && !autoCommitEnabledRef.current[conn.id] && !conn.readOnly && ['Administrator', 'Developer'].includes(accessRole)) {
           const session = await api.startWorksheetSession(conn.id);
@@ -594,7 +595,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
               body: g.body,
               confirmLabel: g.confirmLabel,
               danger: g.danger,
-              onConfirm: () => reallyRun(statement, true, conn, transactionId),
+              onConfirm: () => reallyRun(statement, true, conn, transactionId, remaining),
             });
             return;
           }
@@ -605,6 +606,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           pushHistory(statement, res.durationMs, res.rowsReturned, !res.error);
           if (res.error) toast("error", `${res.error.code}: execution failed`);
           else {
+            continueScript = true;
             toast(
               "success",
               `${res.rowsReturned} row(s) in ${res.durationMs} ms${res.truncated ? " (showing first 1,000)" : ""}`
@@ -629,31 +631,36 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           });
           toast("error", err.message);
         })
-        .finally(() => { worksheetBusy.current = false; setRunning(false); });
+        .finally(() => {
+          worksheetBusy.current = false;
+          setRunning(false);
+          if (continueScript && remaining.length) reallyRun(remaining[0], false, conn, transactionId, remaining.slice(1));
+        });
     },
     [accessRole, toast, pushHistory, setConnStatus]
   );
 
   const runSql = useCallback(
     (override?: string) => {
-      let statement = override;
-      if (statement === undefined) {
+      let statements = override === undefined ? [] : [override];
+      if (override === undefined) {
         const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
-        try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
+        try { statements = worksheetStatements(sqlRef.current, selection.start, selection.end); }
         catch (error) { toast("warning", (error as Error).message); return; }
       }
+      const statement = statements[0] ?? "";
       if (!statement.trim()) { toast("info", "Place the cursor inside a statement to run it."); return; }
       if (accessRole === "Analyst") {
         toast("warning", "Analyst access is limited to table data");
         return;
       }
-      if (accessRole === "Viewer" && !isReadOnlySql(statement)) {
+      if (accessRole === "Viewer" && statements.some(item => !isReadOnlySql(item))) {
         toast("warning", "Viewer access is read-only — only SELECT statements can run");
         return;
       }
       // read-only connection: block writes before they go anywhere (the backend enforces
       // this too — this is just instant feedback with no round trip)
-      if (statement.trim() && !isReadOnlySql(statement) && activeConnRef.current?.readOnly) {
+      if (statements.some(item => !isReadOnlySql(item)) && activeConnRef.current?.readOnly) {
         const d = destructiveCheck(statement);
         setResult({
           columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
@@ -668,7 +675,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       }
       // everything else goes to the backend unacknowledged: it runs reads, and answers
       // writes with a confirmation for the dialog above (see reallyRun)
-      reallyRun(statement);
+      reallyRun(statement, false, activeConnRef.current, undefined, statements.slice(1));
     },
     [accessRole, reallyRun, toast]
   );

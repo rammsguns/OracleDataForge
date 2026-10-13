@@ -41,6 +41,7 @@ import { NEW_TABLE_SENTINEL } from "../utils/tableDdl";
 import { download, toCsv, toJson } from "../utils/sql";
 import { Btn, ContextMenu, Modal, Spinner } from "./ui";
 import type { MenuItem } from "../types";
+import PackageSyncDialog from "./PackageSyncDialog";
 import PackageExport from "./PackageExport";
 import SavePackageDialog from "./SavePackageDialog";
 import CreateJobDialog from "./CreateJobDialog";
@@ -213,7 +214,7 @@ const STATUS_DOT: Record<string, string> = {
  *  collapsed (App.tsx swaps it for a rail), and re-querying the whole catalog just because the
  *  user reclaimed some editor width would be a pointless round trip — on a large schema, a slow
  *  one. Invalidation is unchanged: `schemaBump` (DDL, connect/disconnect, edited connection)
- *  and the Refresh button both clear it. */
+ *  refresh loaded trees; disconnected connections are removed. */
 const schemaCache: Record<string, LiveSchemaState> = {};
 /** the `schemaBump` the cache was filled at (the store starts at 0) */
 let cachedBump = 0;
@@ -230,6 +231,7 @@ export default function Sidebar() {
   /** how many items each group is currently rendering (see GROUP_PAGE) */
   const [shown, setShown] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const [packageSync, setPackageSync] = useState<{ connId: string; name: string; groupLabel: string } | null>(null);
   const [packageExport, setPackageExport] = useState<{ object: string; spec: string; body: string | null } | null>(null);
   const [savePackageConnId, setSavePackageConnId] = useState<string | null>(null);
   const [createJobConnId, setCreateJobConnId] = useState<string | null>(null);
@@ -384,15 +386,42 @@ export default function Sidebar() {
       onConfirm: disconnectAll,
     });
 
-  // successful DDL or an edited connection bumps this counter — drop all cached schemas.
-  // Compared against the module-level `cachedBump` rather than "> 0": this effect also runs on
-  // every *mount*, and the panel now mounts again each time it is expanded, so a plain
-  // "bump > 0" would wipe the cache on expand and discard the loaded catalog.
+  // DDL and compilation refresh already loaded catalogs without hiding their trees.
+  // Keep expanded groups and pagination in place while dictionary reads finish.
+  // Disconnected/removed connections still lose their cached schema.
   useEffect(() => {
-    if (s.schemaBump !== cachedBump) {
-      cachedBump = s.schemaBump;
-      setLiveSchemas({});
+    if (s.schemaBump === cachedBump) return;
+    cachedBump = s.schemaBump;
+    const connected = new Set(s.connections.filter(c => c.live && c.status === "connected").map(c => c.id));
+    const loaded = Object.entries(liveSchemas).filter(([id, state]) => connected.has(id) && state.status === "ready");
+    for (const id of Object.keys(schemaCache)) if (!connected.has(id)) delete schemaCache[id];
+    setLiveSchemas(current => Object.fromEntries(Object.entries(current).filter(([id]) => connected.has(id))));
+    let cancelled = false;
+    for (const [id] of loaded) {
+      void api.schema(id).then(r => {
+        if (cancelled) return;
+        setLiveSchemas(current => {
+          if (current[id]?.status !== "ready") return current;
+          return { ...current, [id]: {
+            status: "ready",
+            schema: {
+              schemaName: r.schemaName,
+              groups: [
+                { label: "Tables", kind: "table", items: r.tables.map(t => t.name), invalid: r.invalidTables },
+                { label: "Views", kind: "view", items: r.views, invalid: r.invalidViews },
+                ...(r.extras ?? []),
+              ],
+            },
+            rowCounts: Object.fromEntries(r.tables.map(t => [t.name, t.rowCount])),
+          } };
+        });
+      }).catch((e: Error) => {
+        if (!cancelled) s.toast("warning", `Could not refresh schema — ${e.message}. Use Refresh to retry.`);
+      });
     }
+    return () => { cancelled = true; };
+    // Refresh once per invalidation; catalog updates must not restart the requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.schemaBump]);
 
   const liveState = activeConn?.live ? liveSchemas[activeConn.id] : undefined;
@@ -553,6 +582,9 @@ export default function Sidebar() {
         : []),
       { label: "Edit…", action: () => (designable ? openTableDesigner(name) : openObjectEditor(name, kind)) },
       { label: "Inspect DDL", action: () => openObjectEditor(name, kind) },
+      ...(activeConn?.live && activeConn.status === "connected" && !activeConn.readOnly && fullAccess && kind === "package"
+        ? [{ label: "Package Sync — Sync Spec…", action: () => setPackageSync({ connId: activeConn.id, name, groupLabel }) }]
+        : []),
       ...(activeConn?.live && kind === "package"
         ? [{ label: "Save package code…", action: () => void savePackage(activeConn.id, name) }]
         : []),
@@ -1177,6 +1209,7 @@ export default function Sidebar() {
         onClose={() => setJobAction(null)} onDone={() => { void refreshGroupAsync(jobAction.connId, "Scheduler"); }} />}
       {createJobConnId && <CreateJobDialog key={createJobConnId} connId={createJobConnId} onClose={() => setCreateJobConnId(null)}
         onCreated={() => { setOpenGroups((groups) => ({ ...groups, Scheduler: true })); void refreshGroupAsync(createJobConnId, "Scheduler"); }} />}
+      {packageSync && <PackageSyncDialog {...packageSync} onClose={() => setPackageSync(null)} onDone={() => { s.refreshGroups([packageSync.groupLabel]); s.bumpSchema(); }} />}
       {packageExport && <PackageExport {...packageExport} sourceDescription="saved database source" onClose={() => setPackageExport(null)} />}
       {savePackageConnId && <SavePackageDialog key={savePackageConnId} connId={savePackageConnId} onClose={() => setSavePackageConnId(null)} />}
     </div>
