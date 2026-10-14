@@ -4892,6 +4892,38 @@ app.get("/api/connections", (_req, res) => {
   res.json({ connections });
 });
 
+/** Reveal a saved Oracle password only after a fresh workspace Administrator check.
+ *  The request body is never logged and the secret is returned for this request only. */
+app.post("/api/connections/:id/password/reveal", async (req, res) => {
+  const connection = registry.get(routeId(req));
+  if (!connection) return res.status(404).json({ error: "Unknown connection." });
+  const cooldown = authCooldownRemaining(req.ip ?? "");
+  if (cooldown > 0) {
+    res.setHeader("Retry-After", String(Math.ceil(cooldown / 1000)));
+    return res.status(429).json({ error: "Too many failed Administrator checks. Try again shortly." });
+  }
+
+  const username = String(req.body?.username ?? "").trim();
+  const password = String(req.body?.password ?? "");
+  const tokenLogin = username.toLowerCase() === "dataforge" && !!AUTH_TOKEN;
+  let authenticated = false;
+  if (tokenLogin) {
+    const supplied = Buffer.from(password, "utf8");
+    const expected = Buffer.from(AUTH_TOKEN, "utf8");
+    authenticated = supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  } else {
+    const user = users.get(username.toLowerCase());
+    const activeAdmin = user?.status === "Active" && user.role === "Administrator";
+    const credential = activeAdmin ? user : DUMMY_CREDENTIAL;
+    authenticated = await verifyPassword(password, credential.salt, credential.hash) && !!activeAdmin;
+  }
+  if (!authenticated) {
+    recordAuthFailure(req.ip ?? "", username);
+    return res.status(403).json({ error: "Administrator authentication failed." });
+  }
+  return res.json({ password: connection.password });
+});
+
 /* ---------------- Uploading an Oracle Cloud wallet ------------------------------------
  * The wallet zip is the whole endpoint definition for an Autonomous Database: host, port,
  * service names and the certificate to present, all inside the file Oracle Cloud hands you.

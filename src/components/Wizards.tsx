@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Download, FileSpreadsheet, KeyRound, Loader2, PlugZap, Server, ShieldAlert, XCircle } from "lucide-react";
+import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, Cloud, Download, Eye, EyeOff, FileSpreadsheet, KeyRound, Loader2, PlugZap, Server, ShieldAlert, XCircle } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, CONNECTION_ROLES, type AuthMode, type ConnectionRole, type ImportPreview, type ImportRequest, type ImportResult, type WalletService } from "../utils/api";
 import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/importData";
@@ -18,6 +18,12 @@ export function ConnectionWizard() {
   const [port, setPort] = useState(editing?.port ?? 1521);
   const [user, setUser] = useState(editing && editing.user !== "—" ? editing.user : "");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [authPromptOpen, setAuthPromptOpen] = useState(false);
+  const [adminUsername, setAdminUsername] = useState("");
+  const [adminPassword, setAdminPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
   // SQL Developer's "Role": the privilege sessions open with. Not a credential — it changes
   // what the same username is allowed to do once it is in.
   const [role, setRole] = useState<ConnectionRole>(editing?.role ?? "default");
@@ -47,6 +53,24 @@ export function ConnectionWizard() {
   // The backend gives SYS SYSDBA whether or not it was asked for (SYS cannot connect any
   // other way), so the summary names the role the session will really open with.
   const effectiveRole = role === "default" && user.trim().toLowerCase() === "sys" ? "SYSDBA" : role;
+
+  const revealSavedPassword = async () => {
+    if (!editing?.live) return;
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const result = await api.revealConnectionPassword(editing.id, adminUsername, adminPassword);
+      setPassword(result.password);
+      setShowPassword(true);
+      setAdminPassword("");
+      setAdminUsername("");
+      setAuthPromptOpen(false);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Administrator authentication failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   // Editing a wallet connection: the alias list lives in the wallet on the server, so it is
   // read back rather than remembered in the browser. A wallet deleted underneath the
@@ -198,7 +222,8 @@ export function ConnectionWizard() {
 
   const stepLabels = ["Oracle connection", "Verify & save"];
   return (
-    <Modal title={editing ? `Edit connection — ${editing.name}` : "New database connection"} onClose={close} width={620}>
+    <>
+    <Modal title={editing ? `Edit connection — ${editing.name}` : "New database connection"} onClose={() => authPromptOpen ? setAuthPromptOpen(false) : close()} width={620}>
       {/* steps indicator */}
       <ol className="flex items-center gap-2 mb-5 text-[11px]" aria-label="Wizard progress">
         {stepLabels.map((label, i) => {
@@ -334,7 +359,24 @@ export function ConnectionWizard() {
                 backend refuses to replay it at a different server/port/user (see S3 in the
                 security pass), so the hint has to say when blank still works. */}
             <Field label="Password" hint={editing?.live ? "Leave blank to keep the saved password — required again if you change the server, port or user" : undefined}>
-              <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
+              <div className="relative">
+                <input className={`${inputCls} pr-9`} type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
+                <button
+                  type="button"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  title={showPassword ? "Hide password" : editing?.live && !password ? "Authenticate as Administrator to show saved password" : "Show password"}
+                  className="absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-mute hover:text-accenthi hover:bg-panel3"
+                  onClick={() => {
+                    if (showPassword) setShowPassword(false);
+                    else if (editing?.live && !password) {
+                      setAuthPromptOpen(true);
+                      setAuthError("");
+                    } else setShowPassword(true);
+                  }}
+                >
+                  {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
             </Field>
             {/* SQL Developer's Role dropdown, same list and same default. A tested connection
                 is no evidence for a different privilege, so changing it clears the result. */}
@@ -479,6 +521,23 @@ export function ConnectionWizard() {
         )}
       </div>
     </Modal>
+    {authPromptOpen && <Modal title="Administrator authentication" onClose={() => { if (!authBusy) { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); } }} width={420}>
+      <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); void revealSavedPassword(); }}>
+        <p className="text-[12px] text-mute">Enter an active workspace Administrator account and password to show this saved Oracle password.</p>
+        <Field label="Administrator email or username">
+          <input className={inputCls} autoComplete="username" value={adminUsername} onChange={(e) => setAdminUsername(e.target.value)} autoFocus />
+        </Field>
+        <Field label="Administrator password">
+          <input className={inputCls} type="password" autoComplete="current-password" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} />
+        </Field>
+        {authError && <p className="text-[11.5px] text-err" role="alert">{authError}</p>}
+        <div className="flex justify-end gap-2">
+          <Btn variant="outline" disabled={authBusy} onClick={() => { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); }}>Cancel</Btn>
+          <Btn variant="primary" disabled={authBusy || !adminUsername || !adminPassword} onClick={() => void revealSavedPassword()}>{authBusy ? "Checking…" : "Authenticate and show"}</Btn>
+        </div>
+      </form>
+    </Modal>}
+    </>
   );
 }
 
