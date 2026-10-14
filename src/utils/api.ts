@@ -936,6 +936,9 @@ export const api = {
   /** Saved connections from the backend registry (metadata only) — lets a browser that has
    *  never seen them rehydrate its list instead of showing "No connections yet". */
   list: () => request<{ connections: StoredConnection[] }>("/api/connections"),
+  /** Reveal one saved Oracle password after fresh Administrator authentication. */
+  revealConnectionPassword: (id: string, username: string, password: string) =>
+    request<{ password: string }>(`/api/connections/${id}/password/reveal`, { username, password }),
   test: (cfg: LiveConnConfig) => request<TestResult>("/api/connections/test", cfg),
   /** test an existing connection — empty password means "use the stored one" */
   testExisting: (id: string, cfg: LiveConnConfig) => request<TestResult>(`/api/connections/${id}/test`, cfg),
