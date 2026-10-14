@@ -61,6 +61,8 @@ export interface TableDef {
 export type CellValue = string | number | null;
 
 export interface ResultSet {
+  dbmsOutput?: string[];
+  dbmsOutputTruncated?: boolean;
   columns: string[];
   rows: CellValue[][];
   durationMs: number;

@@ -18,6 +18,12 @@ function mask(sql: string): string {
   }
   return chars.join('');
 }
+
+/** SQL*Plus client directive; output capture is already enabled by the app. */
+export function isServerOutputOn(sql: string): boolean {
+  return /^\s*SET\s+SERVEROUTPUT\s+ON(?:\s+SIZE\s+(?:UNLIMITED|\d+))?(?:\s+FORMAT\s+(?:WRAPPED|WORD_WRAPPED|TRUNCATED))?\s*;?\s*$/i.test(mask(sql));
+}
+
 export function statementRanges(sql: string) {
   const code = mask(sql);
   const ranges: { start: number; end: number }[] = [];
@@ -25,6 +31,15 @@ export function statementRanges(sql: string) {
   while (start < code.length) {
     while (start < code.length && /[\s;]/.test(code[start])) start++;
     if (start >= code.length) break;
+    // SET commands end at the newline, without needing a SQL semicolon. Only
+    // recognize them at statement boundaries, never inside stored PL/SQL.
+    const lineEnd = code.indexOf('\n', start);
+    const directiveEnd = lineEnd < 0 ? code.length : lineEnd;
+    if (isServerOutputOn(sql.slice(start, directiveEnd))) {
+      ranges.push({ start, end: directiveEnd });
+      start = directiveEnd;
+      continue;
+    }
     // Stored PL/SQL and anonymous blocks use SQL*Plus's standalone slash delimiter.
     const block = /^(?:begin\b|declare\b|create\s+(?:or\s+replace\s+)?(?:(?:non)?editionable\s+)?(?:procedure|function|package|trigger|type)\b|with\s+(?:function|procedure)\b)/i.test(code.slice(start));
     const slash = /^[ \t]*\/[ \t]*\r?$/gm;

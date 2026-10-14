@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, CircleAlert, Download, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, Search } from "lucide-react";
+import { CheckCircle2, CircleAlert, Copy, Download, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, RefreshCw, Search } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, type ObjectSource } from "../utils/api";
 import CodeEditor, { type CodeEditorHandle } from "./CodeEditor";
@@ -95,11 +95,55 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   const [loaded, setLoaded] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [compiling, setCompiling] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const mounted = useRef(false);
   const [panel, setPanel] = useState<ResultPanel | null>(null);
   const [activeErr, setActiveErr] = useState<{ part: "spec" | "body"; line: number } | null>(null);
   /** index of the error row whose hint is expanded (two errors can share a line) */
   const [hintIdx, setHintIdx] = useState<number | null>(null);
   const editorRef = useRef<CodeEditorHandle>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  const copyErrors = async () => {
+    if (!panel || panel.kind === "success") return;
+    const report = panel.kind === "exec"
+      ? `${object} (${panel.part}) — Statement failed\nLine ${panel.line}: ${panel.message}`
+      : `${object} — ${panel.label}\n${panel.errors.map((e) =>
+        `${e.attribute} (${e.part}) ${e.displayLine}:${e.displayCol}: ${e.text}`
+      ).join("\n")}`;
+    try {
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(report);
+          copied = true;
+        } catch { /* Try selection-based copying when clipboard access is denied. */ }
+      }
+      if (!copied) {
+        // HTTP access from another device may not expose the Clipboard API.
+        const focused = document.activeElement;
+        const field = document.createElement("textarea");
+        field.value = report;
+        field.style.cssText = "position:fixed;left:-9999px;top:0";
+        document.body.appendChild(field);
+        try {
+          field.select();
+          copied = document.execCommand("copy");
+        } finally {
+          field.remove();
+          if (focused instanceof HTMLElement) focused.focus({ preventScroll: true });
+        }
+      }
+      if (!copied) throw new Error("Clipboard access is unavailable.");
+      s.toast("success", "Compilation errors copied");
+    } catch {
+      s.toast("error", "Could not copy compilation errors. Check your browser clipboard permissions.");
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -127,6 +171,45 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   const dirtySpec = loaded && spec !== orig.spec;
   const dirtyBody = loaded && body !== orig.body;
   const dirty = dirtySpec || dirtyBody;
+  const reloadSource = async () => {
+    if (compiling || refreshing) return;
+    setRefreshing(true);
+    try {
+      const fresh = await api.source(connId, object);
+      if (!mounted.current) return;
+      if (fresh.error || !fresh.source) throw new Error(fresh.error || "The object has no readable source.");
+      const nextSpec = fresh.source;
+      const nextBody = fresh.bodySource ?? "";
+      const nextPart = fresh.bodySource != null ? part : "spec";
+      setSrc(fresh);
+      setSpec(nextSpec);
+      setBody(nextBody);
+      setOrig({ spec: nextSpec, body: nextBody });
+      setPartState(nextPart);
+      setEdits(memKey, { spec: nextSpec, body: nextBody, part: nextPart });
+      setPanel(null);
+      setActiveErr(null);
+      setHintIdx(null);
+      s.toast("success", `${object} source refreshed from the database`);
+    } catch (e) {
+      if (mounted.current) s.toast("error", `Refresh failed: ${(e as Error).message}`);
+    } finally {
+      if (mounted.current) setRefreshing(false);
+    }
+  };
+  const refreshSource = () => {
+    if (compiling || refreshing) return;
+    if (dirty) {
+      s.askConfirm({
+        title: `Refresh ${object} source?`,
+        body: "Reload the current source from the database and discard your unsaved edits. For packages and types, both specification and body will be refreshed.",
+        confirmLabel: "Discard edits & refresh",
+        onConfirm: () => { void reloadSource(); },
+      });
+    } else {
+      void reloadSource();
+    }
+  };
   useEffect(() => {
     setTabDirty(tabId, dirty);
   }, [setTabDirty, tabId, dirty]);
@@ -160,7 +243,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
    *  then ALTER … COMPILE to read the fresh status + user_errors.
    *  Both calls are acknowledged (`true`) because the dialog in `compile` already named them. */
   const runCompile = async (parts: ("spec" | "body")[]) => {
-    if (!type || compiling) return;
+    if (!type || compiling || refreshing) return;
     setCompiling(true);
     setPanel(null);
     setActiveErr(null);
@@ -229,7 +312,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
 
   /** Compiling overwrites the object that is live in the database — name it before running it. */
   const compile = (parts: ("spec" | "body")[]) => {
-    if (!type || compiling) return;
+    if (!type || compiling || refreshing) return;
     const what =
       parts.length > 1 ? `${type} ${object} (spec and body)` : parts[0] === "body" ? `${type} BODY ${object}` : `${type} ${object}`;
     s.askConfirm({
@@ -276,6 +359,10 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             <Search size={15} />
           </Btn>
           <ToolbarSep />
+          <Btn variant="outline" className="mx-2" onClick={refreshSource} disabled={!loaded || compiling || refreshing} title="Refresh source from the database">
+            <RefreshCw size={15} className={refreshing ? "df-spin" : undefined} /> Refresh
+          </Btn>
+          <ToolbarSep />
           {type === "PACKAGE" && loaded && (
             <>
               <Btn variant="toolbar" onClick={() => setExportOpen(true)} title="Export package specification and body">
@@ -287,7 +374,8 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
           {canWrite && !systemObject && (type === "PROCEDURE" || type === "FUNCTION" || type === "PACKAGE") && (
             <>
               <Btn
-                variant="toolbar"
+                variant="outline"
+                className="mx-2"
                 onClick={() => s.openTab("run", `${object} (Run)`, object)}
                 title={`Run ${object} with parameter values`}
               >
@@ -297,7 +385,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             </>
           )}
           {editable && hasParts && hasBody && (
-            <Btn variant="toolbar" onClick={() => compile(["spec", "body"])} disabled={compiling} title="Compile specification, then body">
+            <Btn variant="toolbar" onClick={() => compile(["spec", "body"])} disabled={compiling || refreshing} title="Compile specification, then body">
               {compiling ? <Loader2 size={15} className="df-spin" /> : <Package size={15} />}
             </Btn>
           )}
@@ -305,7 +393,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             <Btn
               variant="toolbar"
               onClick={() => compile([showingBody ? "body" : "spec"])}
-              disabled={compiling || !loaded}
+              disabled={compiling || refreshing || !loaded}
               title={
                 compiling
                   ? "Compiling…"
@@ -371,7 +459,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
             ref={editorRef}
             value={text}
             onChange={onEdit}
-            readOnly={!editable}
+            readOnly={!editable || refreshing}
             errorLine={activeErr && activeErr.part === (showingBody ? "body" : "spec") ? activeErr.line : null}
             onCompile={editable ? () => compile([showingBody ? "body" : "spec"]) : undefined}
             ariaLabel={`${effType ?? "Object"} ${object} source`}
@@ -416,6 +504,9 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
                     <span className="text-mute">(line {panel.line})</span>
                   </span>
                 </button>
+                <Btn variant="outline" onClick={() => void copyErrors()} title="Copy the full compilation error">
+                  <Copy size={12} /> Copy
+                </Btn>
               </div>
               <ErrorHint text={panel.message} />
             </div>
@@ -424,6 +515,9 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
               <div className="flex items-center gap-2 px-4 pt-2.5 pb-1.5 text-[12.5px] text-err font-semibold sticky top-0 bg-panel">
                 <CircleAlert size={14} /> {panel.errors.length} problem(s) — {panel.label}
                 <span className="text-mute text-[11px] font-normal ml-1">at {panel.at}</span>
+                <Btn variant="outline" className="ml-auto" onClick={() => void copyErrors()} title="Copy all compilation errors and warnings">
+                  <Copy size={12} /> Copy
+                </Btn>
               </div>
               <ul>
                 {panel.errors.map((e, i) => {

@@ -162,7 +162,7 @@ export default function Workspace() {
           </div>
         ))}
         {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>
-        {active.kind === "worksheet" && <SqlWorksheet />}
+        {active.kind === "worksheet" && <SqlWorksheet key={active.id} />}
         {active.kind === "data" && <DataBrowser table={active.payload!} />}
         {active.kind === "run" && <RoutineRunner key={active.id} routine={active.payload!} />}
         {active.kind === "tabledesign" && <TableDesigner key={active.id} table={active.payload!} tabId={active.id} />}

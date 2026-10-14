@@ -810,6 +810,7 @@ export function ConfirmDialog() {
         <Btn variant="ghost" onClick={s.closeConfirm}>Cancel</Btn>
         <Btn
           variant={c.danger ? "danger" : "primary"}
+          autoFocus
           onClick={() => {
             c.onConfirm();
             s.closeConfirm();

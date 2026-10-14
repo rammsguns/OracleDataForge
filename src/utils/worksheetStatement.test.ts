@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { worksheetStatement, worksheetStatements, statementRanges } from './worksheetStatement';
+import { isServerOutputOn, worksheetStatement, worksheetStatements, statementRanges } from './worksheetStatement';
 test('runs either query from the reported worksheet', () => {
   const sql = '-- worksheet\n-- Ctrl+Enter\nSELECT * FROM categories;\nSELECT * FROM customers;';
   assert.equal(worksheetStatement(sql, sql.indexOf('categories')), 'SELECT * FROM categories;');
@@ -41,4 +41,31 @@ test('selected scripts split SQL and standalone slashes without repeating statem
 test('selected scripts preserve PL/SQL blocks and literal delimiters', () => {
   const sql = "BEGIN NULL; END;\n/\nSELECT ';' FROM dual;";
   assert.deepEqual(worksheetStatements(sql, 0, sql.length), ['BEGIN NULL; END;', "SELECT ';' FROM dual;"]);
+});
+
+test('SERVEROUTPUT directives are separate from the following PL/SQL block', () => {
+  const block = "BEGIN\n DBMS_OUTPUT.PUT_LINE('hello');\nEND;";
+  const sql = `-- heading\nSET SERVEROUTPUT ON\n${block}\n/\nSELECT 1 FROM dual;`;
+  const statements = worksheetStatements(sql, 0, sql.length);
+  assert.deepEqual(statements, ['SET SERVEROUTPUT ON', block, 'SELECT 1 FROM dual;']);
+  assert.deepEqual(statements.filter(statement => !isServerOutputOn(statement)), [block, 'SELECT 1 FROM dual;']);
+  assert.equal(worksheetStatement(sql, sql.indexOf('PUT_LINE')), block);
+});
+
+test('SERVEROUTPUT supports SQL*Plus size and format options and CRLF', () => {
+  for (const directive of ['set serveroutput on;', 'SET SERVEROUTPUT ON SIZE UNLIMITED', 'SET SERVEROUTPUT ON SIZE 100000 FORMAT WRAPPED', 'SET SERVEROUTPUT ON -- display output']) {
+    const script = directive + '\r\nBEGIN NULL; END;\r\n/';
+    const statements = worksheetStatements(script, 0, script.length);
+    assert.equal(statements.length, 2);
+    assert.equal(isServerOutputOn(statements[0]), true);
+    assert.equal(statements[1], 'BEGIN NULL; END;');
+  }
+  assert.equal(isServerOutputOn('SET SERVEROUTPUT ON invalid'), false);
+});
+
+test('SERVEROUTPUT text in comments, literals and blocks stays untouched', () => {
+  const block = "BEGIN\n DBMS_OUTPUT.PUT_LINE(q'[\nSET SERVEROUTPUT ON\n]');\nEND;";
+  assert.deepEqual(worksheetStatements(block, 0, block.length), [block]);
+  assert.equal(isServerOutputOn("SELECT 'SET SERVEROUTPUT ON' FROM dual;"), false);
+  assert.equal(isServerOutputOn('-- SET SERVEROUTPUT ON'), false);
 });

@@ -3,6 +3,7 @@ import express from "express";
 import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies } from './tableDataCopy.ts';
 import { tableDataSelection } from '../src/utils/tableDataDependencies.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
+import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
 import { selectManagementQueries } from "./dbaManagement.ts";
@@ -155,7 +156,7 @@ interface LiveConnection extends ConnConfig {
   oracleMaintained?: boolean;
 }
 
-interface QueryOutcome {
+interface QueryOutcome extends Partial<DbmsOutput> {
   columns: string[];
   rows: (string | number | null)[][];
   rowsReturned: number;
@@ -2949,13 +2950,14 @@ setInterval(() => { void worksheetSessions.expire(); }, 60_000).unref();
 async function oraQuery(c: LiveConnection, sql: string, session?: oracledb.Connection): Promise<QueryOutcome> {
   const conn = session ?? await getOraConn(c);
   try {
-    const result = await conn.execute(oraPrepare(sql), [], {
+    const { result, ...output } = await withDbmsOutput(conn, () => conn.execute(oraPrepare(sql), [], {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
       maxRows: MAX_ROWS + 1,
       autoCommit: !session,
-    });
+    }));
     if (result.rows) {
       return {
+        ...output,
         columns: (result.metaData ?? []).map((m) => m.name),
         rows: (result.rows as unknown[][]).slice(0, MAX_ROWS).map((r) => r.map(mapVal)),
         rowsReturned: result.rows.length > MAX_ROWS ? MAX_ROWS : result.rows.length,
@@ -2964,6 +2966,7 @@ async function oraQuery(c: LiveConnection, sql: string, session?: oracledb.Conne
     }
     const affected = result.rowsAffected ?? 0;
     return {
+      ...output,
       columns: ["RESULT"],
       rows: [[`${affected} row(s) affected`]],
       rowsReturned: affected,
@@ -6749,7 +6752,6 @@ interface RoutineRunBody {
 }
 
 const ROUTINE_CURSOR_MAX = 100;
-const ROUTINE_OUTPUT_MAX_LINES = 1000;
 const ROUTINE_BLOCK_MAX = 64_000;
 const ROUTINE_BLOCK_MAX_BINDS = 32;
 
@@ -6892,22 +6894,6 @@ interface RoutineRunResult {
   dbmsOutput: string[];
   dbmsOutputTruncated?: boolean;
   error: { message: string; code: string; helpUrl?: string } | null;
-}
-
-/** DBMS_OUTPUT is session state — this must run on the SAME connection as the call, and the
- *  buffer still holds whatever was printed before an error, so it is read even after one. */
-async function readDbmsOutput(conn: oracledb.Connection): Promise<{ lines: string[]; truncated: boolean }> {
-  try {
-    const o = await conn.execute(`BEGIN DBMS_OUTPUT.GET_LINES(:lines, :n); END;`, {
-      lines: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 32767, maxArraySize: ROUTINE_OUTPUT_MAX_LINES },
-      n: { dir: oracledb.BIND_INOUT, type: oracledb.NUMBER, val: ROUTINE_OUTPUT_MAX_LINES },
-    });
-    const ob = o.outBinds as { lines?: (string | null)[]; n?: number };
-    const nLines = Number(ob.n ?? 0);
-    return { lines: (ob.lines ?? []).slice(0, nLines).map((l) => l ?? ""), truncated: nLines >= ROUTINE_OUTPUT_MAX_LINES };
-  } catch {
-    return { lines: [], truncated: false }; // output buffer unavailable — not fatal
-  }
 }
 
 /** Drain one REF CURSOR bind into a grid; one row past the cap makes truncation detectable. */
@@ -7639,7 +7625,7 @@ app.post("/api/connections/:id/query", async (req, res) => {
     }
     res.json({ ...out, durationMs: Date.now() - started, error: null, versioned });
   } catch (e) {
-    const err = e as { code?: string; errorNum?: number };
+    const err = e as { code?: string; errorNum?: number } & Partial<DbmsOutput>;
     const code = err.errorNum ? `ORA-${String(err.errorNum).padStart(5, "0")}` : err.code ?? "SQL-ERROR";
     if (queryAudit && !querySucceeded) {
       try { appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "failed-or-unknown", errorCode: code }); }
@@ -7651,6 +7637,8 @@ app.post("/api/connections/:id/query", async (req, res) => {
       columns: [], rows: [],
       durationMs: Date.now() - started,
       rowsReturned: 0,
+      dbmsOutput: err.dbmsOutput ?? [],
+      dbmsOutputTruncated: err.dbmsOutputTruncated,
       error: {
         message,
         line: oraErrorLine(e, sql),
