@@ -6,6 +6,7 @@ type BtnBaseProps = {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
+  autoFocus?: boolean;
   className?: string;
 };
 
@@ -25,6 +26,7 @@ export function Btn({
   variant = "ghost",
   title,
   disabled,
+  autoFocus,
   className = "",
   "aria-label": ariaLabel,
 }: BtnProps) {
@@ -50,6 +52,8 @@ export function Btn({
       title={title}
       aria-label={ariaLabel ?? title}
       disabled={disabled}
+      autoFocus={autoFocus}
+      data-dialog-autofocus={autoFocus || undefined}
     >
       {children}
     </button>
@@ -101,7 +105,8 @@ export function Modal({ title, onClose, children, width = 560 }: { title: string
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCloseRef.current();
     window.addEventListener("keydown", onKey);
-    ref.current?.focus();
+    const initialFocus = ref.current?.querySelector<HTMLElement>("[data-dialog-autofocus]");
+    (initialFocus ?? ref.current)?.focus();
     return () => window.removeEventListener("keydown", onKey);
   }, []);
   return (

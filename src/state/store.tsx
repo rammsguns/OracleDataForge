@@ -1,4 +1,4 @@
-import { worksheetStatement, worksheetStatements } from "../utils/worksheetStatement";
+import { isServerOutputOn, worksheetStatement, worksheetStatements } from "../utils/worksheetStatement";
 import {
   createContext,
   useCallback,
@@ -253,7 +253,19 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [activeConnId, setActiveConnId] = useState(() => loadStoredConnections()[0]?.id ?? "");
   const [tabs, setTabs] = useState<Tab[]>(BASE_TABS);
   const [activeTabId, setActiveTabId] = useState("t1");
-  const [sql, setSql] = useState(INITIAL_SQL);
+  const [worksheetSql, setWorksheetSql] = useState<Record<string, string>>({ t1: INITIAL_SQL });
+  const worksheetId = tabs.find((tab) => tab.id === activeTabId && tab.kind === "worksheet")?.id
+    ?? tabs.find((tab) => tab.kind === "worksheet")?.id ?? "t1";
+  const worksheetIdRef = useRef(worksheetId);
+  worksheetIdRef.current = worksheetId;
+  const sql = worksheetSql[worksheetId] ?? "";
+  const setSql = useCallback((next: string | ((previous: string) => string)) => {
+    const id = worksheetIdRef.current;
+    setWorksheetSql((previous) => ({
+      ...previous,
+      [id]: typeof next === "function" ? next(previous[id] ?? "") : next,
+    }));
+  }, []);
   const [running, setRunning] = useState(false);
   const [transactions, setTransactions] = useState<Record<string, string>>(() => {
     try {
@@ -422,6 +434,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [accessRole, toast]);
 
   const doCloseTab = useCallback((id: string) => {
+    setWorksheetSql((previous) => {
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    });
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.id === id);
       const next = prev.filter((t) => t.id !== id);
@@ -557,7 +574,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [toast, finishTransaction, setConnStatus]);
 
   const reallyRun = useCallback(
-    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = []) => {
+    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false) => {
       if (worksheetBusy.current) return;
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
@@ -576,6 +593,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setRunning(true);
       setPlanVisible(false);
       let continueScript = false;
+      let scriptOutput = previousOutput;
+      let outputTruncated = previousTruncated;
       (async () => {
         if (!transactionId && !autoCommitEnabledRef.current[conn.id] && !conn.readOnly && ['Administrator', 'Developer'].includes(accessRole)) {
           const session = await api.startWorksheetSession(conn.id);
@@ -595,11 +614,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
               body: g.body,
               confirmLabel: g.confirmLabel,
               danger: g.danger,
-              onConfirm: () => reallyRun(statement, true, conn, transactionId, remaining),
+              onConfirm: () => reallyRun(statement, true, conn, transactionId, remaining, previousOutput, previousTruncated),
             });
             return;
           }
-          setResult({ ...res, statement });
+          const combinedOutput = [...previousOutput, ...(res.dbmsOutput ?? [])];
+          scriptOutput = combinedOutput.slice(0, 1000);
+          outputTruncated = previousTruncated || !!res.dbmsOutputTruncated || combinedOutput.length > 1000;
+          setResult({ ...res, statement, dbmsOutput: scriptOutput, dbmsOutputTruncated: outputTruncated });
           // the statement reached the database, so a session is open again —
           // running a query is the one implicit way a connection gets connected
           setConnStatus(conn.id, "connected");
@@ -634,7 +656,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         .finally(() => {
           worksheetBusy.current = false;
           setRunning(false);
-          if (continueScript && remaining.length) reallyRun(remaining[0], false, conn, transactionId, remaining.slice(1));
+          if (continueScript && remaining.length) reallyRun(remaining[0], false, conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated);
         });
     },
     [accessRole, toast, pushHistory, setConnStatus]
@@ -648,6 +670,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         try { statements = worksheetStatements(sqlRef.current, selection.start, selection.end); }
         catch (error) { toast("warning", (error as Error).message); return; }
       }
+      const outputEnabled = statements.some(isServerOutputOn);
+      statements = statements.filter(item => !isServerOutputOn(item));
+      if (outputEnabled) toast("info", "DBMS_OUTPUT enabled — messages appear in the DBMS Output tab");
+      if (outputEnabled && statements.length === 0) return;
       const statement = statements[0] ?? "";
       if (!statement.trim()) { toast("info", "Place the cursor inside a statement to run it."); return; }
       if (accessRole === "Analyst") {
@@ -722,8 +748,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const insertSql = useCallback(
     (nextSql: string) => {
-      setSql(nextSql);
-      setActiveTabId((current) => tabs.find((tab) => tab.kind === "worksheet")?.id ?? current);
+      const target = tabs.find((tab) => tab.kind === "worksheet");
+      if (target) {
+        setWorksheetSql((previous) => ({ ...previous, [target.id]: nextSql }));
+        setActiveTabId(target.id);
+      }
       toast("info", "SQL inserted into worksheet — review before running");
     },
     [tabs, toast]

@@ -24,7 +24,7 @@ export default function SqlWorksheet() {
   const s = useStudio();
   const [expanded, setExpanded] = useState(false);
   const [editorPct, setEditorPct] = useState(46);
-  const [view, setView] = useState<"results" | "plan">("results");
+  const [view, setView] = useState<"results" | "plan" | "output">("results");
   const dragRef = useRef<HTMLDivElement>(null);
   const connectionInitialized = useRef(false);
   useEffect(() => {
@@ -146,7 +146,7 @@ export default function SqlWorksheet() {
         {/* results area */}
         <div className="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col bg-panel">
           <div className="flex items-center gap-0.5 border-b border-bdrsoft px-2 pt-1 shrink-0">
-            {(["results", "plan"] as const).map((v) => (
+            {(["results", "plan", "output"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setView(v)}
@@ -156,7 +156,7 @@ export default function SqlWorksheet() {
                 aria-selected={view === v}
                 role="tab"
               >
-                {v === "results" ? "Query Result" : "Explain Plan"}
+                {v === "results" ? "Query Result" : v === "plan" ? "Explain Plan" : `DBMS Output${s.result?.dbmsOutput?.length ? ` (${s.result.dbmsOutput.length})` : ""}`}
               </button>
             ))}
             <button type="button" className="ml-2 flex items-center gap-1 rounded px-2 py-1 text-[11px] hover:bg-panel3" onClick={() => setExpanded((v) => !v)} aria-label={expanded ? "Restore editor" : "Expand results"} title={expanded ? "Restore editor" : "Expand results"}>
@@ -192,6 +192,13 @@ export default function SqlWorksheet() {
               </div>
             ) : view === "plan" ? (
               <ExplainPlan />
+            ) : view === "output" ? (
+              <div className="h-full overflow-auto p-4">
+                {s.result?.dbmsOutputTruncated && <p className="text-[11.5px] text-warn mb-2">Output truncated to the first 1,000 lines.</p>}
+                {s.result?.dbmsOutput?.length ? (
+                  <pre className="font-mono text-[12px] text-ink whitespace-pre-wrap break-words select-text">{s.result.dbmsOutput.join("\n")}</pre>
+                ) : <p className="text-[12px] text-mute">DBMS_OUTPUT is enabled automatically. Run code containing DBMS_OUTPUT.PUT_LINE(...) to see messages here.</p>}
+              </div>
             ) : !s.result ? (
               <EmptyState
                 icon={<Terminal />}
