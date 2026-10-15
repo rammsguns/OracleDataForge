@@ -90,6 +90,8 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
   const [memberKey, setMemberKey] = useState<string | null>(mem?.memberKey ?? null);
   const [argStates, setArgStates] = useState<Record<string, Record<string, ArgState>>>(mem?.values ?? {});
   const [running, setRunning] = useState(false);
+  const [parameterWidth, setParameterWidth] = useState(480);
+  const [parameterHeight, setParameterHeight] = useState(28);
   const [result, setResult] = useState<RoutineRunResult | null>(mem?.result ?? null);
   const [showBlock, setShowBlock] = useState(false);
   const [mode, setMode] = useState<"form" | "block">(mem?.mode ?? "form");
@@ -399,10 +401,24 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
         {/* parameters */}
         {recordReturn && <p className="text-[12px] text-soft">Record return supported: Run test will display {member.returnFields!.map(f => f.name).join(', ')} as separate output values.</p>}
         <fieldset disabled={running} className="border border-bdrsoft rounded-md">
-          <header className="flex items-center gap-2 px-3 py-2 border-b border-bdrsoft">
+          <header className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-bdrsoft">
             <span className="text-[11px] font-bold uppercase tracking-wider text-mute">
               Parameters{member.kind === "FUNCTION" && member.returnType ? ` · returns ${member.returnType}` : ""}
             </span>
+            <label className="flex items-center gap-2 text-[11px] text-mute">
+              Textbox width
+              <input type="range" min={160} max={1200} step={20} value={parameterWidth}
+                aria-label="Parameter textbox width"
+                onChange={e => setParameterWidth(Number(e.target.value))} />
+              <span>{parameterWidth}px</span>
+            </label>
+            <label className="flex items-center gap-2 text-[11px] text-mute">
+              Textbox height
+              <input type="range" min={28} max={400} step={4} value={parameterHeight}
+                aria-label="Parameter textbox height"
+                onChange={e => setParameterHeight(Number(e.target.value))} />
+              <span>{parameterHeight}px</span>
+            </label>
             {mode === "block" && (
               <span className="text-[11px] text-mute">
                 {blockDirty ? "the block was edited — these values no longer drive it" : "these values fill the block below"}
@@ -441,16 +457,17 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
                       </td>
                       <td className="px-2 py-1">
                         {isInput(p) ? (
-                          <div><input
+                          <div><textarea
                             aria-invalid={mode === 'form' && !!inputErrors[p.name]}
                             aria-describedby={mode === 'form' && inputErrors[p.name] ? `input-error-${p.position}` : undefined}
-                            list={p.bindKind === 'boolean' ? 'routine-booleans' : undefined}
+                            rows={1}
                             value={a.value}
                             disabled={disabled}
                             placeholder={p.dataType === 'CHAR' ? 'e.g. Y or NULL' : p.bindKind ? PLACEHOLDER[p.bindKind] ?? "NULL" : mode === "block" ? "PL/SQL expression" : "—"}
                             aria-label={`Value for ${p.name}`}
                             onChange={(e) => setArg(p, { value: e.target.value, isNull: false, useDefault: false })}
-                            className={`${inputCls} font-mono !h-7 disabled:opacity-40 ${mode === 'form' && inputErrors[p.name] ? '!border-warn' : ''}`}
+                            style={{ width: parameterWidth, height: parameterHeight }}
+                            className={`${inputCls} font-mono min-h-7 min-w-40 resize overflow-auto py-1 disabled:opacity-40 ${mode === 'form' && inputErrors[p.name] ? '!border-warn' : ''}`}
                           />
                           {mode === 'form' && inputErrors[p.name] && <p id={`input-error-${p.position}`} className="text-warn text-[11px] mt-1">{inputErrors[p.name]}</p>}
                           {p.bindKind === 'string' && !a.isNull && !a.useDefault && <p className="text-mute text-[10px] mt-1">Enter text without quotes. Empty text becomes NULL in Oracle.</p>}
@@ -475,7 +492,6 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
             </p>
           )}
         </fieldset>
-        <datalist id="routine-booleans"><option value="true" /><option value="false" /></datalist>
         {mode === 'form' && member.kind === 'FUNCTION' && member.returnBindKind && member.returnBindKind !== 'cursor' && (
           <fieldset disabled={running} className="border border-bdrsoft rounded-md p-3 space-y-2 text-[12px]">
             <label className="flex items-center gap-2"><input type="checkbox" checked={expectation.enabled} onChange={e => setExpectation(prev => ({ ...prev, enabled: e.target.checked }))} /> Check expected return value</label>
