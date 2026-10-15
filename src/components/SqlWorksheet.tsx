@@ -10,6 +10,7 @@ import {
   ListTree,
   Play,
   Rows3,
+  RefreshCw,
   Save,
   Terminal,
 } from "lucide-react";
@@ -22,6 +23,24 @@ import { download } from "../utils/sql";
 
 export default function SqlWorksheet() {
   const s = useStudio();
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectingRef = useRef(false);
+  const activeConnection = s.connections.find((c) => c.id === s.activeConnId);
+  const worksheetBusy = s.running || s.transactionBusy || reconnecting;
+  const runSql = () => {
+    if (!reconnectingRef.current) s.runSql();
+  };
+  const reconnect = async () => {
+    if (reconnectingRef.current || s.running || s.transactionBusy || !activeConnection?.live) return;
+    reconnectingRef.current = true;
+    setReconnecting(true);
+    try {
+      await s.reconnectConn(activeConnection.id);
+    } finally {
+      reconnectingRef.current = false;
+      setReconnecting(false);
+    }
+  };
   const [expanded, setExpanded] = useState(false);
   const [editorPct, setEditorPct] = useState(46);
   const [view, setView] = useState<"results" | "plan" | "output">("results");
@@ -62,12 +81,13 @@ export default function SqlWorksheet() {
     <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
       {/* worksheet toolbar */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
-        <Btn variant="primary" onClick={() => s.runSql()} title="Run selected statements in order or statement at cursor (Ctrl+Enter)" disabled={s.running || s.transactionBusy}>
+        <Btn variant="primary" onClick={runSql} title="Run selected statements in order or statement at cursor (Ctrl+Enter)" disabled={worksheetBusy}>
           <Play size={12} fill="currentColor" />
           Run
         </Btn>
         <Btn
           variant="outline"
+          disabled={worksheetBusy}
           onClick={() => {
             setView("plan");
             s.setPlanVisible(true);
@@ -92,7 +112,7 @@ export default function SqlWorksheet() {
             aria-label="Worksheet connection"
             title="Connection used for worksheet SQL and transactions"
             value={s.activeConnId}
-            disabled={s.running || s.transactionBusy || !s.connections.length}
+            disabled={worksheetBusy || !s.connections.length}
             onChange={(e) => {
               connectionInitialized.current = true;
               s.setActiveConnId(e.target.value);
@@ -102,6 +122,15 @@ export default function SqlWorksheet() {
             {!s.connections.some((c) => c.id === s.activeConnId) && <option value="">Select connection</option>}
             {s.connections.map((c) => <option key={c.id} value={c.id}>{c.name}{c.status === "connected" ? " (connected)" : ""}</option>)}
           </select>
+          <Btn
+            variant="outline"
+            onClick={reconnect}
+            disabled={worksheetBusy || !activeConnection?.live}
+            title="Reconnect the selected connection. Uncommitted changes will be rolled back; your worksheet SQL is kept."
+          >
+            {reconnecting ? <Spinner /> : <RefreshCw size={13} />}
+            {reconnecting ? "Reconnecting…" : "Reconnect"}
+          </Btn>
         </div>
         <div className="ml-auto hidden md:flex items-center gap-2 text-[11.5px] text-mute">
           <kbd className="hidden md:inline">Ctrl</kbd>
@@ -111,11 +140,11 @@ export default function SqlWorksheet() {
       </div>
       <div className="flex flex-wrap items-center gap-2 px-3 py-1 border-b border-bdrsoft text-[12px]">
         <button type="button" role="switch" aria-checked={s.autoCommit} onClick={s.toggleAutoCommit}
-          disabled={s.running || s.transactionBusy || !s.activeConnId || !['Administrator', 'Developer'].includes(s.accessRole) || s.connections.find(c => c.id === s.activeConnId)?.readOnly}
+          disabled={worksheetBusy || !s.activeConnId || !['Administrator', 'Developer'].includes(s.accessRole) || activeConnection?.readOnly}
           className="rounded border border-bdr px-2 py-1 hover:bg-panel3 disabled:opacity-50">Auto-commit: {s.autoCommit ? 'On' : 'Off'}</button>
         {!s.autoCommit && <>
-          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('COMMIT')}>Commit</Btn>
-          <Btn variant="outline" disabled={s.running || s.transactionBusy} onClick={() => s.finishTransaction('ROLLBACK')}>Rollback</Btn>
+          <Btn variant="outline" disabled={worksheetBusy} onClick={() => s.finishTransaction('COMMIT')}>Commit</Btn>
+          <Btn variant="outline" disabled={worksheetBusy} onClick={() => s.finishTransaction('ROLLBACK')}>Rollback</Btn>
         </>}
         <span className="text-mute">Shared with table edits · DDL commits implicitly; explicit COMMIT still applies.</span>
         {!s.autoCommit && <span className="text-warn">Manual sessions roll back on disconnect or after 30 minutes idle.</span>}
@@ -124,7 +153,7 @@ export default function SqlWorksheet() {
       {/* editor */}
       <div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
         <div hidden={expanded} style={{ height: `${editorPct}%` }} className="min-h-24 min-w-0 shrink-0 overflow-hidden">
-          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={() => s.runSql()} />
+          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={runSql} />
         </div>
 
         {/* splitter */}
