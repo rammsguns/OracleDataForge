@@ -1,5 +1,6 @@
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import express from "express";
+import { describeTarget, describeRows } from './worksheetDescribe.ts';
 import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies } from './tableDataCopy.ts';
 import { tableDataSelection } from '../src/utils/tableDataDependencies.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
@@ -157,6 +158,7 @@ interface LiveConnection extends ConnConfig {
 }
 
 interface QueryOutcome extends Partial<DbmsOutput> {
+  resultKind?: "describe";
   columns: string[];
   rows: (string | number | null)[][];
   rowsReturned: number;
@@ -2950,6 +2952,14 @@ setInterval(() => { void worksheetSessions.expire(); }, 60_000).unref();
 async function oraQuery(c: LiveConnection, sql: string, session?: oracledb.Connection): Promise<QueryOutcome> {
   const conn = session ?? await getOraConn(c);
   try {
+    const target = describeTarget(sql);
+    if (target) {
+      // Parsing a SELECT resolves schema names and synonyms in the worksheet's own
+      // session without fetching table data or committing a pending transaction.
+      const info = await conn.getStatementInfo(`SELECT * FROM ${target} WHERE 1 = 0`);
+      const rows = describeRows(info.metaData ?? []);
+      return { resultKind: 'describe', columns: ['Name', 'Null?', 'Type'], rows, rowsReturned: rows.length };
+    }
     const { result, ...output } = await withDbmsOutput(conn, () => conn.execute(oraPrepare(sql), [], {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
       maxRows: MAX_ROWS + 1,

@@ -406,6 +406,7 @@ export interface GuardConfirmation {
 }
 
 export interface LiveQueryResult {
+  resultKind?: "describe";
   dbmsOutput?: string[];
   dbmsOutputTruncated?: boolean;
   columns: string[];
