@@ -29,6 +29,7 @@ export default function ResultsGrid({
   exportName = "results",
   dense,
   truncated,
+  paginate = true,
 }: {
   columns: string[];
   rows: CellValue[][];
@@ -36,6 +37,8 @@ export default function ResultsGrid({
   dense?: boolean;
   /** the server stopped at its row cap — say so permanently, not just in a toast */
   truncated?: boolean;
+  /** Describe results show the complete column list in one scrollable view. */
+  paginate?: boolean;
 }) {
   const gridRef = useRef<HTMLDivElement>(null);
   const [columnSearch, setColumnSearch] = useState("");
@@ -71,7 +74,8 @@ export default function ResultsGrid({
   }, [rows, filter, sort]);
 
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE));
-  const pageRows = filtered.slice(page * PAGE, page * PAGE + PAGE);
+  const pageRows = paginate ? filtered.slice(page * PAGE, page * PAGE + PAGE) : filtered;
+  const rowOffset = paginate ? page * PAGE : 0;
   const visCols = columns.map((c, i) => ({ name: c, i })).filter((c) => !hidden.has(c.i)).sort((a, b) => Number(pinned.has(b.i)) - Number(pinned.has(a.i)));
   const columnWidth = (i: number) => widths[i] ?? Math.min(260, Math.max(140, columns[i].length * 8 + 60));
   const columnStyle = (i: number) => pinned.has(i) ? { position: "sticky" as const, left: 48 + visCols.slice(0, visCols.findIndex((c) => c.i === i)).reduce((n, c) => n + columnWidth(c.i), 0), zIndex: 2 } : {};
@@ -178,7 +182,7 @@ export default function ResultsGrid({
           <tbody>
             {pageRows.map((r, ri) => (
               <tr key={ri} className="hover:bg-accentdim/60 group">
-                <td style={{ position: "sticky", left: 0, zIndex: 3 }} className="border-b border-r border-bdrsoft px-2 text-[10px] text-mute bg-panel"><button className="underline hover:text-accent" title="Open row details" aria-label={`View details for row ${page * PAGE + ri + 1}`} onClick={() => setRowDetail(r)}>{page * PAGE + ri + 1}</button></td>
+                <td style={{ position: "sticky", left: 0, zIndex: 3 }} className="border-b border-r border-bdrsoft px-2 text-[10px] text-mute bg-panel"><button className="underline hover:text-accent" title="Open row details" aria-label={`View details for row ${rowOffset + ri + 1}`} onClick={() => setRowDetail(r)}>{rowOffset + ri + 1}</button></td>
                 {visCols.map(({ i }) => {
                   const raw = cellText(r[i]);
                   const long = raw.length > CELL_CLIP;
@@ -246,7 +250,7 @@ export default function ResultsGrid({
             </span>
           )}
         </span>
-        <div className="ml-auto flex items-center gap-1">
+        {paginate && <div className="ml-auto flex items-center gap-1">
           <button
             className="p-1 rounded hover:bg-panel3 disabled:opacity-30"
             disabled={page === 0}
@@ -266,7 +270,7 @@ export default function ResultsGrid({
           >
             <ChevronRight size={14} />
           </button>
-        </div>
+        </div>}
       </div>
 
       {rowDetail && (

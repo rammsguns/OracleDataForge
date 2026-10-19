@@ -191,6 +191,18 @@ export default function SqlWorksheet() {
             <button type="button" className="ml-2 flex items-center gap-1 rounded px-2 py-1 text-[11px] hover:bg-panel3" onClick={() => setExpanded((v) => !v)} aria-label={expanded ? "Restore editor" : "Expand results"} title={expanded ? "Restore editor" : "Expand results"}>
               {expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}<span className="hidden sm:inline">{expanded ? "Restore" : "Expand"}</span>
             </button>
+            {view === "results" && s.result && (
+              <Btn
+                variant="outline"
+                title="Rerun the statement shown in the query result"
+                disabled={worksheetBusy || !activeConnection?.live || !s.result.statement.trim()}
+                onClick={() => {
+                  if (!reconnectingRef.current && s.result?.statement) s.runSql(s.result.statement);
+                }}
+              >
+                <RefreshCw size={12} className={s.running ? "animate-spin" : ""} /> Refresh
+              </Btn>
+            )}
             {/* execution details */}
             {s.result && !s.running && (
               <div className="ml-auto flex items-center gap-3 pr-2 pb-1 text-[11.5px] text-soft">
@@ -260,7 +272,7 @@ export default function SqlWorksheet() {
                 </div>
               </div>
             ) : (
-              <ResultsGrid columns={s.result.columns} rows={s.result.rows} exportName="query-results" truncated={s.result.truncated} />
+              <ResultsGrid columns={s.result.columns} rows={s.result.rows} exportName="query-results" truncated={s.result.truncated} paginate={s.result.resultKind !== "describe"} />
             )}
           </div>
         </div>
