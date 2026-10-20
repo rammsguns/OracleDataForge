@@ -174,7 +174,7 @@ export default function DataBrowser({ table }: { table: string }) {
             </div>
           </div>
         ) : liveData ? (
-          <ResultsGrid columns={liveData.columns} rows={liveData.rows} exportName={table.toLowerCase()} dense truncated={liveData.truncated} />
+          <ResultsGrid columns={liveData.columns} rows={liveData.rows} exportName={table.toLowerCase()} exportTable={table} dense truncated={liveData.truncated} />
         ) : (
           <EmptyState icon={<Table2 />} title="No data" hint={`${table} returned no rows.`} />
         )}

@@ -89,6 +89,27 @@ export function toJson(columns: string[], rows: CellValue[][]): string {
   return JSON.stringify(rows.map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i]]))), null, 2);
 }
 
+/** Export raw result values, independently of grid pagination and formatting. */
+export function toInserts(columns: string[], rows: CellValue[][], table: string): string {
+  // Accept a table or schema.table, including SQL quoted identifiers.
+  const identifier = '(?:"(?:[^"\\r\\n]|"")+"|[A-Za-z_][A-Za-z0-9_$#]*)';
+  if (!new RegExp(`^${identifier}(?:\\s*\\.\\s*${identifier})?$`).test(table.trim())) {
+    throw new Error('Enter a table name or schema.table (use double quotes for special names).');
+  }
+  const quote = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  const literal = (value: CellValue) => {
+    if (value === null) return "NULL";
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) throw new Error("Cannot export a non-finite number as SQL.");
+      return String(value);
+    }
+    return `'${value.replace(/'/g, "''")}'`;
+  };
+  const target = table.trim();
+  const names = columns.map(quote).join(", ");
+  return rows.map((row) => `INSERT INTO ${target} (${names}) VALUES (${columns.map((_, i) => literal(row[i] ?? null)).join(", ")});`).join("\n") + "\n";
+}
+
 export function download(filename: string, content: string, mime = "text/plain") {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
