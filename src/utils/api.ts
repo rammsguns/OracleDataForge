@@ -665,6 +665,7 @@ export interface ObjectCopyResult {
 }
 
 export interface ObjectSource {
+  properties?: { owner: string; type: string; status: string; created: string | null; lastDdlTime: string | null; objectId: number }[];
   name: string;
   type: string | null;
   source: string | null;
