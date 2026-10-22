@@ -114,6 +114,7 @@ interface Store {
 
   /** place generated or restored SQL into the active worksheet without executing it */
   insertSql: (sql: string) => void;
+  openSqlWorksheet: (sql: string, title: string) => void;
 
   toasts: Toast[];
   toast: (kind: Toast["kind"], text: string) => void;
@@ -810,6 +811,16 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       .finally(() => setPlanLoading(false));
   }, [toast, setConnStatus]);
 
+  const openSqlWorksheet = useCallback((nextSql: string, title: string) => {
+    if (!["Administrator", "Developer", "Viewer"].includes(accessRole)) {
+      throw new Error("Your role does not have access to worksheets.");
+    }
+    const id = `t${tabSeq++}`;
+    setWorksheetSql((previous) => ({ ...previous, [id]: nextSql }));
+    setTabs((previous) => [...previous, { id, kind: "worksheet", title }]);
+    setActiveTabId(id);
+  }, [accessRole]);
+
   const insertSql = useCallback(
     (nextSql: string) => {
       const target = tabs.find((tab) => tab.kind === "worksheet");
@@ -994,6 +1005,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       toggleFavorite,
       clearHistory,
       insertSql,
+      openSqlWorksheet,
       toasts,
       toast,
       dismissToast,
@@ -1014,7 +1026,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

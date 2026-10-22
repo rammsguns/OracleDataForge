@@ -1,3 +1,4 @@
+import { useStudio } from "../state/store";
 import HorizontalScrollbar from "./HorizontalScrollbar";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -9,18 +10,17 @@ import {
   Copy,
   Download,
   Filter,
+  ExternalLink,
   Maximize2,
   Pin,
 } from "lucide-react";
 import type { CellValue } from "../types";
-import { download, toCsv, toJson } from "../utils/sql";
+import { download, toCsv, toJson, toInserts } from "../utils/sql";
 import { Btn, Modal } from "./ui";
 
 const PAGE = 10;
 
-/** Longer than this and the cell is shown clipped, with the full value one click away.
- *  Without a cap a single wide value (a 23ai VECTOR, a long CLOB) stretches the table
- *  to tens of thousands of pixels and every other column becomes unreachable. */
+/** Long values keep a detail button even when the column is resized. */
 const CELL_CLIP = 140;
 
 export default function ResultsGrid({
@@ -28,6 +28,7 @@ export default function ResultsGrid({
   rows,
   exportName = "results",
   dense,
+  exportTable,
   truncated,
   paginate = true,
 }: {
@@ -35,11 +36,16 @@ export default function ResultsGrid({
   rows: CellValue[][];
   exportName?: string;
   dense?: boolean;
+  exportTable?: string;
   /** the server stopped at its row cap — say so permanently, not just in a toast */
   truncated?: boolean;
   /** Describe results show the complete column list in one scrollable view. */
   paginate?: boolean;
 }) {
+  const studio = useStudio();
+  const [insertOpen, setInsertOpen] = useState(false);
+  const [insertTable, setInsertTable] = useState("");
+  const [insertError, setInsertError] = useState("");
   const gridRef = useRef<HTMLDivElement>(null);
   const [columnSearch, setColumnSearch] = useState("");
   const [widths, setWidths] = useState<Record<number, number>>({});
@@ -88,10 +94,29 @@ export default function ResultsGrid({
     return v;
   };
 
-  /** Values past CELL_CLIP are clipped in place and get an expand affordance — the row
-   *  stays readable and the other columns stay reachable. Export is unaffected: CSV/JSON
-   *  are built from `filtered`, never from what the cell renders. */
+  // Keep the complete value in the cell so resizing can reveal it in full.
   const cellText = (v: CellValue) => (v === null ? "" : String(v));
+  const fitColumns = (indices: number[]) => {
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return;
+    const table = gridRef.current?.querySelector("table");
+    context.font = table ? getComputedStyle(table).font : "12px monospace";
+    const fitted: Record<number, number> = {};
+    for (const i of indices) {
+      // Include every returned row, regardless of pagination or the current filter.
+      let width = context.measureText(columns[i]).width + 76;
+      for (const row of rows) {
+        const value = row[i];
+        const text = value === null ? "(null)" : typeof value === "number"
+          ? (Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))
+          : String(value);
+        width = Math.max(width, context.measureText(text).width + 52);
+      }
+      fitted[i] = Math.max(90, Math.ceil(width));
+    }
+    setWidths((previous) => ({ ...previous, ...fitted }));
+  };
+
 
   return (
     <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
@@ -143,7 +168,13 @@ export default function ResultsGrid({
             </div>
           )}
         </div>
+        <Btn variant="outline" title="Fit visible columns to the longest value across all returned rows" onClick={() => fitColumns(visCols.map(({ i }) => i))}>
+          <Columns3 size={12} /> Fit columns
+        </Btn>
         <div className="ml-auto flex items-center gap-1.5">
+          <Btn variant="outline" title="Export all returned rows as INSERT statements" disabled={!rows.length || !columns.length} onClick={() => { setInsertTable(exportTable ?? ""); setInsertError(""); setInsertOpen(true); }}>
+            <Download size={12} /> INSERT
+          </Btn>
           <Btn variant="outline" title="Export as CSV" onClick={() => download(`${exportName}.csv`, toCsv(columns, filtered), "text/csv")}>
             <Download size={12} /> CSV
           </Btn>
@@ -172,7 +203,7 @@ export default function ResultsGrid({
                   <div className="relative flex items-center gap-1">
                     <button type="button" title={pinned.has(i) ? `Unpin ${name}` : `Pin ${name}`} aria-label={pinned.has(i) ? `Unpin ${name}` : `Pin ${name}`} aria-pressed={pinned.has(i)} onClick={(e) => { e.stopPropagation(); setPinned((prev) => { const next = new Set(prev); if (next.has(i)) next.delete(i); else next.add(i); return next; }); }} className={pinned.has(i) ? "text-accent shrink-0" : "text-mute shrink-0"}><Pin size={11} /></button>
                     <span className="truncate" title={name}>{name}</span>
-                    <div role="separator" aria-orientation="vertical" aria-label={`Resize ${name}`} tabIndex={0} onClick={(e) => e.stopPropagation()} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setWidths((prev) => ({ ...prev, [i]: Math.max(90, Math.min(600, columnWidth(i) + (e.key === "ArrowRight" ? 20 : -20))) })); } }} onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (e.currentTarget.hasPointerCapture(e.pointerId)) { const th = e.currentTarget.closest("th")!; setWidths((prev) => ({ ...prev, [i]: Math.max(90, Math.min(600, e.clientX - th.getBoundingClientRect().left)) })); } }} className="absolute -right-2.5 top-0 bottom-0 w-2 cursor-col-resize touch-none hover:bg-accent" />
+                    <div role="separator" aria-orientation="vertical" aria-label={`Resize ${name}`} title="Drag to resize; double-click or press Enter to fit contents" tabIndex={0} onDoubleClick={(e) => { e.stopPropagation(); fitColumns([i]); }} onClick={(e) => e.stopPropagation()} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); fitColumns([i]); } if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setWidths((prev) => ({ ...prev, [i]: Math.max(90, columnWidth(i) + (e.key === "ArrowRight" ? 20 : -20)) })); } }} onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (e.currentTarget.hasPointerCapture(e.pointerId)) { const th = e.currentTarget.closest("th")!; setWidths((prev) => ({ ...prev, [i]: Math.max(90, e.clientX - th.getBoundingClientRect().left) })); } }} className="absolute -right-2.5 top-0 bottom-0 w-2 cursor-col-resize touch-none hover:bg-accent" />
                     {sort?.col === i && (sort.dir === 1 ? <ArrowUp size={11} className="text-accent" /> : <ArrowDown size={11} className="text-accent" />)}
                   </div>
                 </th>
@@ -192,11 +223,11 @@ export default function ResultsGrid({
                       style={columnStyle(i)}
                       title={raw}
                       onDoubleClick={() => { setCopied(false); setDetail({ column: columns[i], value: raw }); }}
-                      className={`border-b border-r border-bdrsoft px-2.5 bg-panel whitespace-nowrap text-ink max-w-[26rem] overflow-hidden text-ellipsis ${dense ? "py-0.5" : "py-1"}`}
+                      className={`border-b border-r border-bdrsoft px-2.5 bg-panel whitespace-nowrap text-ink overflow-hidden text-ellipsis ${dense ? "py-0.5" : "py-1"}`}
                     >
                       {long ? (
                         <span className="inline-flex items-center gap-1.5 max-w-full">
-                          <span className="overflow-hidden text-ellipsis">{raw.slice(0, CELL_CLIP)}…</span>
+                          <span className="overflow-hidden text-ellipsis">{raw}</span>
                           <button
                             type="button"
                             onClick={() => {
@@ -273,6 +304,63 @@ export default function ResultsGrid({
         </div>}
       </div>
 
+      {insertOpen && (
+        <Modal title="Export INSERT statements" onClose={() => setInsertOpen(false)} width={480}>
+          <div className="p-4 space-y-3">
+            <label className="block text-[12px]">Destination table
+              <input autoFocus aria-label="Destination table" placeholder="SCHEMA.TABLE_NAME" value={insertTable} onChange={(e) => setInsertTable(e.target.value)} className="mt-1 w-full rounded border border-bdr bg-panel2 px-2 py-1 font-mono" />
+            </label>
+            <p className="text-[12px] text-mute">Exports all {rows.length.toLocaleString()} returned rows and all columns, including rows hidden by the filter.</p>
+            {truncated && <p className="text-[12px] text-warn">The result was truncated by the server. Only the returned rows can be exported.</p>}
+            <p className="text-[12px] text-mute">Text values are quoted as text. Date and other typed columns may need conversion before running the script.</p>
+            {insertError && <p role="alert" className="text-[12px] text-warn">{insertError}</p>}
+            <div className="flex gap-2 flex-wrap">
+            <Btn variant="outline" onClick={async () => {
+              try {
+                const sql = toInserts(columns, rows, insertTable);
+                let copied = false;
+                try {
+                  if (navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(sql);
+                    copied = true;
+                  }
+                } catch { /* Try the selection-based fallback for LAN HTTP access. */ }
+                if (!copied) {
+                  const field = document.createElement("textarea");
+                  field.value = sql;
+                  field.style.cssText = "position:fixed;left:-9999px;top:0";
+                  const focused = document.activeElement;
+                  document.body.appendChild(field);
+                  try {
+                    field.select();
+                    copied = document.execCommand("copy");
+                  } finally {
+                    field.remove();
+                    if (focused instanceof HTMLElement) focused.focus();
+                  }
+                }
+                if (!copied) throw new Error("Clipboard access was blocked. Use Download SQL or open in a worksheet to copy the script.");
+                setInsertError("");
+                studio.toast("success", "INSERT statements copied to clipboard");
+              } catch (error) { setInsertError(error instanceof Error ? error.message : "Could not copy to clipboard."); }
+            }}><Copy size={12} /> Copy</Btn>
+            <Btn variant="outline" disabled={!["Administrator", "Developer", "Viewer"].includes(studio.accessRole)} onClick={() => {
+              try {
+                studio.openSqlWorksheet(toInserts(columns, rows, insertTable), "INSERT export");
+                setInsertOpen(false);
+              } catch (error) { setInsertError(error instanceof Error ? error.message : "Could not open worksheet."); }
+            }}><ExternalLink size={12} /> Open in new worksheet</Btn>
+            <Btn variant="outline" onClick={() => {
+              try {
+                const sql = toInserts(columns, rows, insertTable);
+                download(`${exportName}.sql`, sql, "application/sql");
+                setInsertOpen(false);
+              } catch (error) { setInsertError(error instanceof Error ? error.message : "Export failed."); }
+            }}> <Download size={12} /> Download SQL</Btn>
+            </div>
+          </div>
+        </Modal>
+      )}
       {rowDetail && (
         <Modal title="Row details" onClose={() => setRowDetail(null)} width={760}>
           <div className="p-4 max-h-[65vh] overflow-auto">
