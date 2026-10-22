@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, CircleAlert, Copy, Download, FileCode2, Hammer, Lightbulb, Loader2, Package, PenLine, Play, RefreshCw, Search } from "lucide-react";
+import { CheckCircle2, CircleAlert, Copy, Download, FileCode2, Hammer, Info, Lightbulb, Loader2, Package, PenLine, Play, RefreshCw, Search } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, type ObjectSource } from "../utils/api";
 import CodeEditor, { type CodeEditorHandle } from "./CodeEditor";
 import { editKey, getEdits, setEdits } from "../utils/editBuffers";
 import { hintForError } from "../utils/plsqlHints";
-import { Btn, Badge, Spinner, ToolbarSep } from "./ui";
+import { Btn, Badge, Spinner, ToolbarSep, Modal } from "./ui";
 import PackageExport from "./PackageExport";
 
 /** Oracle code types editable + compilable in place (BODY variants are reached via the SPEC/BODY toggle). */
@@ -94,6 +94,20 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   const [orig, setOrig] = useState({ spec: "", body: "" });
   const [loaded, setLoaded] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
+  const [propertiesLoading, setPropertiesLoading] = useState(false);
+  const [propertiesError, setPropertiesError] = useState<string | null>(null);
+  const [properties, setProperties] = useState<ObjectSource["properties"]>();
+  const loadProperties = async () => {
+    setPropertiesLoading(true);
+    setPropertiesError(null);
+    try {
+      const fresh = await api.source(connId, object);
+      if (fresh.error) throw new Error(fresh.error);
+      setProperties(fresh.properties);
+    } catch (e) { setPropertiesError((e as Error).message); }
+    finally { setPropertiesLoading(false); }
+  };
   const [compiling, setCompiling] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const mounted = useRef(false);
@@ -362,6 +376,9 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
           <Btn variant="outline" className="mx-2" onClick={refreshSource} disabled={!loaded || compiling || refreshing} title="Refresh source from the database">
             <RefreshCw size={15} className={refreshing ? "df-spin" : undefined} /> Refresh
           </Btn>
+          <Btn variant="outline" onClick={() => { setPropertiesOpen(true); void loadProperties(); }} disabled={!loaded} title="View object properties">
+            <Info size={15} /> Properties
+          </Btn>
           <ToolbarSep />
           {type === "PACKAGE" && loaded && (
             <>
@@ -557,6 +574,30 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
         </div>
       )}
 
+      {propertiesOpen && (
+        <Modal title={`Properties — ${object}`} onClose={() => setPropertiesOpen(false)} width={680}>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-[11.5px] text-mute">Database local time. Last DDL change includes recompilation and other DDL operations.</p>
+              <Btn variant="outline" disabled={propertiesLoading} onClick={() => void loadProperties()}><RefreshCw size={13} /> Refresh</Btn>
+            </div>
+            {propertiesLoading ? <Spinner label="Reading object properties…" /> : propertiesError ? (
+              <p role="alert" className="text-[12px] text-err">{propertiesError}</p>
+            ) : properties?.length ? properties.map((item) => (
+              <section key={item.type} className="border border-bdr rounded-lg p-3">
+                <div className="flex items-center gap-2 mb-3"><span className="text-[12px] font-semibold">{item.type}</span><Badge tone={item.status === "VALID" ? "ok" : "err"}>{item.status}</Badge></div>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-[12px]">
+                  <dt className="text-mute">Owner</dt><dd className="font-mono break-all">{item.owner}</dd>
+                  <dt className="text-mute">Name</dt><dd className="font-mono break-all">{object}</dd>
+                  <dt className="text-mute">Object ID</dt><dd>{item.objectId}</dd>
+                  <dt className="text-mute">Created</dt><dd>{item.created ?? "Unavailable"}</dd>
+                  <dt className="text-mute">Last DDL change</dt><dd>{item.lastDdlTime ?? "Unavailable"}</dd>
+                </dl>
+              </section>
+            )) : <p className="text-[12px] text-mute">No object properties are available.</p>}
+          </div>
+        </Modal>
+      )}
       {exportOpen && (
         <PackageExport object={object} spec={spec} body={hasBody ? body : null} dirty={dirty} onClose={() => setExportOpen(false)} />
       )}

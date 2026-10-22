@@ -62,6 +62,9 @@ interface Store {
   activeConnId: string;
   setActiveConnId: (id: string) => void;
 
+  reopenWorksheets: boolean;
+  setReopenWorksheets: (enabled: boolean) => void;
+  worksheetSaveError: boolean;
   tabs: Tab[];
   activeTabId: string;
   openTab: (kind: TabKind, title: string, payload?: string) => void;
@@ -244,6 +247,31 @@ function loadStoredHistory(): HistoryEntry[] {
   }
 }
 
+const WORKSHEET_STORAGE_KEY = "dataforge.worksheets.v1";
+const REOPEN_WORKSHEETS_KEY = "dataforge.worksheets.reopen";
+
+function loadWorksheets(): { tabs: Tab[]; sql: Record<string, string>; activeId: string } {
+  const fallback = { tabs: BASE_TABS, sql: { t1: INITIAL_SQL }, activeId: "t1" };
+  try {
+    if (localStorage.getItem(REOPEN_WORKSHEETS_KEY) === "false") return fallback;
+    const saved = JSON.parse(localStorage.getItem(WORKSHEET_STORAGE_KEY) ?? "null");
+    if (!saved || saved.version !== 1 || !Array.isArray(saved.tabs)) return fallback;
+    const ids = new Set<string>();
+    const tabs: Tab[] = [];
+    const sql: Record<string, string> = {};
+    for (const item of saved.tabs) {
+      if (!item || typeof item.id !== "string" || !/^t[0-9]+$/.test(item.id) ||
+          ids.has(item.id) || typeof item.title !== "string" || typeof item.sql !== "string") continue;
+      ids.add(item.id);
+      tabs.push({ id: item.id, kind: "worksheet", title: item.title, payload: typeof item.payload === "string" ? item.payload : undefined });
+      sql[item.id] = item.sql;
+    }
+    if (!tabs.length) return fallback;
+    tabSeq = Math.max(tabSeq, ...tabs.map((tab) => Number(tab.id.slice(1)) + 1));
+    return { tabs, sql, activeId: ids.has(saved.activeId) ? saved.activeId : tabs[0].id };
+  } catch { return fallback; }
+}
+
 export function StudioProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const accessRole: AccessRole = session?.role ?? "Viewer";
@@ -251,9 +279,45 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => loadLayout().sidebarOpen);
   const [connections, setConnections] = useState<Connection[]>(loadStoredConnections);
   const [activeConnId, setActiveConnId] = useState(() => loadStoredConnections()[0]?.id ?? "");
-  const [tabs, setTabs] = useState<Tab[]>(BASE_TABS);
-  const [activeTabId, setActiveTabId] = useState("t1");
-  const [worksheetSql, setWorksheetSql] = useState<Record<string, string>>({ t1: INITIAL_SQL });
+  const [initialWorksheets] = useState(loadWorksheets);
+  const [reopenWorksheets, setReopenWorksheets] = useState(() => {
+    try { return localStorage.getItem(REOPEN_WORKSHEETS_KEY) !== "false"; } catch { return true; }
+  });
+  const [worksheetSaveError, setWorksheetSaveError] = useState(false);
+  const [tabs, setTabs] = useState<Tab[]>(initialWorksheets.tabs);
+  const [activeTabId, setActiveTabId] = useState(initialWorksheets.activeId);
+  const [worksheetSql, setWorksheetSql] = useState<Record<string, string>>(initialWorksheets.sql);
+  const worksheetSnapshot = useRef("");
+  worksheetSnapshot.current = JSON.stringify({
+    version: 1,
+    activeId: activeTabId,
+    tabs: tabs.filter((tab) => tab.kind === "worksheet").map((tab) => ({
+      id: tab.id, title: tab.title, payload: tab.payload, sql: worksheetSql[tab.id] ?? "",
+    })),
+  });
+  const saveWorksheets = useCallback(() => {
+    try {
+      localStorage.setItem(WORKSHEET_STORAGE_KEY, worksheetSnapshot.current);
+      setWorksheetSaveError(false);
+    } catch { setWorksheetSaveError(true); }
+  }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(saveWorksheets, 300);
+    return () => window.clearTimeout(timer);
+  }, [tabs, worksheetSql, activeTabId, saveWorksheets]);
+  useEffect(() => {
+    const onVisibility = () => { if (document.visibilityState === "hidden") saveWorksheets(); };
+    window.addEventListener("pagehide", saveWorksheets);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", saveWorksheets);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [saveWorksheets]);
+  useEffect(() => {
+    try { localStorage.setItem(REOPEN_WORKSHEETS_KEY, String(reopenWorksheets)); }
+    catch { setWorksheetSaveError(true); }
+  }, [reopenWorksheets]);
   const worksheetId = tabs.find((tab) => tab.id === activeTabId && tab.kind === "worksheet")?.id
     ?? tabs.find((tab) => tab.kind === "worksheet")?.id ?? "t1";
   const worksheetIdRef = useRef(worksheetId);
@@ -894,6 +958,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setEditingConn,
       activeConnId,
       setActiveConnId,
+      reopenWorksheets,
+      setReopenWorksheets,
+      worksheetSaveError,
       tabs,
       activeTabId,
       openTab,
@@ -947,7 +1014,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

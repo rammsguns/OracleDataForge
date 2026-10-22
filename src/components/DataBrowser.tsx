@@ -6,15 +6,15 @@ import ResultsGrid from "./ResultsGrid";
 import RowEditor from "./RowEditor";
 import { Btn, Badge, EmptyState, Spinner } from "./ui";
 
-/** Matches the server's own cap, so the grid's `truncated` flag is the real story. */
-const PREVIEW_ROWS = 1000;
+const DEFAULT_PREVIEW_ROWS = 100;
+const MAX_PREVIEW_ROWS = 1000;
 
 /** Quoted so a lowercase or mixed-case object resolves as itself — Oracle would otherwise
  *  uppercase the bare name and answer ORA-00942 for a table the tree lists happily. */
-const previewSql = (engine: string | undefined, table: string) =>
+const previewSql = (engine: string | undefined, table: string, limit: number) =>
   engine === "oracle"
-    ? `SELECT * FROM "${table.replace(/"/g, "")}" FETCH FIRST ${PREVIEW_ROWS} ROWS ONLY`
-    : `SELECT * FROM \`${table.replace(/`/g, "")}\` LIMIT ${PREVIEW_ROWS}`;
+    ? `SELECT * FROM "${table.replace(/"/g, "")}" FETCH FIRST ${limit} ROWS ONLY`
+    : `SELECT * FROM \`${table.replace(/`/g, "")}\` LIMIT ${limit}`;
 
 export default function DataBrowser({ table }: { table: string }) {
   const s = useStudio();
@@ -22,6 +22,9 @@ export default function DataBrowser({ table }: { table: string }) {
   const [liveData, setLiveData] = useState<LiveQueryResult | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [reloads, setReloads] = useState(0);
+  const [rowLimit, setRowLimit] = useState(DEFAULT_PREVIEW_ROWS);
+  const [rowLimitInput, setRowLimitInput] = useState(String(DEFAULT_PREVIEW_ROWS));
+  const validRowLimit = /^[0-9]+$/.test(rowLimitInput) && Number(rowLimitInput) >= 1 && Number(rowLimitInput) <= MAX_PREVIEW_ROWS;
   /** "edit" swaps the read-only preview for the ROWID-backed row editor */
   const [mode, setMode] = useState<"view" | "edit">("view");
   const conn = s.connections.find((c) => c.id === s.activeConnId);
@@ -62,7 +65,7 @@ export default function DataBrowser({ table }: { table: string }) {
     setLiveError(null);
     let cancelled = false;
     api
-      .query(conn.id, previewSql(conn.engine, table))
+      .query(conn.id, previewSql(conn.engine, table, rowLimit))
       .then((r) => {
         if (cancelled) return;
         if (r.error) setLiveError(r.error.message);
@@ -73,13 +76,13 @@ export default function DataBrowser({ table }: { table: string }) {
     return () => {
       cancelled = true;
     };
-  }, [table, conn?.id, conn?.engine, conn, mode, reloads]);
+  }, [table, conn?.id, conn?.engine, conn, mode, reloads, rowLimit]);
 
   const openInWorksheet = useCallback(() => {
-    s.setSql(`${previewSql(conn?.engine, table)};`);
+    s.setSql(`${previewSql(conn?.engine, table, rowLimit)};`);
     s.openTab("worksheet", "Worksheet 1");
     s.toast("info", "Query loaded in worksheet");
-  }, [conn?.engine, s, table]);
+  }, [conn?.engine, s, table, rowLimit]);
 
   // No connection = nothing to show. This used to fall through to fabricated rows from
   // src/data/mock.ts — complete with a row count and a staged 350 ms "Fetching…" spinner —
@@ -104,7 +107,7 @@ export default function DataBrowser({ table }: { table: string }) {
         {mode === "view" && liveData && (
           <span className="text-[12px] text-mute hidden md:inline">
             {liveData.rows.length.toLocaleString()} row{liveData.rows.length === 1 ? "" : "s"}
-            {liveData.truncated ? ` (first ${PREVIEW_ROWS.toLocaleString()})` : ""} · {liveData.durationMs} ms
+            {liveData.truncated ? ` (first ${rowLimit.toLocaleString()})` : ""} · {liveData.durationMs} ms
           </span>
         )}
         <div className="ml-auto flex gap-1.5">
@@ -122,6 +125,20 @@ export default function DataBrowser({ table }: { table: string }) {
             </Btn>
           ) : (
             <>
+              <form className="flex items-center gap-1.5" onSubmit={(e) => {
+                e.preventDefault();
+                if (!validRowLimit || loading) return;
+                setRowLimit(Number(rowLimitInput));
+                setReloads((n) => n + 1);
+              }}>
+                <label className="text-[11.5px] text-mute" htmlFor="table-row-limit">Rows</label>
+                <input id="table-row-limit" type="number" min={1} max={MAX_PREVIEW_ROWS} step={1}
+                  className="w-20 h-7 px-2 rounded border border-bdr bg-panel2 text-ink text-[12px]"
+                  value={rowLimitInput} onChange={(e) => setRowLimitInput(e.target.value)}
+                  aria-invalid={!validRowLimit} title="Number of rows to fetch (1–1,000)" />
+                <button type="submit" disabled={!validRowLimit || loading}
+                  className="h-7 px-2 rounded border border-bdr text-[12px] text-soft hover:text-ink disabled:opacity-40">Apply</button>
+              </form>
               <Btn variant="outline" onClick={() => setReloads((n) => n + 1)} disabled={loading} title="Re-run the preview query">
                 <RefreshCw size={12} className={loading ? "df-spin" : ""} /> Refresh
               </Btn>

@@ -708,6 +708,11 @@ export default function TableDesigner({ table, tabId }: { table: string; tabId: 
         {!editable && <Badge tone="warn">READ-ONLY</Badge>}
         {!isNew && dirty && <Badge tone="warn">{changeCount ? `${changeCount} pending` : "modified"}</Badge>}
         <div className="ml-auto flex gap-1.5">
+          {!isNew && (
+            <Btn variant="outline" onClick={() => s.openTab("data", table, table)} disabled={applying} title="Show rows from this table">
+              <Eye size={12} /> Show Data
+            </Btn>
+          )}
           {editable && !isNew && (
             <button
               type="button"

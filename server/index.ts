@@ -660,7 +660,8 @@ function isReadStatement(sql: string): boolean {
  * any other way, since both arrive as the same SQL text.
  */
 function isDataBrowserPreviewSql(sql: string): boolean {
-  return /^\s*SELECT\s+\*\s+FROM\s+"[^"]+"\s+FETCH\s+FIRST\s+1000\s+ROWS\s+ONLY\s*;?\s*$/i.test(sql);
+  const match = /^\s*SELECT\s+\*\s+FROM\s+"[^"]+"\s+FETCH\s+FIRST\s+([0-9]+)\s+ROWS\s+ONLY\s*;?\s*$/i.exec(sql);
+  return !!match && Number(match[1]) >= 1 && Number(match[1]) <= MAX_ROWS;
 }
 
 /** Returns an error message when `role` isn't allowed to run `sql` at all, else null.
@@ -1898,6 +1899,7 @@ function listVersionedObjects(c: LiveConnection) {
 /* ---------------- Object source (real DDL for the Object Editor) ---------------- */
 
 interface ObjectSource {
+  properties?: { owner: string; type: string; status: string; created: string | null; lastDdlTime: string | null; objectId: number }[];
   name: string;
   type: string | null;
   source: string | null;
@@ -2120,7 +2122,21 @@ async function oraObjectSource(c: LiveConnection, rawName: string, wantType?: st
     }
     return { name, type, source: null, error: `Could not read the DDL of ${type} ${name} (dbms_metadata).` };
     };
-    return { ...(await resolve()), systemObject };
+    const resolved = await resolve();
+    const rows = obj.length ? await oraRows(conn,
+      `SELECT USER AS owner, object_type, status, object_id,
+              TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS') AS created,
+              TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI:SS') AS last_ddl_time
+       FROM user_objects WHERE object_name = :n
+         AND (object_type = :t OR object_type = :bt)
+       ORDER BY object_type`,
+      { n: name, t: resolved.type ?? "", bt: resolved.type === "PACKAGE" || resolved.type === "TYPE" ? `${resolved.type} BODY` : resolved.type ?? "" }
+    ) : [];
+    return { ...resolved, systemObject, properties: rows.map((r) => ({
+      owner: String(r.OWNER), type: String(r.OBJECT_TYPE), status: String(r.STATUS),
+      objectId: Number(r.OBJECT_ID), created: r.CREATED == null ? null : String(r.CREATED),
+      lastDdlTime: r.LAST_DDL_TIME == null ? null : String(r.LAST_DDL_TIME),
+    })) };
   } finally {
     await conn.close();
   }
