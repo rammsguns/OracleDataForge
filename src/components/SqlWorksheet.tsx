@@ -106,6 +106,13 @@ export default function SqlWorksheet() {
           <Save size={13} />
           Save
         </Btn>
+        <label className="flex items-center gap-1.5 text-[11px] text-mute" title="Automatically restore open worksheets and SQL from this browser after refresh or restart">
+          <input type="checkbox" checked={s.reopenWorksheets} onChange={(e) => s.setReopenWorksheets(e.target.checked)} />
+          Reopen worksheets on startup
+        </label>
+        <span className={`text-[10.5px] ${s.worksheetSaveError ? "text-err" : "text-mute"}`} role={s.worksheetSaveError ? "alert" : undefined}>
+          {s.worksheetSaveError ? "Autosave unavailable — use Save to download SQL" : "Autosave on · this browser"}
+        </span>
         <div className="ml-2 flex items-center gap-2 text-[11.5px] text-mute">
           <Database size={12} />
           <select
