@@ -366,7 +366,7 @@ export class HarnessAdapter {
  * schema-context expansion until that has been reviewed separately.
  */
 export function filterActionsForRole(actions: string[], role: string): string[] {
-  if (role.toLowerCase() === "analyst") {
+  if (role.trim().toLowerCase() === "analyst") {
     return actions.filter((action) => action === "explain");
   }
   return actions;
