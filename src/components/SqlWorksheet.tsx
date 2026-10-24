@@ -17,6 +17,7 @@ import {
 import { useStudio } from "../state/store";
 import SqlEditor from "./SqlEditor";
 import AssistPanel from "./AssistPanel";
+import { useHarnessEnabled } from "../utils/useHarnessEnabled";
 import ResultsGrid from "./ResultsGrid";
 import ExplainPlan from "./ExplainPlan";
 import { Btn, EmptyState, Spinner } from "./ui";
@@ -24,6 +25,7 @@ import { download } from "../utils/sql";
 
 export default function SqlWorksheet() {
   const s = useStudio();
+  const harnessEnabled = useHarnessEnabled();
   const [assistOpen, setAssistOpen] = useState(false);
   const [selection, setSelection] = useState({start: 0, end: 0, source: s.sql});
   const [reconnecting, setReconnecting] = useState(false);
@@ -101,7 +103,7 @@ export default function SqlWorksheet() {
           <ListTree size={13} />
           Explain
         </Btn>
-        <Btn variant="outline" onClick={() => setAssistOpen(open => !open)}>Assist</Btn>
+        {harnessEnabled && <Btn variant="outline" onClick={() => setAssistOpen(open => !open)}>Assist</Btn>}
         <Btn variant="outline" onClick={s.doFormat} title="Format SQL (Ctrl+Shift+F)">
           <AlignLeft size={13} />
           Format

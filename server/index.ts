@@ -4710,7 +4710,7 @@ let harnessConfig: HarnessIntegrationConfig;
 try {
   harnessConfig = readConfig(process.env);
 } catch (err) {
-  console.warn("Harness configuration error:", err);
+  console.warn("Harness integration disabled: invalid configuration.");
   harnessConfig = {
     enabled: false,
     baseUrl: "",
@@ -4764,7 +4764,7 @@ const harnessAdapter = new HarnessAdapter({
   resolver: {
     targetReference: (instanceId, connectionId, schema) =>
       `dataforge:${instanceId}:${connectionId}:${schema ?? ""}`,
-    databaseVersion: async (_connectionId) => "19.0.0.0.0",
+    databaseVersion: async (_connectionId) => "",
     resolve: (actor, request) => resolveContextForActor(actor, request),
   },
 });
