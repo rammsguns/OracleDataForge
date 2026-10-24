@@ -38,7 +38,7 @@ function sseResponse(events: Array<[string, unknown]>): Response {
 const REQUEST: AssistRequest = {
   action: "explain",
   connectionId: "conn-9",
-  schema: "HARNESS_APP",
+  schema: "APP_SCHEMA",
   selection: "SELECT 1 FROM dual",
   editorId: "buffer-1",
   editorRevision: "3",
@@ -84,7 +84,7 @@ test("preview uses the permission resolver without contacting the provider", asy
   });
   const preview = await adapter.preview(ACTOR, REQUEST);
   assert.equal(resolvedActor, ACTOR);
-  assert.equal(preview.targetReference, "dataforge:preview-test:conn-9:HARNESS_APP");
+  assert.equal(preview.targetReference, "dataforge:preview-test:conn-9:APP_SCHEMA");
   assert.equal(preview.attachments[0]?.content, REQUEST.selection);
   await assert.rejects(adapter.preview({...ACTOR, role: "Analyst"}, {...REQUEST, action: "propose"}), /action_not_allowed/);
 });
@@ -97,4 +97,35 @@ test("upstream gateway outage is reported as unavailable", async () => {
   assert.equal(caps.reachable, false);
   assert.deepEqual(caps.actions, []);
   assert.match(caps.detail, /unavailable/);
+});
+
+test("whole editor text survives preview and assist independently of selection", async () => {
+  const request = { ...REQUEST, editorText: "SELECT 1 FROM dual;\nSELECT 2 FROM dual;" };
+  let payload: { editor: { text: string }; attachments: { content: string }[] } | undefined;
+  const adapter = new HarnessAdapter({ config: config(), instanceId: "editor-test", resolver: RESOLVER,
+    fetchImpl: async (_url, init) => { payload = JSON.parse(String(init?.body)); return sseResponse([["done", {}]]); },
+  });
+  assert.equal((await adapter.preview(ACTOR, request)).editor.text, request.editorText);
+  for await (const _event of adapter.assist(ACTOR, request)) { /* consume */ }
+  assert.equal(payload?.editor.text, request.editorText);
+  assert.equal(payload?.attachments[0].content, REQUEST.selection);
+  assert.equal((await adapter.preview(ACTOR, REQUEST)).editor.text, REQUEST.selection);
+});
+
+test("disabled preview refuses before resolving context or contacting harness", async () => {
+  const adapter = new HarnessAdapter({ config: readConfig({}), instanceId: "disabled",
+    resolver: { ...RESOLVER, resolve: async () => assert.fail("must not resolve") },
+    fetchImpl: async () => assert.fail("must not fetch"),
+  });
+  await assert.rejects(adapter.preview(ACTOR, REQUEST), /integration_disabled/);
+});
+
+test("credential refusal remains reachable but incompatible", async () => {
+  const adapter = new HarnessAdapter({ config: config(), instanceId: "credentials", resolver: RESOLVER,
+    fetchImpl: async () => new Response("", { status: 401 }),
+  });
+  const caps = await adapter.capabilities(ACTOR);
+  assert.equal(caps.reachable, true);
+  assert.equal(caps.compatible, false);
+  assert.match(caps.detail, /credential/);
 });
