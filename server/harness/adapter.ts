@@ -224,6 +224,11 @@ export class HarnessAdapter {
       return;
     }
 
+    if (!filterActionsForRole([request.action], actor.role).includes(request.action)) {
+      yield errorEvent("action_not_allowed", "Your DataForge role does not allow this action.");
+      return;
+    }
+
     const attachments = sanitize(
       await this.resolver.resolve(actor, request),
       this.config.maxContextBytes,
@@ -301,6 +306,10 @@ export class HarnessAdapter {
       schema?: string;
     },
   ): Promise<{ canApply: boolean; reasons: string[]; proposedText?: string }> {
+    // Applying a proposal requires proposal assistance under the current role.
+    if (!filterActionsForRole(["propose"], actor.role).includes("propose")) {
+      return { canApply: false, reasons: ["action_not_allowed"] };
+    }
     const response = await this.call(
       "POST",
       `/api/v1/copilot/proposals/${encodeURIComponent(proposalId)}/apply-check`,
