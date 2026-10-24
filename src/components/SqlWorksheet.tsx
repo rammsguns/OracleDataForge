@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { useStudio } from "../state/store";
 import SqlEditor from "./SqlEditor";
+import AssistPanel from "./AssistPanel";
+import { useHarnessEnabled } from "../utils/useHarnessEnabled";
 import ResultsGrid from "./ResultsGrid";
 import ExplainPlan from "./ExplainPlan";
 import { Btn, EmptyState, Spinner } from "./ui";
@@ -23,6 +25,9 @@ import { download } from "../utils/sql";
 
 export default function SqlWorksheet() {
   const s = useStudio();
+  const harnessEnabled = useHarnessEnabled();
+  const [assistOpen, setAssistOpen] = useState(false);
+  const [selection, setSelection] = useState({start: 0, end: 0, source: s.sql});
   const [reconnecting, setReconnecting] = useState(false);
   const reconnectingRef = useRef(false);
   const activeConnection = s.connections.find((c) => c.id === s.activeConnId);
@@ -98,6 +103,7 @@ export default function SqlWorksheet() {
           <ListTree size={13} />
           Explain
         </Btn>
+        {harnessEnabled && <Btn variant="outline" onClick={() => setAssistOpen(open => !open)}>Assist</Btn>}
         <Btn variant="outline" onClick={s.doFormat} title="Format SQL (Ctrl+Shift+F)">
           <AlignLeft size={13} />
           Format
@@ -157,10 +163,14 @@ export default function SqlWorksheet() {
         {!s.autoCommit && <span className="text-warn">Manual sessions roll back on disconnect or after 30 minutes idle.</span>}
       </div>
 
+      {assistOpen && <AssistPanel key={`${s.activeTabId}:${s.activeConnId}:${JSON.stringify(s.session)}`} text={s.sql}
+        selection={selection.source === s.sql ? s.sql.slice(selection.start, selection.end) : ""}
+        connectionId={s.activeConnId} schema={activeConnection?.user.toUpperCase() ?? ""}
+        editorId={s.activeTabId} onApply={s.setSql} />}
       {/* editor */}
       <div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
         <div hidden={expanded} style={{ height: `${editorPct}%` }} className="min-h-24 min-w-0 shrink-0 overflow-hidden">
-          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={s.setSqlSelection} onRun={runSql} />
+          <SqlEditor value={s.sql} onChange={s.setSql} errorLine={errorLine} onSelectionChange={(start, end) => { s.setSqlSelection(start, end); setSelection({start, end, source: s.sql}); }} onRun={runSql} />
         </div>
 
         {/* splitter */}
