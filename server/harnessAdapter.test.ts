@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HarnessAdapter, type AssistRequest, type ContextResolver, type DataForgeActor } from "./harness/adapter.ts";
+import { parseSse, readSse, HarnessAdapter, type AssistRequest, type ContextResolver, type DataForgeActor } from "./harness/adapter.ts";
 import { readConfig } from "./harness/config.ts";
 
 const ACTOR: DataForgeActor = { id: "df-user-7", role: "Developer", durable: true };
@@ -128,4 +128,63 @@ test("credential refusal remains reachable but incompatible", async () => {
   assert.equal(caps.reachable, true);
   assert.equal(caps.compatible, false);
   assert.match(caps.detail, /credential/);
+});
+
+for (const method of ["capabilities", "preview", "assist", "applyCheck"] as const) {
+  test(`disabled ${method} never fetches or resolves context`, async () => {
+    let calls = 0;
+    const adapter = new HarnessAdapter({
+      config: readConfig({}), instanceId: "disabled",
+      resolver: {
+        targetReference: () => assert.fail("must not resolve target"),
+        databaseVersion: async () => assert.fail("must not resolve version"),
+        resolve: async () => assert.fail("must not resolve context"),
+      },
+      fetchImpl: async () => { calls++; return new Response("{}"); },
+    });
+    if (method === "capabilities") assert.equal((await adapter.capabilities(ACTOR)).enabled, false);
+    if (method === "preview") await assert.rejects(adapter.preview(ACTOR, REQUEST), /integration_disabled/);
+    if (method === "assist") {
+      const events = [];
+      for await (const event of adapter.assist(ACTOR, REQUEST)) events.push(event);
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.data.code, "integration_disabled");
+    }
+    if (method === "applyCheck") assert.deepEqual(await adapter.applyCheck(ACTOR, "proposal", {
+      editorId: "editor", revision: "1", currentText: "SELECT 1", connectionId: "conn",
+    }), { canApply: false, reasons: ["integration_disabled"] });
+    assert.equal(calls, 0);
+  });
+}
+
+test("SSE parses CRLF, comments and multiline data with optional field spaces", () => {
+  assert.deepEqual(parseSse(': keepalive\r\nevent:delta\r\ndata: {\r\ndata: "text": "hello"\r\ndata: }'), {
+    event: "delta", data: { text: "hello" },
+  });
+  // Concatenating these lines would incorrectly turn two numbers into 12.
+  assert.equal(parseSse('event: delta\ndata: {"value":1\ndata: 2}'), null);
+});
+
+for (const newline of ["\n", "\r\n"]) {
+  test(`SSE retains events across every chunk split (${JSON.stringify(newline)})`, async () => {
+    const wire = [": comment", "event: delta", 'data: {', 'data: "text": "héllo"', 'data: }', "", "event: done", 'data: {}', "", ""].join(newline);
+    const bytes = new TextEncoder().encode(wire);
+    for (let split = 1; split < bytes.length; split++) {
+      const stream = new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(bytes.slice(0, split));
+        controller.enqueue(bytes.slice(split));
+        controller.close();
+      } });
+      const events = [];
+      for await (const event of readSse(stream)) events.push(event);
+      assert.deepEqual(events, [{ event: "delta", data: { text: "héllo" } }, { event: "done", data: {} }], `split ${split}`);
+    }
+  });
+}
+
+test("SSE preserves existing behavior of dropping an unterminated trailing event", async () => {
+  const stream = new Response('event: delta\ndata: {"text":"complete"}\n\nevent: done\ndata: {}').body!;
+  const events = [];
+  for await (const event of readSse(stream)) events.push(event);
+  assert.deepEqual(events, [{ event: "delta", data: { text: "complete" } }]);
 });

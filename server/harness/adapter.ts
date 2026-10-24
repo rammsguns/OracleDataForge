@@ -326,6 +326,9 @@ export class HarnessAdapter {
       schema?: string;
     },
   ): Promise<{ canApply: boolean; reasons: string[]; proposedText?: string }> {
+    if (!this.config.enabled) {
+      return { canApply: false, reasons: ["integration_disabled"] };
+    }
     // Applying a proposal requires proposal assistance under the current role.
     if (!filterActionsForRole(["propose"], actor.role).includes("propose")) {
       return { canApply: false, reasons: ["action_not_allowed"] };
@@ -429,28 +432,28 @@ export async function* readSse(
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
+    let boundary: RegExpExecArray | null;
+    while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+      const chunk = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary[0].length);
       const parsed = parseSse(chunk);
       if (parsed) yield parsed;
-      boundary = buffer.indexOf("\n\n");
     }
   }
 }
 
 export function parseSse(chunk: string): StreamEvent | null {
   let event = "";
-  let data = "";
-  for (const line of chunk.split("\n")) {
-    if (line.startsWith("event: ")) event = line.slice(7).trim();
-    else if (line.startsWith("data: ")) data += line.slice(6);
+  const data: string[] = [];
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
   }
-  if (!event || !data) return null;
+  if (!event || !data.length) return null;
   if (!(KNOWN_STREAM_EVENTS as readonly string[]).includes(event)) return null;
   try {
-    return { event: event as StreamEventName, data: JSON.parse(data) };
+    return { event: event as StreamEventName, data: JSON.parse(data.join("\n")) };
   } catch {
     return null;
   }
