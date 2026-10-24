@@ -58,6 +58,15 @@ export function registerHarnessRoutes({ adapter, currentActor, router }: RouteOp
     response.json(await adapter.capabilities(actor));
   });
 
+  router.post("/api/ai/context-preview", async (request, response) => {
+    const actor = await currentActor(request);
+    if (!actor) { response.status(401).json({ error: "Sign in to DataForge first." }); return; }
+    const parsed = parseAssistRequest(request.body);
+    if ("error" in parsed) { response.status(400).json({ error: parsed.error }); return; }
+    try { response.json(await adapter.preview(actor, parsed.request)); }
+    catch (cause) { response.status(403).json({ error: (cause as Error).message }); }
+  });
+
   router.post("/api/ai/chat", async (request, response) => {
     const actor = await currentActor(request);
     if (!actor) {

@@ -208,6 +208,19 @@ export class HarnessAdapter {
     }
   }
 
+  /** Resolve exactly the permitted outgoing context without calling the provider. */
+  async preview(actor: DataForgeActor, request: AssistRequest) {
+    if (!this.config.enabled) throw new Error("integration_disabled");
+    if (!filterActionsForRole([request.action], actor.role).includes(request.action)) {
+      throw new Error("action_not_allowed");
+    }
+    return {
+      targetReference: this.resolver.targetReference(this.instanceId, request.connectionId, request.schema),
+      schema: request.schema ?? "",
+      attachments: sanitize(await this.resolver.resolve(actor, request), this.config.maxContextBytes),
+    };
+  }
+
   /**
    * Run one assist request and yield the harness stream events.
    *
