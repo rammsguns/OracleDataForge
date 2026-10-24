@@ -8,6 +8,9 @@ import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
 import { storageChangeSql, type StorageChange } from "../src/utils/dbaSql.ts";
 import { selectManagementQueries } from "./dbaManagement.ts";
+import { HarnessAdapter, type AssistRequest, type ContextAttachment, type DataForgeActor } from "./harness/adapter.ts";
+import { readConfig, type HarnessIntegrationConfig } from "./harness/config.ts";
+import { registerHarnessRoutes } from "./harness/routes.ts";
 import { globalSessionsSql, localSessionsSql, globalConnectInfoSql, localConnectInfoSql, killSessionSql, sessionIdentifier, sessionResourcesSql, sessionResourceStats } from "./oracleSessions.ts";
 import compression from "compression";
 import { AuthConcurrency } from "./authConcurrency.ts";
@@ -4702,6 +4705,85 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "16mb" })); // generous headroom for CSV/JSON imports
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, connections: registry.size }));
+
+let harnessConfig: HarnessIntegrationConfig;
+try {
+  harnessConfig = readConfig(process.env);
+} catch (err) {
+  console.warn("Harness configuration error:", err);
+  harnessConfig = {
+    enabled: false,
+    baseUrl: "",
+    token: "",
+    timeoutMs: 60000,
+    maxContextBytes: 131072,
+    adapterVersion: "0.1.0",
+  };
+}
+
+const installationId = process.env.DATAFORGE_INSTANCE_ID || "dataforge-default";
+
+async function resolveContextForActor(
+  actor: DataForgeActor,
+  request: AssistRequest,
+): Promise<ContextAttachment[]> {
+  const attachments: ContextAttachment[] = [];
+  if (request.selection) {
+    attachments.push({
+      category: "selected_source",
+      name: "selection",
+      content: request.selection,
+      provenance: "editor selection",
+    });
+  }
+  if (request.errorText) {
+    attachments.push({
+      category: "error_text",
+      name: "error",
+      content: request.errorText,
+      provenance: "user-supplied error text",
+    });
+  }
+  if (request.planText) {
+    attachments.push({
+      category: "plan_text",
+      name: "plan",
+      content: request.planText,
+      provenance: "explain plan output",
+    });
+  }
+  if (actor.role.toLowerCase() === "analyst") {
+    return attachments;
+  }
+  return attachments;
+}
+
+const harnessAdapter = new HarnessAdapter({
+  config: harnessConfig,
+  instanceId: installationId,
+  resolver: {
+    targetReference: (instanceId, connectionId, schema) =>
+      `dataforge:${instanceId}:${connectionId}:${schema ?? ""}`,
+    databaseVersion: async (_connectionId) => "19.0.0.0.0",
+    resolve: (actor, request) => resolveContextForActor(actor, request),
+  },
+});
+
+registerHarnessRoutes({
+  router: app,
+  adapter: harnessAdapter,
+  currentActor: async (req) => {
+    const res = (req as express.Request).res;
+    const role = res?.locals?.role as string | undefined;
+    if (!role) return null;
+    const email = (res?.locals?.userEmail as string | undefined) ?? null;
+    return {
+      id: email,
+      role,
+      durable: Boolean(email),
+    };
+  },
+});
 
 /** Tells the browser who it's actually authenticated as, so the UI reflects the role the
  *  server will enforce instead of a client-chosen guess. */
