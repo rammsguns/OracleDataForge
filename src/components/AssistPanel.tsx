@@ -22,12 +22,13 @@ export default function AssistPanel({ text, selection, connectionId, schema, edi
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const controller = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
   const source = useRef({text, revision: crypto.randomUUID()});
   if (source.current.text !== text) source.current = { text, revision: crypto.randomUUID() };
   const current = useRef({text, revision: source.current.revision});
   current.current = {text, revision: source.current.revision};
   const refresh = () => { void fetch("/api/ai/capabilities").then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }).then(setCaps).catch(() => setNotice("Harness unavailable. Refresh integration status to retry.")); };
-  useEffect(() => { refresh(); return () => controller.current?.abort(); }, []);
+  useEffect(() => { mounted.current = true; refresh(); return () => { mounted.current = false; controller.current?.abort(); }; }, []);
   const body = (): Body => ({ action, connectionId, schema, selection: selection || text, editorId, editorRevision: source.current.revision, question });
   const reviewContext = async () => {
     setBusy(true); setNotice(""); setReview(null);
@@ -59,6 +60,7 @@ export default function AssistPanel({ text, selection, connectionId, schema, edi
     const snapshot = {...current.current};
     try {
       const result = await jsonPost(`/api/ai/proposals/${encodeURIComponent(String(answer.proposal.proposalId))}/apply-check`, {editorId, connectionId, schema, revision: snapshot.revision, currentText: snapshot.text});
+      if (!mounted.current) return;
       if (current.current.revision !== snapshot.revision) { setNotice("Editor changed during apply check. Review again."); return; }
       if (result.canApply && typeof result.proposedText === "string") { onApply(result.proposedText); setNotice("Applied to editor. Nothing executed."); }
       else setNotice(`Apply refused: ${(result.reasons ?? []).join(", ")}`);

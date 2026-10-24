@@ -160,11 +160,13 @@ export class HarnessAdapter {
       if (!response.ok) {
         return {
           enabled: true,
-          reachable: true,
+          reachable: response.status < 500,
           compatible: false,
           actions: [],
           adapterVersion: ADAPTER_VERSION,
-          detail: `The harness refused the integration credential (${response.status}).`,
+          detail: response.status >= 500
+            ? `The harness is unavailable (${response.status}). Editing and running in DataForge are unaffected.`
+            : `The harness refused the integration credential (${response.status}).`,
           requestId,
         };
       }

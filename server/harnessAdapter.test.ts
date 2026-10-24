@@ -75,3 +75,26 @@ test("Analyst apply-check is refused without a harness fetch", async () => {
     editorId: "editor", revision: "1", currentText: "SELECT 1", connectionId: "conn",
   }), { canApply: false, reasons: ["action_not_allowed"] });
 });
+
+test("preview uses the permission resolver without contacting the provider", async () => {
+  let resolvedActor: DataForgeActor | undefined;
+  const adapter = new HarnessAdapter({ config: config(), instanceId: "preview-test",
+    resolver: { ...RESOLVER, resolve: async (actor, request) => { resolvedActor = actor; return RESOLVER.resolve(actor, request); } },
+    fetchImpl: async () => { assert.fail("preview must not fetch"); },
+  });
+  const preview = await adapter.preview(ACTOR, REQUEST);
+  assert.equal(resolvedActor, ACTOR);
+  assert.equal(preview.targetReference, "dataforge:preview-test:conn-9:HARNESS_APP");
+  assert.equal(preview.attachments[0]?.content, REQUEST.selection);
+  await assert.rejects(adapter.preview({...ACTOR, role: "Analyst"}, {...REQUEST, action: "propose"}), /action_not_allowed/);
+});
+
+test("upstream gateway outage is reported as unavailable", async () => {
+  const adapter = new HarnessAdapter({ config: config(), instanceId: "preview-test", resolver: RESOLVER,
+    fetchImpl: async () => new Response("", {status: 502}),
+  });
+  const caps = await adapter.capabilities(ACTOR);
+  assert.equal(caps.reachable, false);
+  assert.deepEqual(caps.actions, []);
+  assert.match(caps.detail, /unavailable/);
+});
