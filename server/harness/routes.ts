@@ -18,6 +18,8 @@ export interface MinimalRequest {
 }
 
 export interface MinimalResponse {
+  readonly writableFinished?: boolean;
+  on(event: "close", listener: () => void): void;
   status(code: number): MinimalResponse;
   json(body: unknown): void;
   setHeader(name: string, value: string): void;
@@ -70,7 +72,11 @@ export function registerHarnessRoutes({ adapter, currentActor, router }: RouteOp
     }
 
     const controller = new AbortController();
-    request.on("close", () => controller.abort());
+    // IncomingMessage close means the parsed request body is complete on Node 24.
+    // The response closes early when the streaming client disconnects.
+    response.on("close", () => {
+      if (!response.writableFinished) controller.abort();
+    });
 
     response.setHeader("Content-Type", "text/event-stream");
     response.setHeader("Cache-Control", "no-cache, no-transform");
@@ -81,6 +87,7 @@ export function registerHarnessRoutes({ adapter, currentActor, router }: RouteOp
 
     try {
       for await (const event of adapter.assist(actor, parsed.request, controller.signal)) {
+        if (controller.signal.aborted) break;
         response.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
         response.flush?.();
       }
