@@ -59,6 +59,8 @@ export interface AssistRequest {
   question?: string;
   editorId: string;
   editorRevision: string;
+  /** Complete buffer for safe whole-editor proposal apply; selection remains separate. */
+  editorText?: string;
   conversationId?: string;
 }
 
@@ -219,6 +221,9 @@ export class HarnessAdapter {
     return {
       targetReference: this.resolver.targetReference(this.instanceId, request.connectionId, request.schema),
       schema: request.schema ?? "",
+      action: request.action,
+      question: request.question ?? "",
+      editor: { editorId: request.editorId, revision: request.editorRevision, text: request.editorText ?? request.selection },
       attachments: sanitize(await this.resolver.resolve(actor, request), this.config.maxContextBytes),
     };
   }
@@ -276,7 +281,7 @@ export class HarnessAdapter {
         editor: {
           editorId: request.editorId,
           revision: request.editorRevision,
-          text: request.selection,
+          text: request.editorText ?? request.selection,
         },
         // An assertion about which of *our* users is acting, namespaced by the
         // harness. It is not a role and grants nothing.

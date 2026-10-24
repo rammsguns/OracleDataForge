@@ -3,7 +3,7 @@ import DiffView from "./DiffView";
 import { Btn } from "./ui";
 import { answerEvent, emptyAnswer, sseParser } from "../utils/assist";
 
-type Body = { action: string; connectionId: string; schema: string; selection: string; editorId: string; editorRevision: string; question: string };
+type Body = { action: string; connectionId: string; schema: string; selection: string; editorId: string; editorRevision: string; editorText: string; question: string };
 async function jsonPost(url: string, body: unknown) {
   const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const data = await response.json();
@@ -29,7 +29,7 @@ export default function AssistPanel({ text, selection, connectionId, schema, edi
   current.current = {text, revision: source.current.revision};
   const refresh = () => { void fetch("/api/ai/capabilities").then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }).then(setCaps).catch(() => setNotice("Harness unavailable. Refresh integration status to retry.")); };
   useEffect(() => { mounted.current = true; refresh(); return () => { mounted.current = false; controller.current?.abort(); }; }, []);
-  const body = (): Body => ({ action, connectionId, schema, selection: selection || text, editorId, editorRevision: source.current.revision, question });
+  const body = (): Body => ({ action, connectionId, schema, selection: selection || text, editorId, editorRevision: source.current.revision, editorText: text, question });
   const reviewContext = async () => {
     setBusy(true); setNotice(""); setReview(null);
     try { const request = body(); setReview({ body: request, preview: await jsonPost("/api/ai/context-preview", request) }); }

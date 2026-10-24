@@ -181,6 +181,7 @@ export function parseAssistRequest(
       question: typeof body.question === "string" ? body.question : undefined,
       editorId,
       editorRevision,
+      editorText: typeof body.editorText === "string" ? body.editorText : undefined,
       conversationId:
         typeof body.conversationId === "string" ? body.conversationId : undefined,
     },
