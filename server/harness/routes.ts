@@ -24,6 +24,7 @@ export interface MinimalResponse {
   write(chunk: string): void;
   end(): void;
   flushHeaders?(): void;
+  flush?(): void;
 }
 
 export interface RouteHandler {
@@ -72,7 +73,7 @@ export function registerHarnessRoutes({ adapter, currentActor, router }: RouteOp
     request.on("close", () => controller.abort());
 
     response.setHeader("Content-Type", "text/event-stream");
-    response.setHeader("Cache-Control", "no-cache");
+    response.setHeader("Cache-Control", "no-cache, no-transform");
     // Proxies that buffer will hold the whole answer until the end; this asks the
     // common ones not to.
     response.setHeader("X-Accel-Buffering", "no");
@@ -81,6 +82,7 @@ export function registerHarnessRoutes({ adapter, currentActor, router }: RouteOp
     try {
       for await (const event of adapter.assist(actor, parsed.request, controller.signal)) {
         response.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
+        response.flush?.();
       }
     } catch (cause) {
       response.write(
