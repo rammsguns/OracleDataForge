@@ -930,13 +930,15 @@ export default function Sidebar() {
           {activeConn?.live ? (
             <span className="ml-auto flex items-center gap-1">
               <button
-                aria-label="Refresh schema"
-                title="Refresh schema (re-reads the data dictionary)"
+                aria-label={liveState?.status === "loading" ? "Refreshing schema…" : "Refresh schema"}
+                aria-busy={liveState?.status === "loading"}
+                title={liveState?.status === "loading" ? "Refreshing schema…" : "Refresh schema (re-reads the data dictionary)"}
                 onClick={() => refreshSchema(activeConn.id)}
                 disabled={activeConn.status !== "connected" || liveState?.status === "loading"}
-                className="p-0.5 rounded hover:bg-panel3 hover:text-accenthi disabled:opacity-50 transition-colors"
+                className="flex items-center gap-1 p-0.5 rounded hover:bg-panel3 hover:text-accenthi disabled:opacity-50 transition-colors"
               >
                 <RefreshCcw size={12} className={liveState?.status === "loading" ? "df-spin" : ""} />
+                {liveState?.status === "loading" && <span role="status" className="text-[10px] font-medium normal-case tracking-normal">Refreshing…</span>}
               </button>
               <span className="text-[9px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 normal-case" title="Real database, reached through the local backend">
                 live
