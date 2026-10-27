@@ -23,6 +23,8 @@ import {
 import { useStudio } from "../state/store";
 import type { TabKind } from "../types";
 import SqlWorksheet from "./SqlWorksheet";
+import AssistPanel from "./AssistPanel";
+import { useHarnessEnabled } from "../utils/useHarnessEnabled";
 import DataBrowser from "./DataBrowser";
 import ObjectEditor from "./ObjectEditor";
 import TableDesigner from "./TableDesigner";
@@ -79,6 +81,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
 ];
 
 export default function Workspace() {
+  const harnessEnabled = useHarnessEnabled();
   const s = useStudio();
   const active = s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0];
   const activeTabRef = useRef<HTMLDivElement>(null);
@@ -97,6 +100,7 @@ export default function Workspace() {
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-panel">
+      {harnessEnabled && s.accessRole === "Analyst" && <AssistPanel key={JSON.stringify(s.session)} text="" selection="" connectionId={s.activeConnId} schema="" editorId="analyst-documentation" onApply={() => {}} />}
       <div className="flex items-center gap-2 px-2 py-1.5 border-b border-bdr shrink-0">
         <select aria-label="Open tabs" value={active.id} onChange={(e) => s.setActiveTabId(e.target.value)} className="min-w-0 max-w-52 rounded border border-bdr bg-panel2 px-2 py-1 text-[12px]">
           {s.tabs.map((tab) => <option key={tab.id} value={tab.id}>{tab.title}{tab.dirty ? " •" : ""}</option>)}

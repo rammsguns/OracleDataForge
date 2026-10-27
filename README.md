@@ -1,6 +1,6 @@
 # Oracle DataForge
 
-Oracle DataForge is a focused browser IDE for Oracle Database, extracted from the Oracle functionality in InsightDB AI Suite. It keeps the database-development workflow and removes every alternate database engine, AI assistant, model-provider integration, and enterprise control-plane dependency.
+Oracle DataForge is a focused browser IDE for Oracle Database, extracted from the Oracle functionality in InsightDB AI Suite. It keeps the database-development workflow without alternate database engines or a required model-provider integration.
 
 ## Included Oracle features
 
@@ -25,7 +25,7 @@ Oracle DataForge is a focused browser IDE for Oracle Database, extracted from th
 - Passphrase-encrypted export and import of saved connections, wallets included (AES-256-GCM, scrypt)
 - Dark/light themes and resizable Explorer
 
-There is no Copilot panel, AI endpoint, provider configuration, model SDK, alternate SQL dialect, or non-Oracle driver in this project.
+Optional worksheet assistance connects to a separately deployed OracleDBHarness. It is off by default; DataForge includes no model SDK or provider configuration.
 
 ## Requirements
 
@@ -144,3 +144,48 @@ The token stays in the local backend. After Oracle compilation succeeds without 
 | [performance.md](docs/performance.md) | Row limits, pooling, caching, and what gets slow at scale |
 | [known_limitations.md](docs/known_limitations.md) | Caps, unsupported inputs, and single-instance assumptions |
 | [changelog.md](docs/changelog.md) | What changed, when, and why |
+
+## Optional harness assistance
+
+Assistance is disabled unless `DATAFORGE_HARNESS_ENABLED=true` is set on the backend.
+Editing, execution and compilation continue independently of the harness.
+
+Issue a scoped integration credential as a harness Administrator with
+`POST /api/v1/admin/integrations` and the body
+`{"name":"dataforge","kind":"dataforge","scopes":["copilot:assist"]}`.
+Store the returned one-time credential only in backend environment configuration:
+
+```dotenv
+DATAFORGE_HARNESS_ENABLED=true
+DATAFORGE_HARNESS_URL=https://harness.example.com
+DATAFORGE_HARNESS_TOKEN=<integration credential>
+DATAFORGE_INSTANCE_ID=dataforge-production
+```
+
+Use a stable, unique instance ID for each installation. HTTPS is required except on
+loopback. Optional limits are `DATAFORGE_HARNESS_TIMEOUT_MS` (default `60000`) and
+`DATAFORGE_HARNESS_MAX_CONTEXT_BYTES` (default `131072`). Never put the credential
+in browser configuration, URLs or logs. Revoke it in the harness to disconnect.
+
+Open **Assist** in a worksheet, choose an action and review outgoing context before
+sending. The backend forwards the supplied selection (or full buffer when nothing
+is selected), question, complete editor buffer and revision, schema, opaque target
+reference, actor identity and supplied error/plan text. The harness owns provider
+configuration, context policy and request history. Review its retention and provider
+policy before sending source. The current resolver does not expand schema metadata
+or query Oracle for context and leaves the database version unspecified.
+
+Analysts receive explain-only assistance; the server rejects other actions and
+proposal apply checks under their current role. Other roles use the harness's
+advertised actions. Responses stream, cancellation propagates upstream, and proposed
+changes require diff review plus a fresh editor revision/text check before applying.
+Applying changes edits the buffer only. The integration never executes proposals,
+compiles objects, commits transactions, changes connection settings, sends database
+credentials or wallets, or opens another Oracle connection. Selected-text explanation
+does not execute EXPLAIN PLAN.
+
+Known limits: no dedicated integration settings screen; configuration is server-side.
+Hosted providers and proxies beyond the shipped harness nginx are unqualified.
+Agent-run backend and browser checks on Oracle test stand-ins are recorded in the
+[harness compatibility matrix](https://github.com/rammsguns/OracleDBHarness/blob/main/integrations/dataforge/COMPATIBILITY.md);
+they do not establish human pilot or production qualification.
