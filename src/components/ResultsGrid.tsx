@@ -1,4 +1,5 @@
 import { useStudio } from "../state/store";
+import JsonViewer from "./JsonViewer";
 import HorizontalScrollbar from "./HorizontalScrollbar";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -13,6 +14,7 @@ import {
   ExternalLink,
   Maximize2,
   Pin,
+  Braces,
 } from "lucide-react";
 import type { CellValue } from "../types";
 import { download, toCsv, toJson, toInserts } from "../utils/sql";
@@ -50,9 +52,10 @@ export default function ResultsGrid({
   const [columnSearch, setColumnSearch] = useState("");
   const [widths, setWidths] = useState<Record<number, number>>({});
   const [pinned, setPinned] = useState<Set<number>>(new Set());
+  const [jsonDetail, setJsonDetail] = useState<{ column: string; value: string } | null>(null);
   const [rowDetail, setRowDetail] = useState<CellValue[] | null>(null);
   useEffect(() => {
-    setHidden(new Set()); setPinned(new Set()); setWidths({}); setSort(null); setPage(0); setRowDetail(null);
+    setHidden(new Set()); setPinned(new Set()); setWidths({}); setSort(null); setPage(0); setRowDetail(null); setJsonDetail(null); setDetail(null);
   }, [columns, rows]);
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const [filter, setFilter] = useState("");
@@ -217,6 +220,7 @@ export default function ResultsGrid({
                 {visCols.map(({ i }) => {
                   const raw = cellText(r[i]);
                   const long = raw.length > CELL_CLIP;
+                  const json = r[i] !== null && (/json/i.test(columns[i]) || /^\s*[\[{]/.test(raw));
                   return (
                     <td
                       key={i}
@@ -225,10 +229,11 @@ export default function ResultsGrid({
                       onDoubleClick={() => { setCopied(false); setDetail({ column: columns[i], value: raw }); }}
                       className={`border-b border-r border-bdrsoft px-2.5 bg-panel whitespace-nowrap text-ink overflow-hidden text-ellipsis ${dense ? "py-0.5" : "py-1"}`}
                     >
-                      {long ? (
+                      {long || json ? (
                         <span className="inline-flex items-center gap-1.5 max-w-full">
                           <span className="overflow-hidden text-ellipsis">{raw}</span>
-                          <button
+                          {json && <button type="button" title={`View ${columns[i]} as JSON`} aria-label={`View ${columns[i]} as JSON`} onClick={() => setJsonDetail({ column: columns[i], value: raw })} className="shrink-0 p-0.5 rounded text-accent hover:bg-panel3"><Braces size={13} /></button>}
+                          {long && <button
                             type="button"
                             onClick={() => {
                               setCopied(false);
@@ -239,7 +244,7 @@ export default function ResultsGrid({
                             aria-label={`Show the full ${columns[i]} value`}
                           >
                             <Maximize2 size={11} />
-                          </button>
+                          </button>}
                         </span>
                       ) : (
                         fmt(r[i])
@@ -368,12 +373,14 @@ export default function ResultsGrid({
           </div>
         </Modal>
       )}
+      {jsonDetail && <JsonViewer {...jsonDetail} onClose={() => setJsonDetail(null)} />}
       {detail && (
         <Modal title={detail.column} onClose={() => setDetail(null)} width={760}>
           <div className="px-4 py-3 flex flex-col gap-2 min-h-0">
             <div className="flex items-center gap-2 text-[11.5px] text-mute">
               <span className="font-mono text-soft">{detail.column}</span>
               <span>· {detail.value.length.toLocaleString()} characters</span>
+              <Btn variant="outline" onClick={() => { setJsonDetail(detail); setDetail(null); }}><Braces size={12} /> View as JSON</Btn>
               <Btn
                 variant="outline"
                 className="ml-auto"

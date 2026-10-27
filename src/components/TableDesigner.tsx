@@ -317,11 +317,40 @@ export default function TableDesigner({ table, tabId }: { table: string; tabId: 
   const reload = async () => {
     if (!connId) return;
     const meta = await api.tableMeta(connId, table);
+    if (!meta.exists) throw new Error(meta.error ?? `Table ${table} was not found.`);
     const original = metaToModel(meta);
     const next: TableBuffer = { original, model: cloneModel(original) };
     setTableBuffer(key, next);
     setBuf(next);
     if (meta.exists) setRefMeta(meta);
+  };
+
+  const refreshDesign = () => {
+    const refresh = async () => {
+      setLoading(true);
+      try {
+        await reload();
+        setApplyResult(null);
+        setStats(null);
+        setStorage(null);
+        setAdvisor(null);
+        s.toast("success", `${table} refreshed from the database.`);
+      } catch (e: unknown) {
+        s.toast("error", e instanceof Error ? e.message : "Refresh failed.");
+      } finally {
+        setLoading(false);
+      }
+    };
+    if (dirty) {
+      s.askConfirm({
+        title: `Refresh ${table}?`,
+        body: "Refreshing reloads the table definition from the database and discards your pending design edits.",
+        confirmLabel: "Discard edits and refresh",
+        onConfirm: refresh,
+      });
+    } else {
+      void refresh();
+    }
   };
 
   // refresh only the DB reference data (indexes/constraints), leaving column edits untouched
@@ -711,6 +740,11 @@ export default function TableDesigner({ table, tabId }: { table: string; tabId: 
           {!isNew && (
             <Btn variant="outline" onClick={() => s.openTab("data", table, table)} disabled={applying} title="Show rows from this table">
               <Eye size={12} /> Show Data
+            </Btn>
+          )}
+          {!isNew && (
+            <Btn variant="ghost" onClick={refreshDesign} disabled={applying} title="Reload the table definition from the database">
+              <RefreshCw size={12} /> Refresh
             </Btn>
           )}
           {editable && !isNew && (
