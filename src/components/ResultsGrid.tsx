@@ -19,8 +19,9 @@ import {
 import type { CellValue } from "../types";
 import { download, toCsv, toJson, toInserts } from "../utils/sql";
 import { Btn, Modal } from "./ui";
+import { copyText } from "../utils/clipboard";
 
-const PAGE = 10;
+const PAGE_SIZES = [100, 250, 500, 1000, 2000, 4000];
 
 /** Long values keep a detail button even when the column is resized. */
 const CELL_CLIP = 140;
@@ -60,6 +61,7 @@ export default function ResultsGrid({
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(100);
   const [hidden, setHidden] = useState<Set<number>>(new Set());
   const [colsOpen, setColsOpen] = useState(false);
   /** full value of a clipped cell, opened from the grid */
@@ -82,9 +84,9 @@ export default function ResultsGrid({
     return out;
   }, [rows, filter, sort]);
 
-  const pages = Math.max(1, Math.ceil(filtered.length / PAGE));
-  const pageRows = paginate ? filtered.slice(page * PAGE, page * PAGE + PAGE) : filtered;
-  const rowOffset = paginate ? page * PAGE : 0;
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageRows = paginate ? filtered.slice(page * pageSize, page * pageSize + pageSize) : filtered;
+  const rowOffset = paginate ? page * pageSize : 0;
   const visCols = columns.map((c, i) => ({ name: c, i })).filter((c) => !hidden.has(c.i)).sort((a, b) => Number(pinned.has(b.i)) - Number(pinned.has(a.i)));
   const columnWidth = (i: number) => widths[i] ?? Math.min(260, Math.max(140, columns[i].length * 8 + 60));
   const columnStyle = (i: number) => pinned.has(i) ? { position: "sticky" as const, left: 48 + visCols.slice(0, visCols.findIndex((c) => c.i === i)).reduce((n, c) => n + columnWidth(c.i), 0), zIndex: 2 } : {};
@@ -184,6 +186,14 @@ export default function ResultsGrid({
           <Btn variant="outline" title="Export as JSON" onClick={() => download(`${exportName}.json`, toJson(columns, filtered), "application/json")}>
             <Download size={12} /> JSON
           </Btn>
+          <Btn variant="outline" title="Copy all filtered result rows as JSON" onClick={async () => {
+            try {
+              await copyText(toJson(columns, filtered));
+              studio.toast("success", "JSON copied to clipboard");
+            } catch (error) {
+              studio.toast("error", error instanceof Error ? error.message : "Could not copy JSON to clipboard.");
+            }
+          }}><Copy size={12} /> Copy JSON</Btn>
         </div>
       </div>
 
@@ -287,6 +297,17 @@ export default function ResultsGrid({
           )}
         </span>
         {paginate && <div className="ml-auto flex items-center gap-1">
+          <label className="flex items-center gap-1.5 mr-2">
+            Rows per page
+            <select
+              aria-label="Rows per page"
+              value={pageSize}
+              onChange={(event) => { setPageSize(Number(event.target.value)); setPage(0); }}
+              className="rounded border border-bdr bg-panel2 px-1.5 py-1 text-ink"
+            >
+              {PAGE_SIZES.map((size) => <option key={size} value={size}>{size.toLocaleString()}</option>)}
+            </select>
+          </label>
           <button
             className="p-1 rounded hover:bg-panel3 disabled:opacity-30"
             disabled={page === 0}
