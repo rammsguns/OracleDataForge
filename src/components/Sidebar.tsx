@@ -67,7 +67,7 @@ const EMPTY_SCHEMA: SchemaDef = { schemaName: "", groups: [] };
 type LiveSchemaState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; schema: SchemaDef; rowCounts: Record<string, number> };
+  | { status: "ready"; schema: SchemaDef; rowCounts: Record<string, number>; refreshing?: boolean };
 
 const KIND_ICON: Record<string, React.ReactNode> = {
   database: <Database size={13} />,
@@ -260,7 +260,7 @@ export default function Sidebar() {
   // mid-fetch would come back to a spinner nothing can resolve.
   useEffect(() => {
     for (const k of Object.keys(schemaCache)) delete schemaCache[k];
-    for (const [k, v] of Object.entries(liveSchemas)) if (v.status !== "loading") schemaCache[k] = v;
+    for (const [k, v] of Object.entries(liveSchemas)) if (v.status !== "loading") schemaCache[k] = v.status === "ready" ? { ...v, refreshing: false } : v;
   }, [liveSchemas]);
 
   // a different schema starts from a short list again, rather than inheriting how far
@@ -274,8 +274,15 @@ export default function Sidebar() {
   const refreshSchema = (connId: string) => {
     const c = s.connections.find(connection => connection.id === connId);
     // "idle" = disconnected on purpose — don't re-open a pool behind the user's back
-    if (!c?.live || c.status !== "connected" || liveSchemas[c.id]?.status === "loading") return;
-    setLiveSchemas((m) => ({ ...m, [c.id]: { status: "loading" } }));
+    if (!c?.live || c.status !== "connected") return;
+    const current = liveSchemas[c.id];
+    if (current?.status === "loading" || (current?.status === "ready" && current.refreshing)) return;
+    setLiveSchemas((m) => {
+      const previous = m[c.id];
+      return { ...m, [c.id]: previous?.status === "ready"
+        ? { ...previous, refreshing: true }
+        : { status: "loading" } };
+    });
     api
       .schema(c.id)
       .then((r) =>
@@ -295,9 +302,15 @@ export default function Sidebar() {
           },
         }))
       )
-      .catch((e: Error) =>
-        setLiveSchemas((m) => ({ ...m, [c.id]: { status: "error", message: e.message } }))
-      );
+      .catch((e: Error) => {
+        setLiveSchemas((m) => {
+          const previous = m[c.id];
+          return { ...m, [c.id]: previous?.status === "ready"
+            ? { ...previous, refreshing: false }
+            : { status: "error", message: e.message } };
+        });
+        s.toast("warning", `Could not refresh schema — ${e.message}. Use Refresh to retry.`);
+      });
   };
 
   /**
@@ -425,6 +438,7 @@ export default function Sidebar() {
   }, [s.schemaBump]);
 
   const liveState = activeConn?.live ? liveSchemas[activeConn.id] : undefined;
+  const schemaRefreshing = liveState?.status === "loading" || (liveState?.status === "ready" && !!liveState.refreshing);
   const schema: SchemaDef = liveState?.status === "ready" ? liveState.schema : EMPTY_SCHEMA;
   const liveRowCounts = liveState?.status === "ready" ? liveState.rowCounts : undefined;
   const browsed = schemaOf(activeConn) ?? schema.schemaName;
@@ -930,15 +944,15 @@ export default function Sidebar() {
           {activeConn?.live ? (
             <span className="ml-auto flex items-center gap-1">
               <button
-                aria-label={liveState?.status === "loading" ? "Refreshing schema…" : "Refresh schema"}
-                aria-busy={liveState?.status === "loading"}
-                title={liveState?.status === "loading" ? "Refreshing schema…" : "Refresh schema (re-reads the data dictionary)"}
+                aria-label={schemaRefreshing ? "Refreshing schema…" : "Refresh schema"}
+                aria-busy={schemaRefreshing}
+                title={schemaRefreshing ? "Refreshing schema…" : "Refresh schema (re-reads the data dictionary)"}
                 onClick={() => refreshSchema(activeConn.id)}
-                disabled={activeConn.status !== "connected" || liveState?.status === "loading"}
+                disabled={activeConn.status !== "connected" || schemaRefreshing}
                 className="flex items-center gap-1 p-0.5 rounded hover:bg-panel3 hover:text-accenthi disabled:opacity-50 transition-colors"
               >
-                <RefreshCcw size={12} className={liveState?.status === "loading" ? "df-spin" : ""} />
-                {liveState?.status === "loading" && <span role="status" className="text-[10px] font-medium normal-case tracking-normal">Refreshing…</span>}
+                <RefreshCcw size={12} className={schemaRefreshing ? "df-spin" : ""} />
+                {schemaRefreshing && <span role="status" className="text-[10px] font-medium normal-case tracking-normal">Refreshing…</span>}
               </button>
               <span className="text-[9px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 normal-case" title="Real database, reached through the local backend">
                 live
