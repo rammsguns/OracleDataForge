@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isServerOutputOn, worksheetStatement, worksheetStatements, statementRanges } from './worksheetStatement';
+import { isServerOutputOn, isWorksheetClientDirective, worksheetStatement, worksheetStatements, statementRanges } from './worksheetStatement';
 test('runs either query from the reported worksheet', () => {
   const sql = '-- worksheet\n-- Ctrl+Enter\nSELECT * FROM categories;\nSELECT * FROM customers;';
   assert.equal(worksheetStatement(sql, sql.indexOf('categories')), 'SELECT * FROM categories;');
@@ -68,4 +68,31 @@ test('SERVEROUTPUT text in comments, literals and blocks stays untouched', () =>
   assert.deepEqual(worksheetStatements(block, 0, block.length), [block]);
   assert.equal(isServerOutputOn("SELECT 'SET SERVEROUTPUT ON' FROM dual;"), false);
   assert.equal(isServerOutputOn('-- SET SERVEROUTPUT ON'), false);
+});
+
+test('SQL Developer exports separate annotations and settings from inserts', () => {
+  const insert = "Insert into MAT_EMAILS_GPID (EMAIL) values ('a&b@example.com');";
+  const sql = `REM INSERTING into MAT_EMAILS_GPID\r\nSET DEFINE OFF;\r\n${insert}\r\nCOMMIT;`;
+  const statements = worksheetStatements(sql, 0, sql.length);
+  assert.equal(statements.length, 4);
+  assert.deepEqual(statements.filter(item => !isWorksheetClientDirective(item)), [insert, 'COMMIT;']);
+  assert.equal(worksheetStatement(sql, sql.indexOf('values')), insert);
+});
+
+test('client annotations tolerate quotes and semicolons and common display settings', () => {
+  for (const directive of ["REM customer's export;", 'remark export', 'PROMPT Loading data;', 'set define off', 'SET FEEDBACK OFF;', 'SET PAGESIZE 0', 'SET VERIFY OFF -- export']) {
+    const sql = `${directive}\nSELECT 1 FROM dual;`;
+    const statements = worksheetStatements(sql, 0, sql.length);
+    assert.equal(statements.length, 2, directive);
+    assert.equal(isWorksheetClientDirective(statements[0]), true, directive);
+    assert.equal(statements[1], 'SELECT 1 FROM dual;');
+  }
+});
+
+test('client handling preserves SQL, PL/SQL and execution-affecting settings', () => {
+  for (const sql of ['SET TRANSACTION READ ONLY;', 'SET ROLE ALL;', 'SET DEFINE ON;', 'SET AUTOCOMMIT ON;', "SELECT 'REM export' FROM dual;"]) {
+    assert.equal(isWorksheetClientDirective(sql), false, sql);
+  }
+  const block = "BEGIN\n DBMS_OUTPUT.PUT_LINE(q'[\nREM export\nSET DEFINE OFF;\n]');\nEND;";
+  assert.deepEqual(worksheetStatements(block, 0, block.length), [block]);
 });

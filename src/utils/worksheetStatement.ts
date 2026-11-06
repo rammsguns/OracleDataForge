@@ -4,6 +4,16 @@ function mask(sql: string): string {
   const blank = (a: number, b: number) => { for (let j = a; j < b; j++) if (chars[j] !== '\n' && chars[j] !== '\r') chars[j] = ' '; };
   for (let i = 0; i < sql.length;) {
     const start = i;
+    // Annotation text is not SQL: an apostrophe here must not open a literal
+    // that masks the following statements. Retain the command for range parsing.
+    const annotation = (i === 0 || sql[i - 1] === '\n')
+      ? /^[ \t]*(?:REM(?:ARK)?|PROMPT)\b/i.exec(sql.slice(i)) : null;
+    if (annotation) {
+      const end = sql.indexOf('\n', i);
+      i = end < 0 ? sql.length : end;
+      blank(start + annotation[0].length, i);
+      continue;
+    }
     if (sql.startsWith('--', i)) { const end = sql.indexOf('\n', i); i = end < 0 ? sql.length : end; }
     else if (sql.startsWith('/*', i)) { const end = sql.indexOf('*/', i + 2); i = end < 0 ? sql.length : end + 2; }
     else if (/[qQ]/.test(sql[i]) && sql[i + 1] === "'") {
@@ -24,6 +34,15 @@ export function isServerOutputOn(sql: string): boolean {
   return /^\s*SET\s+SERVEROUTPUT\s+ON(?:\s+SIZE\s+(?:UNLIMITED|\d+))?(?:\s+FORMAT\s+(?:WRAPPED|WORD_WRAPPED|TRUNCATED))?\s*;?\s*$/i.test(mask(sql));
 }
 
+/** Export-script annotations and display settings have no database-side effect.
+ * DEFINE OFF is already the worksheet default: SQL is sent without substitution.
+ * Keep execution-affecting settings (AUTOCOMMIT, DEFINE ON, etc.) out of this list.
+ */
+export function isWorksheetClientDirective(sql: string): boolean {
+  if (/^\s*(?:REM(?:ARK)?|PROMPT)\b[^\r\n]*\s*$/i.test(sql)) return true;
+  return isServerOutputOn(sql) || /^\s*SET\s+(?:DEFINE\s+OFF|(?:ECHO|FEEDBACK|HEADING|VERIFY|TERMOUT|TIMING)\s+(?:ON|OFF)|(?:PAGESIZE|LINESIZE|LONG|LONGCHUNKSIZE)\s+\d+)\s*;?\s*$/i.test(mask(sql));
+}
+
 export function statementRanges(sql: string) {
   const code = mask(sql);
   const ranges: { start: number; end: number }[] = [];
@@ -35,7 +54,7 @@ export function statementRanges(sql: string) {
     // recognize them at statement boundaries, never inside stored PL/SQL.
     const lineEnd = code.indexOf('\n', start);
     const directiveEnd = lineEnd < 0 ? code.length : lineEnd;
-    if (isServerOutputOn(sql.slice(start, directiveEnd))) {
+    if (isWorksheetClientDirective(sql.slice(start, directiveEnd))) {
       ranges.push({ start, end: directiveEnd });
       start = directiveEnd;
       continue;

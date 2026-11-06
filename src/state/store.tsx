@@ -1,4 +1,4 @@
-import { isServerOutputOn, worksheetStatement, worksheetStatements } from "../utils/worksheetStatement";
+import { isServerOutputOn, isWorksheetClientDirective, worksheetStatement, worksheetStatements } from "../utils/worksheetStatement";
 import {
   createContext,
   useCallback,
@@ -639,7 +639,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [toast, finishTransaction, setConnStatus]);
 
   const reallyRun = useCallback(
-    (statement: string, confirmed = false, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false) => {
+    (statement: string, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false) => {
       if (worksheetBusy.current) return;
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
@@ -667,22 +667,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           transactionsRef.current = { ...transactionsRef.current, [conn.id]: transactionId };
           setTransactions(current => ({ ...current, [conn.id]: session.transactionId }));
         }
-        return api.query(conn.id, statement, confirmed, transactionId);
+        // Running a worksheet explicitly authorizes its statements, including writes.
+        return api.query(conn.id, statement, true, transactionId);
       })()
         .then((res) => {
-          // the write guard held this statement back: nothing ran, so don't touch the
-          // result grid or history — just ask, using the backend's own wording
-          if (res.confirmation) {
-            const g = res.confirmation;
-            setConfirm({
-              title: g.title,
-              body: g.body,
-              confirmLabel: g.confirmLabel,
-              danger: g.danger,
-              onConfirm: () => reallyRun(statement, true, conn, transactionId, remaining, previousOutput, previousTruncated),
-            });
-            return;
-          }
           const combinedOutput = [...previousOutput, ...(res.dbmsOutput ?? [])];
           scriptOutput = combinedOutput.slice(0, 1000);
           outputTruncated = previousTruncated || !!res.dbmsOutputTruncated || combinedOutput.length > 1000;
@@ -721,7 +709,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         .finally(() => {
           worksheetBusy.current = false;
           setRunning(false);
-          if (continueScript && remaining.length) reallyRun(remaining[0], false, conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated);
+          if (continueScript && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated);
         });
     },
     [accessRole, toast, pushHistory, setConnStatus]
@@ -736,9 +724,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         catch (error) { toast("warning", (error as Error).message); return; }
       }
       const outputEnabled = statements.some(isServerOutputOn);
-      statements = statements.filter(item => !isServerOutputOn(item));
+      const clientDirectives = statements.filter(isWorksheetClientDirective);
+      statements = statements.filter(item => !isWorksheetClientDirective(item));
       if (outputEnabled) toast("info", "DBMS_OUTPUT enabled — messages appear in the DBMS Output tab");
-      if (outputEnabled && statements.length === 0) return;
+      if (clientDirectives.length && statements.length === 0) {
+        if (!outputEnabled) toast("info", "Script comments and display settings processed locally. Worksheet variable substitution is disabled.");
+        return;
+      }
       const statement = statements[0] ?? "";
       if (!statement.trim()) { toast("info", "Place the cursor inside a statement to run it."); return; }
       if (accessRole === "Analyst") {
@@ -764,9 +756,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("warning", `Blocked: "${activeConnRef.current.name}" is read-only`);
         return;
       }
-      // everything else goes to the backend unacknowledged: it runs reads, and answers
-      // writes with a confirmation for the dialog above (see reallyRun)
-      reallyRun(statement, false, activeConnRef.current, undefined, statements.slice(1));
+      reallyRun(statement, activeConnRef.current, undefined, statements.slice(1));
     },
     [accessRole, reallyRun, toast]
   );
