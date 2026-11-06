@@ -922,6 +922,11 @@ function oraWalletOptions(c: ConnConfig): oracledb.ConnectionAttributes {
   return { configDir: dir, walletLocation: dir, ...(c.walletPassword ? { walletPassword: c.walletPassword } : {}) };
 }
 
+function setOraSessionModule(conn: oracledb.Connection): oracledb.Connection {
+  conn.module = "SQL Developer";
+  return conn;
+}
+
 async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
   if (!c.oraPool) {
     c.oraPool = await oracledb.createPool({
@@ -940,14 +945,14 @@ async function getOraPool(c: LiveConnection): Promise<oracledb.Pool> {
 async function getOraConn(c: LiveConnection): Promise<oracledb.Connection> {
   const privilege = oraPrivilege(c);
   if (privilege !== undefined) {
-    return oracledb.getConnection({
+    return setOraSessionModule(await oracledb.getConnection({
       user: c.user, password: c.password, connectString: oraConnectString(c),
       ...oraWalletOptions(c),
       privilege, connectTimeout: 8,
-    });
+    }));
   }
   const pool = await getOraPool(c);
-  return pool.getConnection();
+  return setOraSessionModule(await pool.getConnection());
 }
 
 async function oraTest(cfg: ConnConfig): Promise<string> {
@@ -958,6 +963,7 @@ async function oraTest(cfg: ConnConfig): Promise<string> {
     ...oraWalletOptions(cfg),
     ...(privilege !== undefined ? { privilege } : {}),
   });
+  setOraSessionModule(conn);
   await conn.execute("SELECT 1 FROM dual");
   const v = conn.oracleServerVersionString;
   await conn.close();
@@ -7694,10 +7700,10 @@ app.post("/api/connections/:id/worksheet-session", requireFullAccess, async (req
   if (!c) return res.status(404).json({ error: 'Unknown connection' });
   if (c.readOnly) return res.status(403).json({ error: 'This connection is read-only.' });
   try {
-    const transactionId = await worksheetSessions.create(worksheetOwner(req), c.id, () => oracledb.getConnection({
+    const transactionId = await worksheetSessions.create(worksheetOwner(req), c.id, async () => setOraSessionModule(await oracledb.getConnection({
       user: c.user, password: c.password, connectString: oraConnectString(c),
       ...oraWalletOptions(c), privilege: oraPrivilege(c), connectTimeout: 8,
-    }));
+    })));
     res.json({ transactionId });
   } catch (e) { res.status(400).json({ error: errMsg(e) }); }
 });
