@@ -4,6 +4,7 @@ import { useStudio } from "../state/store";
 import { api, type LiveQueryResult } from "../utils/api";
 import ResultsGrid from "./ResultsGrid";
 import RowEditor from "./RowEditor";
+import { getDataPreview, setDataPreview, dataPreviewKey } from "../utils/dataBrowserCache";
 import { Btn, Badge, EmptyState, Spinner } from "./ui";
 
 const DEFAULT_PREVIEW_ROWS = 100;
@@ -18,12 +19,15 @@ const previewSql = (engine: string | undefined, table: string, limit: number) =>
 
 export default function DataBrowser({ table }: { table: string }) {
   const s = useStudio();
-  const [loading, setLoading] = useState(true);
-  const [liveData, setLiveData] = useState<LiveQueryResult | null>(null);
+  const cacheKey = dataPreviewKey(s.activeConnId ?? "", table);
+  // Tabs unmount when inactive; restore the previously loaded rows instead of re-querying.
+  const cached = getDataPreview(cacheKey);
+  const [loading, setLoading] = useState(!cached);
+  const [liveData, setLiveData] = useState<LiveQueryResult | null>(cached?.data ?? null);
   const [liveError, setLiveError] = useState<string | null>(null);
-  const [reloads, setReloads] = useState(0);
-  const [rowLimit, setRowLimit] = useState(DEFAULT_PREVIEW_ROWS);
-  const [rowLimitInput, setRowLimitInput] = useState(String(DEFAULT_PREVIEW_ROWS));
+  const [reloads, setReloads] = useState(cached?.reloads ?? 0);
+  const [rowLimit, setRowLimit] = useState(cached?.rowLimit ?? DEFAULT_PREVIEW_ROWS);
+  const [rowLimitInput, setRowLimitInput] = useState(cached?.rowLimitInput ?? String(DEFAULT_PREVIEW_ROWS));
   const validRowLimit = /^[0-9]+$/.test(rowLimitInput) && Number(rowLimitInput) >= 1 && Number(rowLimitInput) <= MAX_PREVIEW_ROWS;
   /** "edit" swaps the read-only preview for the ROWID-backed row editor */
   const [mode, setMode] = useState<"view" | "edit">("view");
@@ -60,6 +64,13 @@ export default function DataBrowser({ table }: { table: string }) {
 
   useEffect(() => {
     if (!conn || mode === "edit") return;
+    const hit = getDataPreview(dataPreviewKey(conn.id, table));
+    if (hit && hit.reloads === reloads && hit.rowLimit === rowLimit) {
+      setLiveData(hit.data);
+      setLiveError(null);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLiveData(null);
     setLiveError(null);
@@ -69,7 +80,10 @@ export default function DataBrowser({ table }: { table: string }) {
       .then((r) => {
         if (cancelled) return;
         if (r.error) setLiveError(r.error.message);
-        else setLiveData(r);
+        else {
+          setLiveData(r);
+          setDataPreview(dataPreviewKey(conn.id, table), { data: r, rowLimit, rowLimitInput: String(rowLimit), reloads });
+        }
       })
       .catch((e: Error) => !cancelled && setLiveError(`Backend unreachable: ${e.message}`))
       .finally(() => !cancelled && setLoading(false));
