@@ -21,6 +21,7 @@ import type {
 import { api, type ExplainResult, type SessionInfo, type RowChangeRequest, type RowChangeResult } from "../utils/api";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
+import { discardDataPreview } from "../utils/dataBrowserCache";
 import { destructiveCheck, formatSql, isReadOnlySql } from "../utils/sql";
 
 export interface ConfirmState {
@@ -499,6 +500,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [accessRole, toast]);
 
   const doCloseTab = useCallback((id: string) => {
+    const closing = tabsRef.current.find((x) => x.id === id);
+    if (closing?.kind === "data" && closing.payload) discardDataPreview(closing.payload);
     setWorksheetSql((previous) => {
       const next = { ...previous };
       delete next[id];
