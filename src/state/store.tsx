@@ -353,9 +353,16 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     try { sessionStorage.setItem('dataforge.worksheet.sessions', JSON.stringify(transactions)); } catch { /* unavailable */ }
   }, [transactions]);
-  const [result, setResult] = useState<ResultSet | null>(null);
-  const [planVisible, setPlanVisible] = useState(false);
-  const [plan, setPlan] = useState<ExplainResult | null>(null);
+  // Result, plan and plan visibility are kept per worksheet tab so switching tabs preserves them.
+  const [results, setResults] = useState<Record<string, ResultSet | null>>({});
+  const [planVisibles, setPlanVisibles] = useState<Record<string, boolean>>({});
+  const [plans, setPlans] = useState<Record<string, ExplainResult | null>>({});
+  const result = results[worksheetId] ?? null;
+  const planVisible = planVisibles[worksheetId] ?? false;
+  const plan = plans[worksheetId] ?? null;
+  const setResultFor = useCallback((id: string, value: ResultSet | null) => setResults((p) => ({ ...p, [id]: value })), []);
+  const setPlanFor = useCallback((id: string, value: ExplainResult | null) => setPlans((p) => ({ ...p, [id]: value })), []);
+  const setPlanVisible = useCallback((value: boolean) => setPlanVisibles((p) => ({ ...p, [worksheetIdRef.current]: value })), []);
   const [planLoading, setPlanLoading] = useState(false);
   const [schemaBump, setSchemaBump] = useState(0);
   const [groupRefresh, setGroupRefresh] = useState<{ labels: string[]; seq: number }>({ labels: [], seq: 0 });
@@ -507,6 +514,14 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       delete next[id];
       return next;
     });
+    const without = <T,>(previous: Record<string, T>) => {
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    };
+    setResults(without);
+    setPlans(without);
+    setPlanVisibles(without);
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.id === id);
       const next = prev.filter((t) => t.id !== id);
@@ -642,8 +657,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [toast, finishTransaction, setConnStatus]);
 
   const reallyRun = useCallback(
-    (statement: string, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false) => {
+    (statement: string, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false, wsId = worksheetIdRef.current) => {
       if (worksheetBusy.current) return;
+      const setResult = (value: ResultSet | null) => setResultFor(wsId, value);
       // every connection is live now — nothing selected means nothing to run against
       if (!conn?.live) {
         setResult({
@@ -659,7 +675,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       }
       worksheetBusy.current = true;
       setRunning(true);
-      setPlanVisible(false);
+      setPlanVisibles((p) => ({ ...p, [wsId]: false }));
       let continueScript = false;
       let scriptOutput = previousOutput;
       let outputTruncated = previousTruncated;
@@ -712,10 +728,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         .finally(() => {
           worksheetBusy.current = false;
           setRunning(false);
-          if (continueScript && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated);
+          if (continueScript && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated, wsId);
         });
     },
-    [accessRole, toast, pushHistory, setConnStatus]
+    [accessRole, toast, pushHistory, setConnStatus, setResultFor]
   );
 
   const runSql = useCallback(
@@ -748,7 +764,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       // this too — this is just instant feedback with no round trip)
       if (statements.some(item => !isReadOnlySql(item)) && activeConnRef.current?.readOnly) {
         const d = destructiveCheck(statement);
-        setResult({
+        setResultFor(worksheetIdRef.current, {
           columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
           error: {
             message: `This connection is read-only — ${d ? `${d.verb} on ${d.target}` : "this statement"} was blocked. Edit the connection to disable read-only mode if you need to make changes.`,
@@ -761,7 +777,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       }
       reallyRun(statement, activeConnRef.current, undefined, statements.slice(1));
     },
-    [accessRole, reallyRun, toast]
+    [accessRole, reallyRun, toast, setResultFor]
   );
 
   const doFormat = useCallback(() => {
@@ -771,6 +787,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const runExplain = useCallback(() => {
     const conn = activeConnRef.current;
+    const wsId = worksheetIdRef.current;
+    const setPlan = (value: ExplainResult | null) => setPlanFor(wsId, value);
     let statement: string;
     const selection = sqlSelection.current.source === sqlRef.current ? sqlSelection.current : { start: 0, end: 0 };
     try { statement = worksheetStatement(sqlRef.current, selection.start, selection.end); }
@@ -802,7 +820,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("error", "Backend unreachable — is the API server running?");
       })
       .finally(() => setPlanLoading(false));
-  }, [toast, setConnStatus]);
+  }, [toast, setConnStatus, setPlanFor]);
 
   const openSqlWorksheet = useCallback((nextSql: string, title: string) => {
     if (!["Administrator", "Developer", "Viewer"].includes(accessRole)) {
