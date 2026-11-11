@@ -265,7 +265,7 @@ test('JSON and large Unicode CLOB/NCLOB text are bound without parsing or trunca
     if (sql.includes('user_tab_cols')) return { rows: columns };
     assert.match(sql, /JSON_SERIALIZE\("DOC" RETURNING CLOB EXTENDED ERROR ON ERROR\)/);
     const handler = options.fetchTypeHandler!;
-    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0])?.type, oracledb.STRING);
+    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0], [])?.type, oracledb.STRING);
     assert.equal(options.fetchArraySize, 1);
     let i = 0;
     return { resultSet: { getRows: async (size: number) => { assert.equal(size, 1); return i < documents.length ? [[documents[i++], text, null]] : []; }, close: async () => {} } };
