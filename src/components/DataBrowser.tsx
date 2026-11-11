@@ -4,7 +4,7 @@ import { useStudio } from "../state/store";
 import { api, type LiveQueryResult } from "../utils/api";
 import ResultsGrid from "./ResultsGrid";
 import RowEditor from "./RowEditor";
-import { getDataPreview, setDataPreview, dataPreviewKey } from "../utils/dataBrowserCache";
+import { getDataPreview, setDataPreview, dataPreviewKey, getDataMode, setDataMode } from "../utils/dataBrowserCache";
 import { Btn, Badge, EmptyState, Spinner } from "./ui";
 
 const DEFAULT_PREVIEW_ROWS = 100;
@@ -30,7 +30,8 @@ export default function DataBrowser({ table }: { table: string }) {
   const [rowLimitInput, setRowLimitInput] = useState(cached?.rowLimitInput ?? String(DEFAULT_PREVIEW_ROWS));
   const validRowLimit = /^[0-9]+$/.test(rowLimitInput) && Number(rowLimitInput) >= 1 && Number(rowLimitInput) <= MAX_PREVIEW_ROWS;
   /** "edit" swaps the read-only preview for the ROWID-backed row editor */
-  const [mode, setMode] = useState<"view" | "edit">("view");
+  const [mode, setMode] = useState<"view" | "edit">(() => getDataMode(cacheKey));
+  useEffect(() => setDataMode(cacheKey, mode), [cacheKey, mode]);
   const conn = s.connections.find((c) => c.id === s.activeConnId);
   // rows are written one statement at a time, so the same roles that may run a write may edit
   const canEdit = (s.accessRole === "Administrator" || s.accessRole === "Developer") && conn?.engine === "oracle" && !conn.readOnly;
