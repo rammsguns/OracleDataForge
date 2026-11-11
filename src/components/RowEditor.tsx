@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, ChevronLeft, ChevronRight, CircleAlert, Lock, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, ChevronLeft, ArrowDown, ArrowUp, ChevronRight, CircleAlert, Filter, Lock, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useStudio } from "../state/store";
 import { api, ConfirmRequiredError, type RowChangeRequest, type RowEditColumn, type TableRowsResult } from "../utils/api";
 import type { CellValue } from "../types";
+import { getRowEditor, setRowEditor } from "../utils/dataBrowserCache";
 import { Badge, Btn, EmptyState, Spinner } from "./ui";
 
 const PAGE = 25;
@@ -29,14 +30,20 @@ const snapshotOf = (row: CellValue[], columns: RowEditColumn[]) =>
  */
 export default function RowEditor({ table, connId }: { table: string; connId: string }) {
   const s = useStudio();
-  const [data, setData] = useState<TableRowsResult | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Tabs unmount when inactive; restore rows, sort, filter, page and unsaved drafts.
+  const cacheKey = `${connId}.${table}`;
+  const [cached] = useState(() => getRowEditor(cacheKey));
+  const [data, setData] = useState<TableRowsResult | null>(cached?.data ?? null);
+  const [loading, setLoading] = useState(!cached);
   const [error, setError] = useState<string | null>(null);
-  const [page, setPage] = useState(0);
+  const [page, setPage] = useState(cached?.page ?? 0);
   /** the row being edited, keyed by ROWID so paging or a refresh cannot move it under us */
-  const [editing, setEditing] = useState<{ rowId: string; draft: Record<string, string> } | null>(null);
-  const [adding, setAdding] = useState<Record<string, string> | null>(null);
+  const [editing, setEditing] = useState<{ rowId: string; draft: Record<string, string> } | null>(cached?.editing ?? null);
+  const [adding, setAdding] = useState<Record<string, string> | null>(cached?.adding ?? null);
   const [busy, setBusy] = useState(false);
+  const [filter, setFilter] = useState(cached?.filter ?? "");
+  const [columnSearch, setColumnSearch] = useState(cached?.columnSearch ?? "");
+  const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(cached?.sort ?? null);
   const autoCommit = s.isAutoCommit(connId);
   const getTransactionId = s.getTransactionId;
 
@@ -55,16 +62,46 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
     }
   }, [connId, table, getTransactionId]);
 
+  // The first run after a remount keeps the cached rows unless the schema was refreshed since.
+  // Not cleared after use: StrictMode runs effects twice in development, and the schema
+  // counter only ever grows, so a later refresh can never match it again.
+  const restoredBump = useRef(cached?.bump);
   useEffect(() => {
+    if (restoredBump.current === s.schemaBump) return;
     void load();
   }, [load, s.schemaBump]);
 
+  useEffect(() => {
+    if (data) setRowEditor(cacheKey, { data, bump: s.schemaBump, filter, columnSearch, sort, page, editing, adding });
+  }, [cacheKey, data, s.schemaBump, filter, columnSearch, sort, page, editing, adding]);
+
   const columns = data?.columns ?? [];
   const rows = useMemo(() => data?.rows ?? [], [data]);
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  /** indexes into `rows`/`rowIds` after the row filter and sort, so each row keeps its ROWID */
+  const view = useMemo(() => {
+    const f = filter.trim().toLowerCase();
+    const idx = rows.map((_, i) => i).filter((i) => !f || rows[i].some((c) => c !== null && String(c).toLowerCase().includes(f)));
+    if (sort) {
+      idx.sort((x, y) => {
+        const av = rows[x][sort.col];
+        const bv = rows[y][sort.col];
+        if (av === null && bv === null) return 0;
+        if (av === null) return 1; // NULLs last in either direction
+        if (bv === null) return -1;
+        if (typeof av === "number" && typeof bv === "number") return (av - bv) * sort.dir;
+        return String(av).localeCompare(String(bv), undefined, { numeric: true }) * sort.dir;
+      });
+    }
+    return idx;
+  }, [rows, filter, sort]);
+  const pages = Math.max(1, Math.ceil(view.length / PAGE));
   const clampedPage = Math.min(page, pages - 1);
   const first = clampedPage * PAGE;
-  const pageRows = rows.slice(first, first + PAGE);
+  const pageIdx = view.slice(first, first + PAGE);
+  const visCols = useMemo(
+    () => columns.map((c, i) => ({ c, i })).filter(({ c }) => c.name.toLowerCase().includes(columnSearch.trim().toLowerCase())),
+    [columns, columnSearch],
+  );
 
   /**
    * One row change, through the backend's write guard: the first call is deliberately
@@ -100,6 +137,9 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
         if (r.action === "insert") {
           setAdding(null);
           // the new row is appended, so land on the page that actually shows it
+          // clear filter and sort so the appended row is really on that last page
+          setFilter("");
+          setSort(null);
           setPage(Math.max(0, Math.ceil((rows.length + 1) / PAGE) - 1));
         } else {
           setEditing(null);
@@ -199,7 +239,7 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
     "w-full min-w-24 h-6.5 px-1.5 rounded bg-panel2 border border-bdr text-[11.5px] font-mono text-ink placeholder:text-mute focus:border-accent focus:outline-none";
 
   const editorInputs = (draft: Record<string, string>, set: (name: string, v: string) => void) =>
-    columns.map((c) =>
+    visCols.map(({ c }) =>
       c.editable ? (
         <td key={c.name} className={cellCls}>
           <input
@@ -243,10 +283,28 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
           <RefreshCw size={12} className={busy ? "df-spin" : ""} /> Refresh
         </Btn>
         <span className="text-[11.5px] text-mute">
-          {rows.length.toLocaleString()} row{rows.length === 1 ? "" : "s"}
+          {view.length.toLocaleString()} row{view.length === 1 ? "" : "s"}
+          {view.length !== rows.length ? ` (filtered from ${rows.length.toLocaleString()})` : ""}
           {data.truncated ? ` (first ${rows.length.toLocaleString()} only)` : ""}
         </span>
         {data.truncated && <Badge tone="warn">truncated</Badge>}
+        <div className="relative">
+          <Filter size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-mute" />
+          <input
+            value={filter}
+            onChange={(e) => { setFilter(e.target.value); setPage(0); }}
+            placeholder="Filter rows…"
+            aria-label="Filter rows"
+            className="h-7 w-44 rounded border border-bdr bg-panel2 pl-7 pr-2 text-[12px] text-ink placeholder:text-mute focus:border-accent focus:outline-none"
+          />
+        </div>
+        <input
+          value={columnSearch}
+          onChange={(e) => setColumnSearch(e.target.value)}
+          placeholder="Search columns…"
+          aria-label="Search columns"
+          className="h-7 w-36 rounded border border-bdr bg-panel2 px-2 text-[12px] text-ink placeholder:text-mute focus:border-accent focus:outline-none"
+        />
         <div className="ml-auto flex items-center gap-1.5">
           <Btn variant="outline" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={clampedPage === 0}>
             <ChevronLeft size={12} />
@@ -269,9 +327,16 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
           <thead className="sticky top-0 z-10 bg-panel">
             <tr>
               <th className="px-2 py-1.5 text-left border-b border-bdr w-20" />
-              {columns.map((c) => (
-                <th key={c.name} className="px-2 py-1.5 text-left border-b border-bdr font-mono font-semibold whitespace-nowrap" title={c.reason}>
+              {visCols.map(({ c, i }) => (
+                <th
+                  key={c.name}
+                  className="px-2 py-1.5 text-left border-b border-bdr font-mono font-semibold whitespace-nowrap cursor-pointer select-none"
+                  title={c.reason ?? `Sort by ${c.name}`}
+                  aria-sort={sort?.col === i ? (sort.dir === 1 ? "ascending" : "descending") : "none"}
+                  onClick={() => { setSort((s0) => (s0?.col === i ? (s0.dir === 1 ? { col: i, dir: -1 } : null) : { col: i, dir: 1 })); setPage(0); }}
+                >
                   {c.name}
+                  {sort?.col === i && (sort.dir === 1 ? <ArrowUp size={11} className="inline ml-1 text-accent" /> : <ArrowDown size={11} className="inline ml-1 text-accent" />)}
                   {c.pk && <span className="ml-1 text-accent" title="primary key">PK</span>}
                   <span className="ml-1.5 font-normal text-mute text-[10.5px]">{c.dataType}</span>
                   {!c.editable && <Lock size={10} className="inline ml-1 text-mute" />}
@@ -295,8 +360,9 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
                 {editorInputs(adding, (name, v) => setAdding((d) => ({ ...(d ?? {}), [name]: v })))}
               </tr>
             )}
-            {pageRows.map((row, i) => {
-              const rowId = data.rowIds[first + i];
+            {pageIdx.map((ri) => {
+              const row = rows[ri];
+              const rowId = data.rowIds[ri];
               const isEditing = editing?.rowId === rowId;
               return (
                 <tr key={rowId} className={isEditing ? "bg-accent/5" : "hover:bg-panel2/60"}>
@@ -338,7 +404,7 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
                   </td>
                   {isEditing
                     ? editorInputs(editing.draft, (name, v) => setEditing((e) => (e ? { ...e, draft: { ...e.draft, [name]: v } } : e)))
-                    : columns.map((c, ci) => (
+                    : visCols.map(({ c, i: ci }) => (
                         <td key={c.name} className={`${cellCls} font-mono max-w-96 truncate`} title={row[ci] === null ? "(null)" : String(row[ci])}>
                           {row[ci] === null ? <span className="text-mute italic">(null)</span> : String(row[ci])}
                         </td>
@@ -348,6 +414,9 @@ export default function RowEditor({ table, connId }: { table: string; connId: st
             })}
           </tbody>
         </table>
+        {!!rows.length && !view.length && !adding && (
+          <div className="py-10 text-center text-[12px] text-mute">No rows match the current filter.</div>
+        )}
         {!rows.length && !adding && (
           <div className="py-10">
             <EmptyState icon={<Plus />} title={`${table} has no rows`} hint="Use “Add row” to insert the first one." />
