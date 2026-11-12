@@ -10,6 +10,7 @@ import {
   ListTree,
   Play,
   Rows3,
+  Pencil,
   RefreshCw,
   Save,
   Terminal,
@@ -22,6 +23,7 @@ import ResultsGrid from "./ResultsGrid";
 import ExplainPlan from "./ExplainPlan";
 import { Btn, EmptyState, Spinner } from "./ui";
 import { download } from "../utils/sql";
+import { editableTableOf } from "../utils/resultTable";
 
 export default function SqlWorksheet() {
   const s = useStudio();
@@ -45,6 +47,14 @@ export default function SqlWorksheet() {
       reconnectingRef.current = false;
       setReconnecting(false);
     }
+  };
+  // same gate as the Explorer's "Edit data…": full access on a live, writable connection
+  const canEditRows = !!activeConnection?.live && !activeConnection.readOnly && (s.accessRole === "Administrator" || s.accessRole === "Developer");
+  const editTable = s.result && !s.result.error && s.result.resultKind !== "describe" && activeConnection
+    ? editableTableOf(s.result.statement, activeConnection.user) : null;
+  const openRowEditor = (table: string) => {
+    s.setEditDataRequest(table);
+    s.openTab("data", table, table);
   };
   const [expanded, setExpanded] = useState(false);
   const [editorPct, setEditorPct] = useState(46);
@@ -218,6 +228,16 @@ export default function SqlWorksheet() {
                 }}
               >
                 <RefreshCw size={12} className={s.running ? "animate-spin" : ""} /> Refresh
+              </Btn>
+            )}
+            {view === "results" && s.result && canEditRows && (
+              <Btn
+                variant="outline"
+                title={editTable ? `Edit ${editTable} data` : "Edit is available for a simple single-table SELECT"}
+                disabled={worksheetBusy || !editTable}
+                onClick={() => editTable && openRowEditor(editTable)}
+              >
+                <Pencil size={12} /> Edit
               </Btn>
             )}
             {/* execution details */}
