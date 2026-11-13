@@ -39,11 +39,12 @@ import {
   splitDdl,
   copyInternalError,
   copyConnectionLost,
+  copyJobDdl,
 } from "./objectCopy.ts";
 
 describe("OBJECT_COPY_KINDS", () => {
   it("is what one run can copy, in the order the UI offers them", () => {
-    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "types", "tables", "indexes", "views", "mviews", "synonyms", "packages", "procedures", "functions", "triggers"]);
+    assert.deepEqual(ALL_COPY_KINDS, ["sequences", "types", "tables", "indexes", "views", "mviews", "synonyms", "packages", "procedures", "functions", "triggers", "jobs"]);
   });
 
   it("lists the kinds in the order they have to be copied in", () => {
@@ -64,9 +65,12 @@ describe("OBJECT_COPY_KINDS", () => {
     assert.ok(ALL_COPY_KINDS.indexOf("synonyms") < ALL_COPY_KINDS.indexOf("triggers"));
     // triggers after everything: one stands on the table or view it fires for *and* on
     // whatever its body calls, which is more than any other kind asks of the target
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "triggers")) {
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "triggers" && k !== "jobs")) {
       assert.ok(ALL_COPY_KINDS.indexOf(kind) < ALL_COPY_KINDS.indexOf("triggers"), kind);
     }
+    // jobs last of all: nothing depends on a job, and a job's action calls the routines and
+    // reads the tables every other kind brings — so it goes in once they are there
+    assert.equal(ALL_COPY_KINDS[ALL_COPY_KINDS.length - 1], "jobs");
   });
 
   it("gives every kind a distinct label and a spec that can be looked up", () => {
@@ -87,9 +91,12 @@ describe("OBJECT_COPY_KINDS", () => {
   });
 
   it("falls back to the dictionary's name for every kind that shares it", () => {
-    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "mviews")) {
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "mviews" && k !== "jobs")) {
       assert.equal(copyMetadataType(kind), copyKindSpec(kind).objectType, kind);
     }
+    // a scheduler job is a "procedural object" to DBMS_METADATA, and JOB only to the dictionary
+    assert.equal(copyMetadataType("jobs"), "PROCOBJ");
+    assert.equal(copyKindSpec("jobs").objectType, "JOB");
   });
 
   it("never passes a DBMS_METADATA type with a space in it", () => {
@@ -679,9 +686,11 @@ describe("dropStatement", () => {
   });
 
   it("has a statement for every kind, since replace is offered for all of them", () => {
-    for (const kind of ALL_COPY_KINDS) {
+    for (const kind of ALL_COPY_KINDS.filter((k) => k !== "jobs")) {
       assert.match(String(dropStatement(kind, "SOMETHING")), /^DROP [A-Z ]+ "SOMETHING"/);
     }
+    // a job has no DROP statement; its replacement goes through DBMS_SCHEDULER instead
+    assert.match(String(dropStatement("jobs", "SOMETHING")), /^BEGIN dbms_scheduler\.drop_job\(job_name => '"SOMETHING"'/);
   });
 });
 
@@ -821,5 +830,62 @@ describe("copyInternalError", () => {
     assert.ok(copyConnectionLost("NJS-500: connection to Oracle Database was closed or broken"));
     assert.ok(copyConnectionLost("ORA-03113: end-of-file on communication channel"));
     assert.ok(!copyConnectionLost("ORA-00955: name is already used by an existing object"));
+  });
+});
+
+describe("scheduler jobs", () => {
+  // the shape DBMS_METADATA.GET_DDL('PROCOBJ', …) returns for an enabled PL/SQL-block job
+  const ddl = `
+BEGIN
+dbms_scheduler.create_job('"JOB_ALERTAS"',
+job_type=>'PLSQL_BLOCK', job_action=>
+'BEGIN
+  CONTAAPP.pkg_alertas.enviar(p_msg => ''Ask CONTAAPP.'');
+  -- dbms_scheduler.enable(''x'');
+END;'
+, number_of_arguments=>0,
+start_date=>TO_TIMESTAMP_TZ('26-OCT-2023 06.00.00.000000000 AM -05:00','DD-MON-RRRR HH.MI.SSXFF AM TZR','NLS_DATE_LANGUAGE=english'), repeat_interval=>
+'TRUNC(SYSDATE+1)+6/24'
+, end_date=>NULL,
+job_class=>'"DEFAULT_JOB_CLASS"', enabled=>FALSE, auto_drop=>TRUE,comments=>
+NULL
+);
+dbms_scheduler.set_attribute('"JOB_ALERTAS"','max_failures',16);
+dbms_scheduler.enable('"JOB_ALERTAS"');
+COMMIT;
+END;`;
+
+  it("is offered as its own kind and dropped through DBMS_SCHEDULER, never killing a running job", () => {
+    assert.equal(normalizeKind("jobs"), "jobs");
+    assert.equal(
+      dropStatement("jobs", "JOB_ALERTAS"),
+      `BEGIN dbms_scheduler.drop_job(job_name => '"JOB_ALERTAS"', force => FALSE); END;`
+    );
+    assert.equal(dropStatement("jobs", "O'BRIEN"), `BEGIN dbms_scheduler.drop_job(job_name => '"O''BRIEN"', force => FALSE); END;`);
+  });
+
+  it("repoints schema qualifiers inside the job action, and only when asked to", () => {
+    const out = retargetSchema(ddl, "CONTAAPP", "CAPP", { literals: true });
+    assert.ok(out.includes("  CAPP.pkg_alertas.enviar("));
+    // the quote escaping of the job's own code survives the round trip
+    assert.ok(out.includes("p_msg => ''Ask CONTAAPP.''"), "a literal inside the job's code is still data");
+    assert.ok(out.includes(`'"DEFAULT_JOB_CLASS"'`));
+    assert.ok(retargetSchema(ddl, "CONTAAPP", "CAPP").includes("  CONTAAPP.pkg_alertas"), "plain DDL leaves literals alone");
+  });
+
+  it("creates the job disabled unless the source's enabled state is asked for", () => {
+    const off = copyJobDdl(ddl, false);
+    assert.ok(!/^dbms_scheduler\.enable/m.test(off));
+    assert.ok(off.includes("-- dbms_scheduler.enable(''x'');"), "the job's own code is not edited");
+    assert.ok(off.includes("set_attribute('\"JOB_ALERTAS\"','max_failures',16);"));
+    assert.equal(copyJobDdl(ddl, true), ddl);
+    assert.match(copyJobDdl("create_job('\"J\"', enabled => TRUE);", false), /enabled=>FALSE/);
+  });
+
+  it("stays one PL/SQL statement that keeps its END;", () => {
+    const statements = copyStatements(copyJobDdl(ddl, false));
+    assert.equal(statements.length, 1);
+    assert.ok(statements[0].startsWith("BEGIN"));
+    assert.ok(statements[0].endsWith("END;"));
   });
 });

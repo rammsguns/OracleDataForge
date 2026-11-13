@@ -151,6 +151,7 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
   const names = run?.names ?? [];
   const existing = run?.existing ?? "skip";
   const preserveTablespace = run?.preserveTablespace ?? false;
+  const enableJobs = run?.enableJobs ?? false;
   const result = run?.result;
   const busy = run?.status === "running";
   const loading = run?.status === "loading";
@@ -736,6 +737,35 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                         {preserveTablespace
                           ? `Each object is created in the tablespace it has in ${plan.sourceSchema}, and fails if ${plan.targetName} has no tablespace of that name.`
                           : `Objects are created in ${plan.targetSchema}'s default tablespace. Storage sizing is left to the target either way.`}
+                      </div>
+                    </div>
+                  </label>
+                </>
+              )}
+
+              {/* a scheduler job runs by itself at its next start date, so whether the copy
+                  switches it on is the one choice that decides what the target does next */}
+              {summary?.activates && (
+                <>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wider text-mute mt-3 mb-2">Schedule</h3>
+                  <label
+                    className={`flex items-start gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors ${
+                      enableJobs ? "border-warn/60 bg-warn/8" : "border-bdr hover:border-accent/40"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={enableJobs}
+                      onChange={(e) => setObjectCopyOptions(key, { enableJobs: e.target.checked })}
+                      className="mt-0.5 accent-[var(--accent)]"
+                      aria-label="Enable jobs as in the source"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-[12.5px] font-semibold">Enable jobs as in the source</div>
+                      <div className="text-[11.5px] text-mute mt-0.5">
+                        {enableJobs
+                          ? `Jobs enabled in ${plan.sourceSchema} start running on their schedule in ${plan.targetName} as soon as they are created.`
+                          : `Every job is created disabled, so nothing runs in ${plan.targetName} until you enable it.`}
                       </div>
                     </div>
                   </label>
