@@ -85,19 +85,22 @@ function copyLogText(r: ObjectCopyResult): string {
   const lines = [
     `# Oracle DataForge object copy log — ${r.label}`,
     `# ${r.sourceSchema} on ${r.sourceName} -> ${r.targetSchema} on ${r.targetName}`,
-    `# ${r.created} created, ${r.replaced} replaced, ${r.skipped} skipped, ${r.failed} failed, ${r.invalid} not valid, ${(r.elapsedMs / 1000).toFixed(1)} s${r.timedOut ? " (stopped at the time budget)" : ""}`,
+    `# ${r.created} created, ${r.replaced} replaced, ${r.skipped} skipped, ${r.failed} failed, ${r.invalid} not valid (new), ${r.invalidInOrigin ?? 0} not valid in origin, ${(r.elapsedMs / 1000).toFixed(1)} s${r.timedOut ? " (stopped at the time budget)" : ""}`,
     ...(r.stopped ? [`# STOPPED at ${r.stopped.object}: ${flat(r.stopped.error)}`, `# Fix: ${r.stopped.advice}${r.stopped.fix ? ` ${r.stopped.fix}` : ""}`] : []),
     "",
   ];
   // problems first: they are what the log is opened for
-  const rank = (o: ObjectCopyObjectResult) => (o.status === "failed" ? 0 : o.warning ? 1 : o.status === "skipped" ? 3 : 2);
+  const rank = (o: ObjectCopyObjectResult) => (o.status === "failed" ? 0 : o.warning ? 1 : o.originInvalid ? 2 : o.status === "skipped" ? 4 : 3);
   for (const o of [...r.objects].sort((a, b) => rank(a) - rank(b))) {
-    const tag = o.status === "failed" ? "FAIL   " : o.warning ? "INVALID" : o.status === "skipped" ? "SKIP   " : "OK     ";
+    const tag = o.status === "failed" ? "FAIL   " : o.warning ? "INVALID" : o.originInvalid ? "ORIGIN " : o.status === "skipped" ? "SKIP   " : "OK     ";
     lines.push(`${tag} ${String(o.ms ?? 0).padStart(6)} ms  ${o.name}${o.status === "replaced" ? " (replaced)" : ""}`);
     if (o.error) lines.push(`        ${flat(o.error)}`);
+    if (o.internalError) lines.push(`        INTERNAL ERROR (${o.internalError.where}): ${flat(o.internalError.advice)}`);
     if (o.reason) lines.push(`        ${flat(o.reason)}`);
     for (const e of o.compileErrors ?? []) lines.push(`        ${flat(e)}`);
     if (o.warning && !o.compileErrors?.length) lines.push(`        ${flat(o.warning)}`);
+    if (o.originInvalid) lines.push(`        Already invalid in ${r.sourceSchema} (origin) — not caused by the copy.`);
+    for (const e of o.originErrors ?? []) lines.push(`        ${flat(e)}`);
     if (o.status === "failed" && o.sql) lines.push(...o.sql.split("\n").map((l) => `        | ${l}`));
   }
   for (const f of r.foreignKeys) {
@@ -379,7 +382,8 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             <Tile label="Failed" value={result.failed} tone={result.failed ? "err" : "neutral"} />
             {/* counted out of "created" rather than beside it: the object is there, it just
                 does not work yet, and a tile is the only place that difference gets seen */}
-            {result.invalid > 0 && <Tile label="Not valid" value={result.invalid} tone="warn" />}
+            {result.invalid > 0 && <Tile label="Not valid (new)" value={result.invalid} tone="warn" />}
+            {result.invalidInOrigin > 0 && <Tile label="Invalid in origin" value={result.invalidInOrigin} tone="neutral" />}
             {result.foreignKeys.length > 0 && (
               <Tile label="Foreign keys" value={result.fksCreated} tone={result.fksFailed ? "warn" : "accent"} />
             )}
@@ -427,6 +431,15 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                       <div className="min-w-0 flex-1">
                         <span className="font-mono text-[12.5px] font-semibold">{o.name}</span>
                         <div className="text-[11.5px] text-err mt-0.5 break-words">{o.error}</div>
+                        {o.internalError && (
+                          <div className="mt-1.5 text-[11.5px] text-soft border border-warn/30 bg-warn/8 rounded px-2 py-1.5 break-words">
+                            <span className="font-semibold text-warn">
+                              Oracle internal error in the {o.internalError.where} database
+                              {o.internalError.argument ? ` — ${o.internalError.code} [${o.internalError.argument}]` : ` — ${o.internalError.code}`}
+                            </span>
+                            <div className="mt-0.5">{o.internalError.advice}</div>
+                          </div>
+                        )}
                         {o.sql && (
                           <details className="mt-1">
                             <summary className="text-[11px] text-mute cursor-pointer">Statement that failed</summary>
@@ -469,6 +482,29 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                       ))}
                     </div>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {result.invalidInOrigin > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Already invalid in origin ({result.sourceSchema})</div>
+              <div className="border border-bdr rounded-lg px-3 py-2">
+                <div className="text-[12px] text-soft">
+                  These are invalid in the source too, so the copy did not break them. Fix them there first.
+                </div>
+                {result.objects.filter((o) => o.originInvalid).map((o) => (
+                  <details key={o.name} className="mt-1.5">
+                    <summary className="text-[11.5px] cursor-pointer">
+                      <span className="font-mono font-semibold">{o.name}</span>
+                      {o.originErrors?.[0] && <span className="text-mute"> — {o.originErrors[0]}</span>}
+                      {(o.originErrors?.length ?? 0) > 1 && <span className="text-mute"> (+{o.originErrors!.length - 1} more)</span>}
+                    </summary>
+                    <ul className="mt-1 pl-4 list-disc text-[11.5px] text-mute space-y-0.5">
+                      {(o.originErrors ?? []).map((e, i) => <li key={i} className="break-words">{e}</li>)}
+                    </ul>
+                  </details>
                 ))}
               </div>
             </div>

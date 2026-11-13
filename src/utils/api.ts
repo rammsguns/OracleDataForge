@@ -634,6 +634,12 @@ export interface ObjectCopyObjectResult {
   sql?: string;
   /** invalid after creation: the target's own compilation errors, one per line */
   compileErrors?: string[];
+  /** failed on an Oracle internal error (ORA-00600 / ORA-07445): what it means and what to check */
+  internalError?: { code: string; argument?: string; where: "source" | "target"; advice: string };
+  /** invalid in the source too — already broken before the copy */
+  originInvalid?: boolean;
+  /** the source's own compilation errors for it */
+  originErrors?: string[];
   ms?: number;
 }
 
@@ -662,6 +668,8 @@ export interface ObjectCopyResult {
   failed: number;
   /** how many of the created ones the target cannot compile — counted out of `created`, not beside it */
   invalid: number;
+  /** created objects that are invalid in the source as well, counted apart from `invalid` */
+  invalidInOrigin: number;
   fksCreated: number;
   fksFailed: number;
   /** set when the run gave up at the first error that every later object would hit too */

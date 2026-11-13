@@ -37,6 +37,8 @@ import {
   prepareDdl,
   retargetSchema,
   splitDdl,
+  copyInternalError,
+  copyConnectionLost,
 } from "./objectCopy.ts";
 
 describe("OBJECT_COPY_KINDS", () => {
@@ -787,5 +789,37 @@ describe("PL/SQL object copy", () => {
   it("supports a specification without a body and standalone functions", () => {
     assert.deepEqual(copyStatements('CREATE OR REPLACE PACKAGE p AS n NUMBER; END;\n/'), ['CREATE OR REPLACE PACKAGE p AS n NUMBER; END;']);
     assert.deepEqual(copyStatements('CREATE OR REPLACE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;\n/'), ['CREATE OR REPLACE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;']);
+  });
+});
+
+describe("copyInternalError", () => {
+  const mv = 'ORA-12018: following error encountered during code generation for "CAPP"."MV_X"\nORA-00600: internal error code, arguments: [koksccda1], [0], [], [], []';
+
+  it("recognises ORA-00600 inside a wrapper error and keeps its first argument", () => {
+    const r = copyInternalError(mv, "target");
+    assert.ok(r);
+    assert.equal(r.code, "ORA-00600");
+    assert.equal(r.argument, "koksccda1");
+    assert.match(r.advice, /internal error in the target database/);
+    assert.match(r.advice, /ORA-00600 \[koksccda1\]/);
+  });
+
+  it("recognises ORA-07445 and names the source when the DDL could not be read", () => {
+    const r = copyInternalError("ORA-07445: exception encountered: core dump [kghalo()+10] [SIGSEGV]", "source");
+    assert.equal(r?.code, "ORA-07445");
+    assert.equal(r?.argument, "kghalo()+10");
+    assert.match(r!.advice, /source database/);
+  });
+
+  it("leaves ordinary errors alone", () => {
+    assert.equal(copyInternalError("ORA-00942: table or view does not exist", "target"), null);
+    assert.equal(copyInternalError("ORA-06000: something", "target"), null);
+  });
+
+  it("knows which errors leave the session unusable", () => {
+    assert.ok(copyConnectionLost(mv));
+    assert.ok(copyConnectionLost("NJS-500: connection to Oracle Database was closed or broken"));
+    assert.ok(copyConnectionLost("ORA-03113: end-of-file on communication channel"));
+    assert.ok(!copyConnectionLost("ORA-00955: name is already used by an existing object"));
   });
 });

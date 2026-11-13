@@ -612,3 +612,37 @@ function copyTextEnd(s: string, i: number): number | null {
   }
   return null;
 }
+
+/**
+ * An Oracle internal error behind a failed copy: ORA-00600 or ORA-07445.
+ *
+ * Both mean the database itself hit a bug — the statement was well formed, and resending it
+ * will fail the same way. They arrive wrapped in whatever the statement was doing (ORA-12018
+ * for a materialized view's code generation, ORA-04052 for a remote lookup), so the wrapper
+ * says nothing useful and the first argument in brackets is what Oracle Support matches on.
+ * The session that hit one is usually gone afterwards (NJS-500), which is why the caller
+ * reconnects before the next object.
+ *
+ * `where` says which side raised it: a failure while reading DDL is the source's, one while
+ * running it is the target's. A view a materialized view selects from is the usual culprit on
+ * the target: if a plain SELECT from it fails the same way, the copy was never the problem.
+ */
+export function copyInternalError(message: string, where: "source" | "target"): { code: string; argument?: string; advice: string } | null {
+  const m = /ORA-(00600|07445)\b[^\[]*(?:\[([^\]]*)\])?/.exec(message);
+  if (!m) return null;
+  const code = `ORA-${m[1]}`;
+  const argument = m[2]?.trim() || undefined;
+  const tag = argument ? `${code} [${argument}]` : code;
+  const advice =
+    `${tag} is an internal error in the ${where} database — an Oracle bug, not a fault in the copied DDL, and running the copy again will hit it again. ` +
+    (where === "target"
+      ? "Check whether the objects it depends on can be queried in the target (for a view or materialized view, try a plain SELECT from what it reads). "
+      : "The source could not produce this object's DDL; try reading it there directly. ") +
+    `Compare the two databases' release update levels — a bug fixed in a later 19c RU shows up exactly like this — and search My Oracle Support for "${tag}" for the bug and patch.`;
+  return { code, ...(argument ? { argument } : {}), advice };
+}
+
+/** The session is gone after this error — the run has to reconnect before the next object. */
+export function copyConnectionLost(message: string): boolean {
+  return /ORA-(00600|07445|03113|03114|03135)\b|NJS-500|DPI-1080|NJS-003/.test(message);
+}
