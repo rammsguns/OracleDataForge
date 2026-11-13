@@ -44,6 +44,8 @@ import {
   copyKindSpec,
   copyMetadataType,
   copyStatusTypes,
+  copyInternalError,
+  copyConnectionLost,
   copyStatements,
   copyTransforms,
   dropStatement,
@@ -3929,6 +3931,12 @@ interface ObjectCopyObjectResult {
   sql?: string;
   /** invalid after creation: the target's own compilation errors (user_errors), one per line */
   compileErrors?: string[];
+  /** failed on an Oracle internal error (ORA-00600 / ORA-07445): what it means and what to check */
+  internalError?: { code: string; argument?: string; where: "source" | "target"; advice: string };
+  /** invalid in the source too: the problem was already there before the copy, so it is not a new one */
+  originInvalid?: boolean;
+  /** the source's own compilation errors (user_errors) for an object that is invalid there */
+  originErrors?: string[];
   /** time spent on this object */
   ms?: number;
 }
@@ -3958,6 +3966,8 @@ interface ObjectCopyResult {
   failed: number;
   /** created, but the target cannot compile them yet — always 0 for a kind that is not compiled */
   invalid: number;
+  /** how many of the created ones are invalid in the source as well — listed apart from `invalid` */
+  invalidInOrigin: number;
   fksCreated: number;
   fksFailed: number;
   /** set when the run gave up at the first error that every later object would hit too */
@@ -4412,15 +4422,18 @@ async function oraObjectCopy(
   const landed = new Set<string>();
   let timedOut = false;
   let stopped: ObjectCopyResult["stopped"];
+  /** what the skip lines of the objects after a stop say about it */
+  let stopCause = "ORA-01031: insufficient privileges";
 
-  const srcConn = await getOraConn(source);
+  let srcConn = await getOraConn(source);
   try {
     await oraCopyPrepareMetadata(srcConn, opts.preserveTablespace);
-    const tgtConn = await getOraConn(target);
+    let tgtConn = await getOraConn(target);
+    // A dropped or replaced object someone else is using would otherwise block for ever;
+    // ten seconds turns that into one reported failure instead of a stalled request.
+    const prepareTarget = (c: oracledb.Connection) => c.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
     try {
-      // A dropped or replaced object someone else is using would otherwise block for ever;
-      // ten seconds turns that into one reported failure instead of a stalled request.
-      await tgtConn.execute(`ALTER SESSION SET ddl_lock_timeout = ${OBJECT_COPY_DDL_LOCK_S}`).catch(() => {});
+      await prepareTarget(tgtConn);
 
       // A kind built on something needs the target read for that too — the same query with
       // another type or two in its IN list, which is what makes the check below cost nothing.
@@ -4436,7 +4449,7 @@ async function oraObjectCopy(
         }
         const base = { name, statements: 0 };
         if (stopped) {
-          objects.push({ ...base, status: "skipped", reason: `Not attempted — the copy stopped at ${stopped.object} (ORA-01031: insufficient privileges).` });
+          objects.push({ ...base, status: "skipped", reason: `Not attempted — the copy stopped at ${stopped.object} (${stopCause}).` });
           continue;
         }
         const tObj = Date.now();
@@ -4486,10 +4499,35 @@ async function oraObjectCopy(
           landed.add(name);
         } catch (e) {
           // `running` is empty when the source could not even produce the DDL
+          const where = running ? "target" : "source";
+          const internal = copyInternalError(errMsg(e), where);
           objects.push({
-            ...base, status: "failed", error: withNetworkHint(errMsg(e), target.host), ms: Date.now() - tObj,
+            ...base, status: "failed", error: withNetworkHint(errMsg(e), (running ? target : source).host), ms: Date.now() - tObj,
             ...(running ? { sql: running.slice(0, 20000) } : {}),
+            ...(internal ? { internalError: { ...internal, where } } : {}),
           });
+          // An internal error usually takes the session with it (NJS-500 on the next call), and
+          // every object after this one would then fail for that reason instead of its own.
+          // A fresh session is cheap next to a run of two hundred false failures.
+          if (copyConnectionLost(errMsg(e))) {
+            try {
+              if (running) {
+                await tgtConn.close().catch(() => {});
+                tgtConn = await getOraConn(target);
+                await prepareTarget(tgtConn);
+              } else {
+                await srcConn.close().catch(() => {});
+                srcConn = await getOraConn(source);
+                await oraCopyPrepareMetadata(srcConn, opts.preserveTablespace);
+              }
+            } catch (re) {
+              stopCause = `the ${where} session was lost and could not be reopened`;
+              stopped = {
+                object: name, error: errMsg(e),
+                advice: `The ${where} session was lost after this error and could not be reopened (${errMsg(re)}), so the run stopped here.`,
+              };
+            }
+          }
           // A missing privilege is the account's problem, not this object's: every object after
           // it would fail the same way, so stop here and say what to grant instead.
           if (/ORA-01031/.test(errMsg(e))) stopped = { object: name, error: errMsg(e), ...copyPrivilegeAdvice(kind, targetSchema, !running) };
@@ -4510,43 +4548,59 @@ async function oraObjectCopy(
       // those is still a created object — with the one sentence that says it does not work yet.
       if (spec.compiled) {
         const made = objects.filter((o) => o.status === "created" || o.status === "replaced");
-        const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name)));
+        // A run stopped on a session it could not reopen has nothing to ask; the failures stand.
+        const invalid = await oraCopyInvalid(tgtConn, kind, new Set(made.map((o) => o.name))).catch(() => new Set<string>());
+        // Which of those are invalid in the source as well: the copy did not break them, so
+        // they are reported apart from the ones that only the target cannot compile.
+        let originInvalid = new Set<string>();
+        if (invalid.size) {
+          try { originInvalid = await oraCopyInvalid(srcConn, kind, invalid); } catch { /* all count as new */ }
+        }
+        const errTypes = { t: copyStatusTypes(kind)[0], body: copyStatusTypes(kind)[1] ?? copyStatusTypes(kind)[0] };
+        const errSql = `SELECT name AS "name", type AS "type", line AS "line", position AS "pos", text AS "text"
+                 FROM user_errors WHERE type IN (:t, :body) AND attribute = 'ERROR' ORDER BY name, type, sequence`;
+        const fill = async (conn: oracledb.Connection, byName: Map<string, ObjectCopyObjectResult>, field: "compileErrors" | "originErrors") => {
+          if (!byName.size) return;
+          try {
+            for (const r of await oraExecRows(conn, errSql, errTypes)) {
+              const o = byName.get(String(r.name));
+              if (!o || (o[field]?.length ?? 0) >= 20) continue;
+              (o[field] ??= []).push(`${r.type} line ${r.line}:${r.pos} — ${String(r.text ?? "").trim()}`);
+            }
+          } catch { /* the flag still stands without the detail */ }
+        };
+        const fresh = new Map<string, ObjectCopyObjectResult>();
+        const inherited = new Map<string, ObjectCopyObjectResult>();
         for (const o of made) {
           if (!invalid.has(o.name)) continue;
-          o.warning = `Created, but ${targetSchema} reports invalid compilation (including any package or type body). Check compilation errors and dependencies, then recompile.`;
+          if (originInvalid.has(o.name)) {
+            o.originInvalid = true;
+            inherited.set(o.name, o);
+          } else {
+            o.warning = `Created, but ${targetSchema} reports invalid compilation (including any package or type body). Check compilation errors and dependencies, then recompile.`;
+            fresh.set(o.name, o);
+          }
         }
-        // The sentence above says that it is broken; user_errors says why, per object.
-        const broken = new Map(made.filter((o) => o.warning).map((o) => [o.name, o]));
-        if (broken.size) {
-          try {
-            const errs = await oraExecRows(
-              tgtConn,
-              `SELECT name AS "name", type AS "type", line AS "line", position AS "pos", text AS "text"
-                 FROM user_errors WHERE type IN (:t, :body) ORDER BY name, type, sequence`,
-              { t: copyStatusTypes(kind)[0], body: copyStatusTypes(kind)[1] ?? copyStatusTypes(kind)[0] }
-            );
-            for (const r of errs) {
-              const o = broken.get(String(r.name));
-              if (!o || (o.compileErrors?.length ?? 0) >= 20) continue;
-              (o.compileErrors ??= []).push(`${r.type} line ${r.line}:${r.pos} — ${String(r.text ?? "").trim()}`);
-            }
-          } catch { /* the warning still stands without the detail */ }
-        }
+        // user_errors says why, per object — the target's for the new problems, the source's
+        // for the ones that were already there
+        await fill(tgtConn, fresh, "compileErrors");
+        await fill(srcConn, inherited, "originErrors");
       }
     } finally {
-      await tgtConn.close();
+      await tgtConn.close().catch(() => {});
     }
   } finally {
-    await srcConn.close();
+    await srcConn.close().catch(() => {});
   }
 
   const count = (s: ObjectCopyObjectResult["status"]) => objects.filter((o) => o.status === s).length;
   // Same idea as the DDL apply log: what happened is on the server's console and on disk, so a
   // failure can still be read after the browser tab is gone.
-  console.log(`[object-copy] ${source.name} -> ${target.name} ${spec.label}: ${count("created")} created, ${count("replaced")} replaced, ${count("skipped")} skipped, ${count("failed")} failed, ${objects.filter((o) => o.warning).length} invalid (${Date.now() - t0} ms)`);
+  console.log(`[object-copy] ${source.name} -> ${target.name} ${spec.label}: ${count("created")} created, ${count("replaced")} replaced, ${count("skipped")} skipped, ${count("failed")} failed, ${objects.filter((o) => o.warning).length} invalid, ${objects.filter((o) => o.originInvalid).length} invalid in origin (${Date.now() - t0} ms)`);
   for (const o of objects) {
-    if (o.status === "failed") console.log(`[object-copy]   FAILED ${o.name}: ${o.error}`);
+    if (o.status === "failed") console.log(`[object-copy]   FAILED ${o.name}: ${o.error}${o.internalError ? ` [internal error in ${o.internalError.where}]` : ""}`);
     else if (o.warning) console.log(`[object-copy]   INVALID ${o.name}: ${(o.compileErrors ?? []).join(" | ") || "no detail in user_errors"}`);
+    else if (o.originInvalid) console.log(`[object-copy]   INVALID IN ORIGIN ${o.name}: ${(o.originErrors ?? []).join(" | ") || "no detail in user_errors"}`);
   }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -4572,6 +4626,7 @@ async function oraObjectCopy(
     skipped: count("skipped"),
     failed: count("failed"),
     invalid: objects.filter((o) => o.warning).length,
+    invalidInOrigin: objects.filter((o) => o.originInvalid).length,
     fksCreated: foreignKeys.filter((f) => f.status === "created").length,
     fksFailed: foreignKeys.filter((f) => f.status === "failed").length,
     timedOut,
@@ -5832,7 +5887,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
       sourceName: source.name, sourceSchema: plan.sourceSchema,
       targetName: target.name, targetSchema: plan.targetSchema,
       kind, label: plan.label, existing, objects: [], foreignKeys: [],
-      created: 0, replaced: 0, skipped: 0, failed: 0, invalid: 0, fksCreated: 0, fksFailed: 0,
+      created: 0, replaced: 0, skipped: 0, failed: 0, invalid: 0, invalidInOrigin: 0, fksCreated: 0, fksFailed: 0,
       timedOut: false, elapsedMs: 0,
       note: plan.total
         ? `Nothing to copy — none of the ${label} that were asked for are in ${plan.sourceSchema}.`
