@@ -2177,6 +2177,8 @@ interface TableIndexMeta {
   tablespace: string | null;
   /** backs a PK/UNIQUE constraint — must be dropped via the constraint, not directly */
   constraintBacked: boolean;
+  /** Per column: the expression behind a function-based (or DESC) index column, else null. */
+  expressions?: (string | null)[];
 }
 
 interface TableConstraintMeta {
@@ -2225,7 +2227,7 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
     }
     const cols = await oraRows(
       conn,
-      `SELECT column_name, data_type, data_length, data_precision, data_scale, nullable, column_id
+      `SELECT column_name, data_type, data_length, char_length, data_precision, data_scale, nullable, column_id
        FROM user_tab_columns WHERE table_name = :n ORDER BY column_id`,
       { n: name }
     );
@@ -2235,6 +2237,12 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
 
     const comm = await oraRows(conn, `SELECT column_name, comments FROM user_col_comments WHERE table_name = :n`, { n: name });
     const comMap = new Map(comm.map((r) => [String(r.COLUMN_NAME), r.COMMENTS == null ? null : String(r.COMMENTS)]));
+    // Identity columns (12c+). Their DATA_DEFAULT is the system ISEQ$$_ sequence, which is not portable.
+    const identMap = new Map<string, "ALWAYS" | "BY DEFAULT">();
+    try {
+      const idents = await oraRows(conn, `SELECT column_name, generation_type FROM user_tab_identity_cols WHERE table_name = :n`, { n: name });
+      for (const i of idents) identMap.set(String(i.COLUMN_NAME), String(i.GENERATION_TYPE).toUpperCase().startsWith("ALWAYS") ? "ALWAYS" : "BY DEFAULT");
+    } catch { /* pre-12c dictionary has no identity view */ }
 
     const pkRows = await oraRows(
       conn,
@@ -2250,7 +2258,10 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
 
     const columns: TableColumnMeta[] = cols.map((r) => {
       const baseType = String(r.DATA_TYPE);
-      const length = r.DATA_LENGTH == null ? null : Number(r.DATA_LENGTH);
+      // DATA_LENGTH is bytes: an NVARCHAR2(2000) reports 4000, which is not a declarable length.
+      // National types are always declared in characters, so take CHAR_LENGTH for those.
+      const isNational = /^N(VAR)?CHAR2?$/.test(String(r.DATA_TYPE));
+      const length = isNational && Number(r.CHAR_LENGTH) > 0 ? Number(r.CHAR_LENGTH) : r.DATA_LENGTH == null ? null : Number(r.DATA_LENGTH);
       const precision = r.DATA_PRECISION == null ? null : Number(r.DATA_PRECISION);
       const scale = r.DATA_SCALE == null ? null : Number(r.DATA_SCALE);
       const cname = String(r.COLUMN_NAME);
@@ -2263,7 +2274,8 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
         scale,
         dataType: composeOraType(baseType, charLen, precision, scale),
         nullable: String(r.NULLABLE) === "Y",
-        dataDefault: defMap.get(cname) ?? null,
+        dataDefault: identMap.has(cname) ? null : defMap.get(cname) ?? null,
+        identity: identMap.get(cname) ?? null,
         comment: comMap.get(cname) ?? null,
         pk: pkSet.has(cname),
         position: Number(r.COLUMN_ID) || 0,
@@ -2288,6 +2300,18 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
       const k = String(r.INDEX_NAME);
       const col = String(r.COLUMN_NAME) + (String(r.DESCEND) === "DESC" ? " DESC" : "");
       (idxCols.get(k) ?? idxCols.set(k, []).get(k)!).push(col);
+    }
+    // Function-based and DESC index columns show up as hidden SYS_NC…$ columns; the real
+    // expression lives in user_ind_expressions (a LONG, hence its own query).
+    const idxExprs = new Map<string, Map<number, string>>();
+    for (const r of await oraRows(
+      conn,
+      `SELECT index_name, column_position, column_expression FROM user_ind_expressions WHERE table_name = :n`,
+      { n: name }
+    )) {
+      if (r.COLUMN_EXPRESSION == null) continue;
+      const k = String(r.INDEX_NAME);
+      (idxExprs.get(k) ?? idxExprs.set(k, new Map()).get(k)!).set(Number(r.COLUMN_POSITION), String(r.COLUMN_EXPRESSION).trim());
     }
 
     // ---- constraints ----
@@ -2339,6 +2363,9 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
       status: String(r.STATUS ?? "N/A"),
       tablespace: r.TABLESPACE_NAME == null ? null : String(r.TABLESPACE_NAME),
       constraintBacked: constraintIndexNames.has(String(r.INDEX_NAME)),
+      ...(idxExprs.has(String(r.INDEX_NAME))
+        ? { expressions: (idxCols.get(String(r.INDEX_NAME)) ?? []).map((_, i) => idxExprs.get(String(r.INDEX_NAME))!.get(i + 1) ?? null) }
+        : {}),
     }));
 
     const CTYPE: Record<string, string> = { P: "PRIMARY KEY", U: "UNIQUE", R: "FOREIGN KEY", C: "CHECK" };
@@ -2377,31 +2404,85 @@ async function oraTableMeta(c: LiveConnection, rawName: string): Promise<TableMe
 }
 
 /** Statements the Table Designer is allowed to run — CREATE TABLE (new-table designer), column/PK/comment DDL (ALTER TABLE also covers constraint add/drop/enable/disable) plus index DDL. */
-const TABLE_DDL_ALLOWED = /^\s*(CREATE\s+TABLE|ALTER\s+TABLE|COMMENT\s+ON\s+(COLUMN|TABLE)|CREATE\s+(UNIQUE\s+|BITMAP\s+)?INDEX|DROP\s+INDEX|ALTER\s+INDEX)\b/i;
+const TABLE_DDL_ALLOWED = /^\s*(CREATE\s+TABLE|ALTER\s+TABLE|CREATE\s+SEQUENCE|COMMENT\s+ON\s+(COLUMN|TABLE)|CREATE\s+(UNIQUE\s+|BITMAP\s+)?INDEX|DROP\s+INDEX|ALTER\s+INDEX)\b/i;
 
-interface ApplyStmtResult { sql: string; ok: boolean; error?: string; line?: number; }
-interface ApplyResult { results: ApplyStmtResult[]; failed: boolean; applied: number; }
+interface ApplyStmtResult { sql: string; ok: boolean; error?: string; line?: number; ms?: number; }
 
-/** Run designer-generated DDL sequentially on one connection, stopping at the first failure. */
-async function oraApplyTableDdl(c: LiveConnection, statements: string[]): Promise<ApplyResult> {
+/** One JSON line per DDL apply run (Table Designer and schema migration) — what ran, what failed. */
+const DDL_APPLY_LOG = path.join(DATA_DIR, "ddl-apply.jsonl");
+function logDdlApply(c: LiveConnection, total: number, results: ApplyStmtResult[], continueOnError: boolean, startedAt: Date) {
+  const failures = results.filter((r) => !r.ok);
+  const applied = results.length - failures.length;
+  console.log(`[ddl-apply] ${c.name}: ${applied}/${total} applied, ${failures.length} failed, ${total - results.length} not run (${Date.now() - startedAt.getTime()} ms)`);
+  for (const f of failures) console.log(`[ddl-apply]   FAILED ${f.sql.replace(/\s+/g, " ").slice(0, 300)}\n[ddl-apply]     ${f.error}`);
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(DDL_APPLY_LOG, JSON.stringify({
+      at: startedAt.toISOString(), connection: c.name, total, applied, failed: failures.length, notRun: total - results.length, continueOnError,
+      statements: results.map((r) => ({ ok: r.ok, ms: r.ms, sql: r.sql.slice(0, 4000), ...(r.ok ? {} : { error: r.error }) })),
+    }) + "\n", { mode: 0o600 });
+  } catch (e) {
+    console.warn(`[ddl-apply] could not write ${DDL_APPLY_LOG}: ${errMsg(e)}`);
+  }
+}
+interface ApplyResult {
+  results: ApplyStmtResult[];
+  failed: boolean;
+  applied: number;
+  /** set when the run gave up at an error every later statement of its kind would hit too */
+  stopped?: { error: string; sql: string; advice: string; fix?: string };
+}
+
+/** What to do about an ORA-01031 on a designer/migration statement. */
+function ddlPrivilegeAdvice(sql: string, schema: string): { advice: string; fix?: string } {
+  const head = sql.replace(/\s+/g, " ").trim().toUpperCase();
+  const priv = /^CREATE SEQUENCE\b/.test(head) ? "CREATE SEQUENCE"
+    : /^CREATE TABLE\b/.test(head) ? "CREATE TABLE"
+    : null;
+  const tail = `Ask a DBA to run it while connected as a privileged user (e.g. SYSTEM), then reconnect the target and apply again. The privilege must be granted directly to ${schema} — one that only comes through a role may not count.`;
+  if (priv) return { advice: `${schema} is not allowed to run this kind of statement in the target. ${tail}`, fix: `GRANT ${priv} TO ${schema};` };
+  if (/\bFOREIGN KEY\b/.test(head)) {
+    return { advice: `The foreign key points at a table ${schema} may not reference. The owner of that table must grant REFERENCES on it directly to ${schema}; then apply again.` };
+  }
+  if (/^CREATE (UNIQUE |BITMAP )?INDEX\b/.test(head)) {
+    return { advice: `${schema} lacks a privilege this statement needs — for a function-based index, EXECUTE on the function it calls, granted directly. ${tail}` };
+  }
+  return { advice: `${schema} is not allowed to change this object. It can only alter, comment on or drop objects it owns: check that the target connection logs in as the schema that owns the table, or ask a DBA for the missing privilege. Then reconnect and apply again.` };
+}
+
+/**
+ * Run designer-generated DDL sequentially on one connection. Stops at the first failure unless
+ * `continueOnError` — the schema migration's opt-in, where one bad statement out of hundreds
+ * should not hold back the independent ones (every failure is still reported).
+ */
+async function oraApplyTableDdl(c: LiveConnection, statements: string[], continueOnError = false): Promise<ApplyResult> {
   const conn = await getOraConn(c);
   const results: ApplyStmtResult[] = [];
+  let stopped: ApplyResult["stopped"];
+  const startedAt = new Date();
+  const todo = statements.map((raw) => raw.trim().replace(/;\s*$/, "")).filter(Boolean);
   try {
-    for (const raw of statements) {
-      const sql = raw.trim().replace(/;\s*$/, "");
-      if (!sql) continue;
+    for (const sql of todo) {
+      const t0 = Date.now();
       try {
         await conn.execute(sql, [], { autoCommit: true });
-        results.push({ sql, ok: true });
+        results.push({ sql, ok: true, ms: Date.now() - t0 });
       } catch (e) {
-        results.push({ sql, ok: false, error: withNetworkHint(errMsg(e), c.host), line: oraErrorLine(e, sql) });
-        break; // Oracle DDL auto-commits each statement — stop so we don't push past a failure
+        results.push({ sql, ok: false, error: withNetworkHint(errMsg(e), c.host), line: oraErrorLine(e, sql), ms: Date.now() - t0 });
+        // A missing privilege belongs to the account, not to this statement: the rest would
+        // mostly fail the same way, so stop even when asked to continue and say what to grant.
+        if (/ORA-01031/.test(errMsg(e))) {
+          stopped = { error: errMsg(e), sql, ...ddlPrivilegeAdvice(sql, c.user.toUpperCase()) };
+          break;
+        }
+        if (!continueOnError) break; // Oracle DDL auto-commits each statement — stop so we don't push past a failure
       }
     }
   } finally {
     await conn.close();
+    logDdlApply(c, todo.length, results, continueOnError, startedAt);
   }
-  return { results, failed: results.some((r) => !r.ok), applied: results.filter((r) => r.ok).length };
+  return { results, failed: results.some((r) => !r.ok), applied: results.filter((r) => r.ok).length, ...(stopped ? { stopped } : {}) };
 }
 
 /* ---------------- Table statistics (Oracle, DBMS_STATS) ---------------- */
@@ -3681,7 +3762,7 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
 
     const colRows = await oraRows(
       conn,
-      `SELECT table_name, column_name, data_type, data_length, data_precision, data_scale, nullable, column_id
+      `SELECT table_name, column_name, data_type, data_length, char_length, data_precision, data_scale, nullable, column_id
        FROM user_tab_columns WHERE table_name IN (${tabs}) ORDER BY table_name, column_id`,
       binds
     );
@@ -3712,7 +3793,10 @@ async function oraErd(c: LiveConnection): Promise<ErdResult> {
     for (const r of colRows) {
       const t = String(r.TABLE_NAME);
       const key = `${t}.${r.COLUMN_NAME}`;
-      const length = r.DATA_LENGTH == null ? null : Number(r.DATA_LENGTH);
+      // DATA_LENGTH is bytes: an NVARCHAR2(2000) reports 4000, which is not a declarable length.
+      // National types are always declared in characters, so take CHAR_LENGTH for those.
+      const isNational = /^N(VAR)?CHAR2?$/.test(String(r.DATA_TYPE));
+      const length = isNational && Number(r.CHAR_LENGTH) > 0 ? Number(r.CHAR_LENGTH) : r.DATA_LENGTH == null ? null : Number(r.DATA_LENGTH);
       const precision = r.DATA_PRECISION == null ? null : Number(r.DATA_PRECISION);
       const scale = r.DATA_SCALE == null ? null : Number(r.DATA_SCALE);
       const baseType = String(r.DATA_TYPE);
@@ -3841,6 +3925,12 @@ interface ObjectCopyObjectResult {
   warning?: string;
   /** how many statements it took */
   statements: number;
+  /** failed: the statement Oracle rejected */
+  sql?: string;
+  /** invalid after creation: the target's own compilation errors (user_errors), one per line */
+  compileErrors?: string[];
+  /** time spent on this object */
+  ms?: number;
 }
 
 /** One foreign key of a copied table, added after every table in the run exists. */
@@ -3870,6 +3960,8 @@ interface ObjectCopyResult {
   invalid: number;
   fksCreated: number;
   fksFailed: number;
+  /** set when the run gave up at the first error that every later object would hit too */
+  stopped?: { error: string; object: string; advice: string; fix?: string };
   timedOut: boolean;
   elapsedMs: number;
   note?: string;
@@ -3888,7 +3980,9 @@ interface ObjectCopyResult {
  * only needs the name added to its own copy of the union.
  */
 const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
-  types: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'TYPE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
+  types: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'TYPE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%'
+            AND object_name NOT LIKE 'SYS\\_YOID%' ESCAPE '\\' AND object_name NOT LIKE 'SYS\\_PLSQL\\_%' ESCAPE '\\' AND object_name NOT LIKE 'SYSTP%'
+            ORDER BY object_name`,
   packages: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PACKAGE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
   procedures: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'PROCEDURE' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
   functions: `SELECT object_name AS "name" FROM user_objects WHERE object_type = 'FUNCTION' AND generated = 'N' AND secondary = 'N' AND object_name NOT LIKE 'BIN$%' ORDER BY object_name`,
@@ -4317,6 +4411,7 @@ async function oraObjectCopy(
   /** what this run left standing in the target, and therefore owes foreign keys to */
   const landed = new Set<string>();
   let timedOut = false;
+  let stopped: ObjectCopyResult["stopped"];
 
   const srcConn = await getOraConn(source);
   try {
@@ -4340,6 +4435,12 @@ async function oraObjectCopy(
           break;
         }
         const base = { name, statements: 0 };
+        if (stopped) {
+          objects.push({ ...base, status: "skipped", reason: `Not attempted — the copy stopped at ${stopped.object} (ORA-01031: insufficient privileges).` });
+          continue;
+        }
+        const tObj = Date.now();
+        let running = "";
         const already = present.has(`${kind} ${name}`);
         if (already && existing === "skip") {
           objects.push({ ...base, status: "skipped", reason: `Already in ${targetSchema} — left as it is.` });
@@ -4372,19 +4473,32 @@ async function oraObjectCopy(
           // make room for a statement that was going to overwrite it anyway.
           if (already && !spec.replaceInPlace) {
             const drop = dropStatement(kind, name);
-            if (drop) await tgtConn.execute(drop, [], { autoCommit: true });
+            if (drop) {
+              running = drop;
+              await tgtConn.execute(drop, [], { autoCommit: true });
+            }
           }
-          for (const sql of statements) await tgtConn.execute(sql, [], { autoCommit: true });
-          objects.push({ ...base, status: already ? "replaced" : "created", statements: statements.length });
+          for (const sql of statements) {
+            running = sql;
+            await tgtConn.execute(sql, [], { autoCommit: true });
+          }
+          objects.push({ ...base, status: already ? "replaced" : "created", statements: statements.length, ms: Date.now() - tObj });
           landed.add(name);
         } catch (e) {
-          objects.push({ ...base, status: "failed", error: withNetworkHint(errMsg(e), target.host) });
+          // `running` is empty when the source could not even produce the DDL
+          objects.push({
+            ...base, status: "failed", error: withNetworkHint(errMsg(e), target.host), ms: Date.now() - tObj,
+            ...(running ? { sql: running.slice(0, 20000) } : {}),
+          });
+          // A missing privilege is the account's problem, not this object's: every object after
+          // it would fail the same way, so stop here and say what to grant instead.
+          if (/ORA-01031/.test(errMsg(e))) stopped = { object: name, error: errMsg(e), ...copyPrivilegeAdvice(kind, targetSchema, !running) };
         }
       }
 
       // Second pass, once every table this run is responsible for exists in the target — the
       // point of having taken the foreign keys out of CREATE TABLE in the first place.
-      if (spec.foreignKeys && !timedOut) {
+      if (spec.foreignKeys && !timedOut && !stopped) {
         const fks = await oraCopyForeignKeys(srcConn, tgtConn, landed, sourceSchema, targetSchema, deadline);
         foreignKeys.push(...fks.results);
         timedOut = timedOut || fks.timedOut;
@@ -4401,6 +4515,23 @@ async function oraObjectCopy(
           if (!invalid.has(o.name)) continue;
           o.warning = `Created, but ${targetSchema} reports invalid compilation (including any package or type body). Check compilation errors and dependencies, then recompile.`;
         }
+        // The sentence above says that it is broken; user_errors says why, per object.
+        const broken = new Map(made.filter((o) => o.warning).map((o) => [o.name, o]));
+        if (broken.size) {
+          try {
+            const errs = await oraExecRows(
+              tgtConn,
+              `SELECT name AS "name", type AS "type", line AS "line", position AS "pos", text AS "text"
+                 FROM user_errors WHERE type IN (:t, :body) ORDER BY name, type, sequence`,
+              { t: copyStatusTypes(kind)[0], body: copyStatusTypes(kind)[1] ?? copyStatusTypes(kind)[0] }
+            );
+            for (const r of errs) {
+              const o = broken.get(String(r.name));
+              if (!o || (o.compileErrors?.length ?? 0) >= 20) continue;
+              (o.compileErrors ??= []).push(`${r.type} line ${r.line}:${r.pos} — ${String(r.text ?? "").trim()}`);
+            }
+          } catch { /* the warning still stands without the detail */ }
+        }
       }
     } finally {
       await tgtConn.close();
@@ -4410,6 +4541,22 @@ async function oraObjectCopy(
   }
 
   const count = (s: ObjectCopyObjectResult["status"]) => objects.filter((o) => o.status === s).length;
+  // Same idea as the DDL apply log: what happened is on the server's console and on disk, so a
+  // failure can still be read after the browser tab is gone.
+  console.log(`[object-copy] ${source.name} -> ${target.name} ${spec.label}: ${count("created")} created, ${count("replaced")} replaced, ${count("skipped")} skipped, ${count("failed")} failed, ${objects.filter((o) => o.warning).length} invalid (${Date.now() - t0} ms)`);
+  for (const o of objects) {
+    if (o.status === "failed") console.log(`[object-copy]   FAILED ${o.name}: ${o.error}`);
+    else if (o.warning) console.log(`[object-copy]   INVALID ${o.name}: ${(o.compileErrors ?? []).join(" | ") || "no detail in user_errors"}`);
+  }
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(path.join(DATA_DIR, "object-copy.jsonl"), JSON.stringify({
+      at: new Date(t0).toISOString(), source: source.name, target: target.name, kind, existing, timedOut, elapsedMs: Date.now() - t0,
+      objects: objects.map((o) => ({ ...o, ...(o.sql ? { sql: o.sql.slice(0, 4000) } : {}) })), foreignKeys,
+    }) + "\n", { mode: 0o600 });
+  } catch (e) {
+    console.warn(`[object-copy] could not write the log: ${errMsg(e)}`);
+  }
   return {
     sourceName: source.name,
     sourceSchema,
@@ -4428,8 +4575,32 @@ async function oraObjectCopy(
     fksCreated: foreignKeys.filter((f) => f.status === "created").length,
     fksFailed: foreignKeys.filter((f) => f.status === "failed").length,
     timedOut,
+    ...(stopped ? { stopped } : {}),
     elapsedMs: Date.now() - t0,
     ...(objects.length ? {} : { note: `Nothing to copy — ${sourceSchema} has no ${spec.label.toLowerCase()}.` }),
+  };
+}
+
+/** The system privilege a schema needs to create each kind of object in itself. */
+const COPY_CREATE_PRIVILEGE: Record<CopyKind, string> = {
+  sequences: "CREATE SEQUENCE", tables: "CREATE TABLE", indexes: "CREATE TABLE", views: "CREATE VIEW",
+  mviews: "CREATE MATERIALIZED VIEW", synonyms: "CREATE SYNONYM", packages: "CREATE PROCEDURE",
+  procedures: "CREATE PROCEDURE", functions: "CREATE PROCEDURE", types: "CREATE TYPE", triggers: "CREATE TRIGGER",
+};
+
+/** What to do about an ORA-01031 — worded for whoever has to ask a DBA for the grant. */
+function copyPrivilegeAdvice(kind: CopyKind, targetSchema: string, readingSource: boolean): { advice: string; fix?: string } {
+  if (readingSource) {
+    return { advice: "The source account could not read this object's DDL. Ask a DBA to let it read its own metadata (DBMS_METADATA), or connect to the source as the owning schema." };
+  }
+  const priv = COPY_CREATE_PRIVILEGE[kind];
+  const extra = kind === "mviews" ? ", CREATE TABLE" : "";
+  return {
+    advice:
+      `${targetSchema} is not allowed to create ${copyKindSpec(kind).label.toLowerCase()} in the target. Ask a DBA to run the grant below while connected as a privileged user (e.g. SYSTEM), then reconnect the target and run the copy again. ` +
+      `The privilege must be granted directly to ${targetSchema} — one that only comes through a role may not count. ` +
+      `If ${targetSchema} already has it, the object reads from another schema: that schema's owner must grant SELECT on those objects directly to ${targetSchema}.`,
+    fix: `GRANT ${priv}${extra} TO ${targetSchema};`,
   };
 }
 
@@ -7405,7 +7576,7 @@ app.post("/api/connections/:id/table/apply", requireFullAccess, async (req, res)
     }));
   }
   try {
-    res.json(await oraApplyTableDdl(c, statements));
+    res.json(await oraApplyTableDdl(c, statements, req.body?.continueOnError === true));
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
   }

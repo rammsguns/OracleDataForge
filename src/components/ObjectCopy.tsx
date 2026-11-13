@@ -6,13 +6,15 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Copy,
+  CheckCircle2,
   Database,
+  EyeOff,
   RefreshCw,
   ShieldAlert,
   XCircle,
 } from "lucide-react";
 import { useStudio } from "../state/store";
-import type { CopyExisting, CopyKind, ObjectCopyObjectResult, ObjectCopyPlan } from "../utils/api";
+import type { CopyExisting, CopyKind, ObjectCopyObjectResult, ObjectCopyPlan, ObjectCopyResult } from "../utils/api";
 import {
   getObjectCopyRun,
   loadObjectCopyPlan,
@@ -27,6 +29,84 @@ import { Badge, Btn, Spinner, inputCls } from "./ui";
 
 const fmtSecs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 const fmtNum = (n: number) => n.toLocaleString();
+
+/** An object the user chose never to copy into a given target (e.g. one the target cannot hold). */
+interface IgnoredObject {
+  name: string;
+  /** why — the error it failed with, when it was ignored from a failed copy */
+  reason: string;
+  at: string;
+  /** set when it comes from a statement ignored in Compare tables — the statement it stands for */
+  compareSql?: string;
+}
+type IgnoredByKind = Partial<Record<CopyKind, IgnoredObject[]>>;
+const IGNORED_KEY = "dataforge.objectCopy.ignored";
+
+/** Ignore lists are kept per target connection name, then per object type. */
+function loadIgnored(): Record<string, IgnoredByKind> {
+  try {
+    const v = JSON.parse(localStorage.getItem(IGNORED_KEY) ?? "{}");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Compare tables keeps its own list of ignored statements, per target, under this key. */
+const COMPARE_IGNORED_KEY = "dataforge.migration.ignored";
+interface CompareIgnored { sql: string; reason: string; at: string }
+function loadCompareIgnored(): Record<string, CompareIgnored[]> {
+  try {
+    const v = JSON.parse(localStorage.getItem(COMPARE_IGNORED_KEY) ?? "{}");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+}
+/**
+ * A CREATE statement ignored in Compare tables is the same decision as ignoring that object
+ * here — "this target is not getting that index" — so it counts on this side too.
+ */
+function fromCompareIgnored(list: CompareIgnored[]): IgnoredByKind {
+  const out: IgnoredByKind = {};
+  for (const x of list) {
+    const m = /^\s*CREATE\s+(?:(?:UNIQUE|BITMAP)\s+)?(INDEX|TABLE|SEQUENCE)\s+("[^"]+"|[A-Za-z0-9_$#]+)/i.exec(x.sql ?? "");
+    if (!m) continue;
+    const k: CopyKind = m[1].toUpperCase() === "INDEX" ? "indexes" : m[1].toUpperCase() === "TABLE" ? "tables" : "sequences";
+    const name = m[2].startsWith('"') ? m[2].slice(1, -1) : m[2].toUpperCase();
+    (out[k] ??= []).push({ name, reason: `${x.reason} (ignored in Compare tables)`, at: x.at, compareSql: x.sql });
+  }
+  return out;
+}
+
+/** A whole copy run as plain text — what "Copy log" and "Download log" hand over. */
+function copyLogText(r: ObjectCopyResult): string {
+  const flat = (t: string) => t.replace(/\s+/g, " ").trim();
+  const lines = [
+    `# Oracle DataForge object copy log — ${r.label}`,
+    `# ${r.sourceSchema} on ${r.sourceName} -> ${r.targetSchema} on ${r.targetName}`,
+    `# ${r.created} created, ${r.replaced} replaced, ${r.skipped} skipped, ${r.failed} failed, ${r.invalid} not valid, ${(r.elapsedMs / 1000).toFixed(1)} s${r.timedOut ? " (stopped at the time budget)" : ""}`,
+    ...(r.stopped ? [`# STOPPED at ${r.stopped.object}: ${flat(r.stopped.error)}`, `# Fix: ${r.stopped.advice}${r.stopped.fix ? ` ${r.stopped.fix}` : ""}`] : []),
+    "",
+  ];
+  // problems first: they are what the log is opened for
+  const rank = (o: ObjectCopyObjectResult) => (o.status === "failed" ? 0 : o.warning ? 1 : o.status === "skipped" ? 3 : 2);
+  for (const o of [...r.objects].sort((a, b) => rank(a) - rank(b))) {
+    const tag = o.status === "failed" ? "FAIL   " : o.warning ? "INVALID" : o.status === "skipped" ? "SKIP   " : "OK     ";
+    lines.push(`${tag} ${String(o.ms ?? 0).padStart(6)} ms  ${o.name}${o.status === "replaced" ? " (replaced)" : ""}`);
+    if (o.error) lines.push(`        ${flat(o.error)}`);
+    if (o.reason) lines.push(`        ${flat(o.reason)}`);
+    for (const e of o.compileErrors ?? []) lines.push(`        ${flat(e)}`);
+    if (o.warning && !o.compileErrors?.length) lines.push(`        ${flat(o.warning)}`);
+    if (o.status === "failed" && o.sql) lines.push(...o.sql.split("\n").map((l) => `        | ${l}`));
+  }
+  for (const f of r.foreignKeys) {
+    if (f.status === "created") continue;
+    lines.push(`${f.status === "failed" ? "FK FAIL" : "FK SKIP"}           ${f.table}.${f.name}`);
+    if (f.error ?? f.reason) lines.push(`        ${flat(f.error ?? f.reason ?? "")}`);
+  }
+  return lines.join("\n") + "\n";
+}
 
 /** The kind a fresh panel opens on — the same default the backend applies. */
 const DEFAULT_KIND: CopyKind = "tables";
@@ -136,6 +216,86 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
 
   const blocker = plan ? copyBlocker(plan) : null;
 
+  // ---- objects this target should never be offered again ----
+  const [ignoredAll, setIgnoredAll] = useState<Record<string, IgnoredByKind>>(loadIgnored);
+  const [showIgnored, setShowIgnored] = useState(false);
+  const [showLog, setShowLog] = useState(false);
+  /** the object type whose ignored objects are expanded in the type list */
+  const [ignoredOpen, setIgnoredOpen] = useState<CopyKind | null>(null);
+  const targetKey = plan?.targetName ?? "";
+  const [compareTick, setCompareTick] = useState(0);
+  const ignoredByKind: IgnoredByKind = useMemo(() => {
+    const own = ignoredAll[targetKey] ?? {};
+    const derived = fromCompareIgnored(loadCompareIgnored()[targetKey] ?? []);
+    const out: IgnoredByKind = { ...own };
+    for (const k of Object.keys(derived) as CopyKind[]) {
+      const have = new Set((own[k] ?? []).map((x) => x.name));
+      out[k] = [...(own[k] ?? []), ...derived[k]!.filter((x) => !have.has(x.name) && have.add(x.name))];
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ignoredAll, targetKey, compareTick]);
+  const setIgnoredFor = (k: CopyKind, all_next: IgnoredObject[]) => {
+    // entries that came from Compare tables live in its list: un-ignoring one here removes it there
+    const keepSql = new Set(all_next.filter((x) => x.compareSql).map((x) => x.compareSql));
+    const dropSql = new Set((ignoredByKind[k] ?? []).filter((x) => x.compareSql && !keepSql.has(x.compareSql)).map((x) => x.compareSql));
+    if (dropSql.size) {
+      const all = loadCompareIgnored();
+      all[targetKey] = (all[targetKey] ?? []).filter((x) => !dropSql.has(x.sql));
+      if (!all[targetKey].length) delete all[targetKey];
+      try {
+        localStorage.setItem(COMPARE_IGNORED_KEY, JSON.stringify(all));
+        window.dispatchEvent(new Event(COMPARE_IGNORED_KEY));
+      } catch { /* session-only if storage is unavailable */ }
+      setCompareTick((n) => n + 1);
+    }
+    const next = all_next.filter((x) => !x.compareSql);
+    setIgnoredAll((all) => {
+      const forTarget = { ...(all[targetKey] ?? {}), [k]: next };
+      if (!next.length) delete forTarget[k];
+      const out = { ...all, [targetKey]: forTarget };
+      try { localStorage.setItem(IGNORED_KEY, JSON.stringify(out)); } catch { /* session-only if storage is unavailable */ }
+      return out;
+    });
+  };
+  const ignoreObjects = (k: CopyKind, items: { name: string; reason: string }[]) => {
+    const cur = ignoredByKind[k] ?? [];
+    const have = new Set(cur.map((x) => x.name));
+    const add = items.filter((x) => !have.has(x.name) && have.add(x.name));
+    if (!add.length) return;
+    setIgnoredFor(k, [...cur, ...add.map((x) => ({ name: x.name, reason: x.reason.replace(/\s+/g, " ").trim(), at: new Date().toISOString() }))]);
+    // an ignored object is not something this run should carry either
+    const gone = new Set(add.map((x) => x.name));
+    if (k === kind) setObjectCopyOptions(key, { names: names.filter((n) => !gone.has(n)) });
+    s.toast("info", `${add.length} object(s) will be ignored for ${targetKey}`);
+  };
+  /**
+   * How many ignored objects of a kind are still owed to the target. Exact for the kind the
+   * plan carries objects for; for the others only the saved names are known, so it is capped at
+   * what is actually missing.
+   */
+  const ignoredCount = (k: CopyKind, total: number, inTarget: number) => {
+    const list = ignoredByKind[k] ?? [];
+    if (!list.length) return 0;
+    if (plan && k === plan.kind) {
+      const missing = new Set(plan.items.filter((i) => !i.existsInTarget).map((i) => i.name));
+      return list.filter((x) => missing.has(x.name)).length;
+    }
+    return Math.min(list.length, Math.max(0, total - inTarget));
+  };
+  const ignoredNow = ignoredByKind[kind] ?? [];
+  // a freshly read plan selects everything — take the ignored objects back out
+  const planStamp = plan ? `${plan.kind}@${plan.checkedAt}` : "";
+  useEffect(() => {
+    const cur = getObjectCopyRun(key);
+    const tn = cur?.plan?.targetName ?? "";
+    const k = cur?.kind ?? DEFAULT_KIND;
+    const skip = new Set([...(loadIgnored()[tn]?.[k] ?? []), ...(fromCompareIgnored(loadCompareIgnored()[tn] ?? [])[k] ?? [])].map((x) => x.name));
+    if (!cur?.plan || !skip.size) return;
+    const next = cur.names.filter((n) => !skip.has(n));
+    if (next.length !== cur.names.length) setObjectCopyOptions(key, { names: next });
+  }, [key, planStamp]);
+
   return (
     <div className="df-fade">
       <p className="text-[11.5px] text-mute mb-3">
@@ -144,8 +304,13 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
       </p>
 
       <div className="flex items-center gap-2 flex-wrap mb-4">
-        <Btn variant="outline" onClick={() => reread()} disabled={loading || busy || sourceId === targetId}>
-          <RefreshCw size={13} /> {plan ? "Re-read both schemas" : "Read both schemas"}
+        <Btn
+          variant="outline"
+          onClick={() => reread()}
+          disabled={loading || busy || sourceId === targetId}
+          title={plan ? "Re-read both schemas: refreshes the counts of every object type and the object list" : undefined}
+        >
+          <RefreshCw size={13} /> {plan ? "Refresh all" : "Read both schemas"}
         </Btn>
         {plan && (
           <span className="text-[11.5px] text-mute">
@@ -162,6 +327,197 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
               change to the target that never started */}
           <span className="text-err font-semibold">{plan ? "Copy failed:" : "Could not read the schemas:"}</span> {run.error}
         </div>
+      )}
+
+      {!loading && !busy && result && (
+        <section
+          className={`mb-5 df-fade border rounded-lg p-3 ${
+            result.failed || result.fksFailed ? "border-err/40 bg-err/8" : result.invalid ? "border-warn/40 bg-warn/8" : "border-ok/40 bg-ok/8"
+          }`}
+        >
+          <div className="flex items-start gap-2 mb-2">
+            {result.failed || result.fksFailed
+              ? <XCircle size={15} className="text-err shrink-0 mt-0.5" />
+              : result.invalid
+              ? <AlertTriangle size={15} className="text-warn shrink-0 mt-0.5" />
+              : <CheckCircle2 size={15} className="text-ok shrink-0 mt-0.5" />}
+            <div className="min-w-0 flex-1 text-[12.5px] font-semibold text-ink">
+              Last copy — {result.label}: {fmtNum(result.created + result.replaced)} copied
+              {result.failed ? ` · ${fmtNum(result.failed)} failed` : ""}
+              {result.invalid ? ` · ${fmtNum(result.invalid)} not valid` : ""}
+              {result.skipped ? ` · ${fmtNum(result.skipped)} skipped` : ""}
+              {result.fksFailed ? ` · ${fmtNum(result.fksFailed)} foreign key(s) not added` : ""}
+              <span className="text-mute font-normal"> · {fmtSecs(result.elapsedMs)}{result.timedOut ? " (stopped at the time budget)" : ""}</span>
+            </div>
+          </div>
+          <div className="flex gap-2 flex-wrap mb-3">
+            <Btn variant="outline" onClick={() => setShowLog((v) => !v)}>{showLog ? "Hide full log" : "Show full log"}</Btn>
+            <Btn variant="outline" onClick={() => { navigator.clipboard?.writeText(copyLogText(result)).then(() => s.toast("success", "Copy log copied"), () => s.toast("error", "Could not copy — use Download log")); }}>Copy log</Btn>
+            <Btn variant="outline" onClick={() => {
+              const url = URL.createObjectURL(new Blob([copyLogText(result)], { type: "text/plain" }));
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = `object-copy-${result.kind}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+              a.click();
+              URL.revokeObjectURL(url);
+            }}>Download log</Btn>
+            {result.objects.some((o) => o.status === "failed" && o.sql) && (
+              <Btn variant="outline" onClick={() => {
+                s.setSql(result.objects.filter((o) => o.status === "failed" && o.sql).map((o) => `-- ${o.name}: ${(o.error ?? "error").replace(/\s+/g, " ")}\n${o.sql}\n/`).join("\n\n"));
+                s.openTab("worksheet", "Worksheet 1");
+                s.toast("info", "Failed statements loaded in worksheet");
+              }}>Open failed in worksheet</Btn>
+            )}
+          </div>
+          {showLog && (
+            <pre className="mb-3 font-mono text-[11px] leading-5 whitespace-pre overflow-auto p-2 bg-panel2 border border-bdr rounded max-h-72">{copyLogText(result)}</pre>
+          )}
+          <div className="flex gap-2 flex-wrap mb-3">
+            <Tile label="Created" value={result.created} tone="ok" />
+            {result.replaced > 0 && <Tile label="Replaced" value={result.replaced} tone="warn" />}
+            <Tile label="Skipped" value={result.skipped} tone="neutral" />
+            <Tile label="Failed" value={result.failed} tone={result.failed ? "err" : "neutral"} />
+            {/* counted out of "created" rather than beside it: the object is there, it just
+                does not work yet, and a tile is the only place that difference gets seen */}
+            {result.invalid > 0 && <Tile label="Not valid" value={result.invalid} tone="warn" />}
+            {result.foreignKeys.length > 0 && (
+              <Tile label="Foreign keys" value={result.fksCreated} tone={result.fksFailed ? "warn" : "accent"} />
+            )}
+          </div>
+
+          {result.stopped && (
+            <div className="mb-3 border border-err/40 bg-panel2 rounded-lg p-3 flex items-start gap-2.5">
+              <ShieldAlert size={15} className="text-err shrink-0 mt-0.5" />
+              <div className="min-w-0 text-[12.5px]">
+                <div className="font-semibold text-ink">
+                  Stopped at the first error — insufficient privileges on <span className="font-mono">{result.stopped.object}</span>
+                </div>
+                <div className="text-[11.5px] text-err mt-0.5 break-words">{result.stopped.error}</div>
+                <div className="text-[12px] text-ink mt-2"><b>How to fix:</b> {result.stopped.advice}</div>
+                {result.stopped.fix && (
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
+                    <pre className="font-mono text-[12px] bg-panel3 border border-bdr rounded px-2 py-1">{result.stopped.fix}</pre>
+                    <Btn variant="outline" onClick={() => { navigator.clipboard?.writeText(result.stopped!.fix!).then(() => s.toast("success", "Grant copied"), () => s.toast("error", "Could not copy")); }}>Copy</Btn>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {result.note && <p className="text-[12px] text-mute mb-3">{result.note}</p>}
+
+          {result.failed > 0 && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 mb-1.5">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-mute">Failed</div>
+                <Btn
+                  variant="outline"
+                  onClick={() => ignoreObjects(result.kind, result.objects.filter((o) => o.status === "failed").map((o) => ({ name: o.name, reason: o.error ?? "error" })))}
+                  title="Never offer these objects for this target again"
+                >
+                  Ignore all failed
+                </Btn>
+              </div>
+              <div className="space-y-1.5 max-h-96 overflow-auto">
+                {result.objects
+                  .filter((o) => o.status === "failed")
+                  .map((o) => (
+                    <div key={o.name} className="border border-err/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
+                      <XCircle size={14} className="text-err shrink-0 mt-0.5" />
+                      <div className="min-w-0 flex-1">
+                        <span className="font-mono text-[12.5px] font-semibold">{o.name}</span>
+                        <div className="text-[11.5px] text-err mt-0.5 break-words">{o.error}</div>
+                        {o.sql && (
+                          <details className="mt-1">
+                            <summary className="text-[11px] text-mute cursor-pointer">Statement that failed</summary>
+                            <pre className="mt-1 font-mono text-[11px] whitespace-pre-wrap break-words bg-panel2 border border-bdr rounded px-2 py-1 max-h-40 overflow-auto">{o.sql}</pre>
+                          </details>
+                        )}
+                      </div>
+                      {(ignoredByKind[result.kind] ?? []).some((x) => x.name === o.name)
+                        ? <span className="text-mute text-[11px] shrink-0">Ignored</span>
+                        : <Btn variant="outline" onClick={() => ignoreObjects(result.kind, [{ name: o.name, reason: o.error ?? "error" }])} title="Never offer this object for this target again">Ignore always</Btn>}
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {result.invalid > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Created, but not valid</div>
+              <div className="space-y-1.5">
+                {reasonGroups(result.objects, (o) => o.warning).map((g) => (
+                  <div key={g.reason} className="border border-warn/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
+                    <AlertTriangle size={14} className="text-warn shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-[12px] text-soft">
+                        {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
+                      </div>
+                      <Names names={g.names} />
+                      {result.objects.filter((o) => o.warning === g.reason && o.compileErrors?.length).map((o) => (
+                        <details key={o.name} className="mt-1.5">
+                          <summary className="text-[11.5px] cursor-pointer">
+                            <span className="font-mono font-semibold">{o.name}</span>
+                            <span className="text-err"> — {o.compileErrors![0]}</span>
+                            {o.compileErrors!.length > 1 && <span className="text-mute"> (+{o.compileErrors!.length - 1} more)</span>}
+                          </summary>
+                          <ul className="mt-1 pl-4 list-disc text-[11.5px] text-err space-y-0.5">
+                            {o.compileErrors!.map((e, i) => <li key={i} className="break-words">{e}</li>)}
+                          </ul>
+                        </details>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {result.skipped > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Not copied</div>
+              <div className="space-y-1.5">
+                {reasonGroups(result.objects, (o) => (o.status === "skipped" ? o.reason ?? "Skipped." : undefined)).map((g) => (
+                  <div key={g.reason} className="border border-bdr rounded-lg px-3 py-2">
+                    <div className="text-[12px] text-soft">
+                      {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
+                    </div>
+                    <Names names={g.names} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {result.fksFailed > 0 && (
+            <div className="mb-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Foreign keys not added</div>
+              <div className="space-y-1.5">
+                {result.foreignKeys
+                  .filter((f) => f.status === "failed")
+                  .map((f) => (
+                    <div key={`${f.table}.${f.name}`} className="border border-warn/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
+                      <AlertTriangle size={14} className="text-warn shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <span className="font-mono text-[12.5px] font-semibold">{f.name}</span>
+                        <span className="text-[11px] text-mute"> on {f.table}</span>
+                        <div className="text-[11.5px] text-err mt-0.5 break-words">{f.error}</div>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+              <p className="text-[11.5px] text-mute mt-1.5">
+                A foreign key names a second table. One that points at a table this copy did not bring across cannot be added
+                until that table is there — copy it and run this again, and the missing keys are filled in.
+              </p>
+            </div>
+          )}
+
+          {/* what this kind carries, in the backend's own words — the same sentence the
+              confirmation dialog was written from, so the two cannot describe different copies */}
+          <p className="text-[11.5px] text-mute">{objectCopyKindSummary(plan, result.kind)?.note}</p>
+        </section>
       )}
 
       {loading && (
@@ -206,18 +562,65 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
                       className="mt-0.5 accent-[var(--accent)]"
                       aria-label={`Copy ${b.label}`}
                     />
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-[12.5px] font-semibold">{b.label}</span>
                         <span className="text-[11px] text-mute">{fmtNum(b.total)}</span>
-                        {b.conflicts > 0 && (
-                          <Badge tone={existing === "replace" && b.kind === kind ? "err" : "warn"}>
-                            {b.conflicts} already in target
-                          </Badge>
-                        )}
+                        {(() => {
+                          const ign = ignoredCount(b.kind, b.total, b.conflicts);
+                          if (b.conflicts === 0 && ign === 0) return null;
+                          // green once nothing is left to bring across: everything is either
+                          // in the target already or deliberately ignored
+                          const complete = b.total > 0 && b.conflicts + ign >= b.total;
+                          return (
+                            <>
+                              {/* ignored objects count as settled, so the number reaches the total */}
+                              <Badge tone={complete ? "ok" : existing === "replace" && b.kind === kind ? "err" : "warn"}>
+                                {b.conflicts + ign} already in target
+                              </Badge>
+                              {ign > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.preventDefault(); setIgnoredOpen((k) => (k === b.kind ? null : b.kind)); }}
+                                  className="text-[11px] text-mute underline decoration-dotted hover:text-ink"
+                                  title="Show the ignored objects"
+                                  aria-expanded={ignoredOpen === b.kind}
+                                >
+                                  {ign} ignored
+                                </button>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                       <div className="text-[11.5px] text-mute mt-0.5">{b.note}</div>
+                      {ignoredOpen === b.kind && (ignoredByKind[b.kind] ?? []).length > 0 && (
+                        <ul className="mt-2 space-y-1.5 max-h-48 overflow-auto border-t border-bdr pt-2" onClick={(e) => e.preventDefault()}>
+                          {(ignoredByKind[b.kind] ?? []).map((x) => (
+                            <li key={x.name} className="flex items-start gap-2 min-w-0">
+                              <div className="min-w-0 flex-1">
+                                <span className="font-mono text-[12px] font-semibold">{x.name}</span>
+                                <div className="text-[11px] text-mute break-words">{x.reason} · ignored {x.at.slice(0, 10)}</div>
+                              </div>
+                              <Btn variant="outline" onClick={() => setIgnoredFor(b.kind, (ignoredByKind[b.kind] ?? []).filter((y) => y.name !== x.name))}>Stop ignoring</Btn>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
+                    <Btn
+                      variant="outline"
+                      className="shrink-0"
+                      title={`Refresh ${b.label.toLowerCase()}`}
+                      aria-label={`Refresh ${b.label.toLowerCase()}`}
+                      onClick={() => {
+                        // re-reading a type also selects it: the object list is only carried for one type
+                        setObjectCopyOptions(key, { kind: b.kind });
+                        reread(b.kind);
+                      }}
+                    >
+                      <RefreshCw size={13} /> Refresh
+                    </Btn>
                   </label>
                 ))}
               </div>
@@ -305,10 +708,39 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
             </section>
           </div>
 
+          {ignoredNow.length > 0 && (
+            <div className="border border-bdr rounded-lg p-3 mt-4 text-[12.5px]">
+              <div className="flex items-center gap-2 flex-wrap">
+                <EyeOff size={14} className="text-mute shrink-0" />
+                <span className="text-ink">
+                  <b>{ignoredNow.length}</b> {(summary?.label ?? plan.label).toLowerCase()} always ignored for {plan.targetName}
+                </span>
+                <span className="flex-1" />
+                <Btn variant="outline" onClick={() => setShowIgnored((v) => !v)}>{showIgnored ? "Hide ignored" : "Show ignored"}</Btn>
+                {showIgnored && <Btn variant="outline" onClick={() => setIgnoredFor(kind, [])}>Stop ignoring all</Btn>}
+              </div>
+              {showIgnored && (
+                <ul className="mt-2 space-y-1.5 max-h-72 overflow-auto">
+                  {ignoredNow.map((x) => (
+                    <li key={x.name} className="flex items-start gap-2 min-w-0">
+                      <div className="min-w-0 flex-1">
+                        <span className="font-mono text-[12.5px] font-semibold">{x.name}</span>
+                        <div className="text-[11.5px] text-mute break-words">{x.reason} · ignored {x.at.slice(0, 10)}</div>
+                      </div>
+                      <Btn variant="outline" onClick={() => setIgnoredFor(kind, ignoredNow.filter((y) => y.name !== x.name))}>Stop ignoring</Btn>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
           <ObjectPicker
             plan={plan}
             names={names}
             onChange={(next) => setObjectCopyOptions(key, { names: next })}
+            ignored={ignoredNow.map((x) => x.name)}
+            onIgnore={(picked) => ignoreObjects(kind, picked.map((name) => ({ name, reason: "Ignored from the object list" })))}
           />
 
           <div className="grid xl:grid-cols-2 gap-4 mt-4">
@@ -360,111 +792,6 @@ export default function ObjectCopy({ sourceId, targetId }: { sourceId: string; t
         </>
       )}
 
-      {!loading && !busy && result && (
-        <section className="mt-5 df-fade">
-          <h3 className="text-[11px] font-bold uppercase tracking-wider text-mute mb-2">
-            Result — {result.label}, {fmtSecs(result.elapsedMs)}
-            {result.timedOut ? " (stopped at the time budget)" : ""}
-          </h3>
-          <div className="flex gap-2 flex-wrap mb-3">
-            <Tile label="Created" value={result.created} tone="ok" />
-            {result.replaced > 0 && <Tile label="Replaced" value={result.replaced} tone="warn" />}
-            <Tile label="Skipped" value={result.skipped} tone="neutral" />
-            <Tile label="Failed" value={result.failed} tone={result.failed ? "err" : "neutral"} />
-            {/* counted out of "created" rather than beside it: the object is there, it just
-                does not work yet, and a tile is the only place that difference gets seen */}
-            {result.invalid > 0 && <Tile label="Not valid" value={result.invalid} tone="warn" />}
-            {result.foreignKeys.length > 0 && (
-              <Tile label="Foreign keys" value={result.fksCreated} tone={result.fksFailed ? "warn" : "accent"} />
-            )}
-          </div>
-
-          {result.note && <p className="text-[12px] text-mute mb-3">{result.note}</p>}
-
-          {result.failed > 0 && (
-            <div className="mb-3">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Failed</div>
-              <div className="space-y-1.5">
-                {result.objects
-                  .filter((o) => o.status === "failed")
-                  .map((o) => (
-                    <div key={o.name} className="border border-err/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
-                      <XCircle size={14} className="text-err shrink-0 mt-0.5" />
-                      <div className="min-w-0">
-                        <span className="font-mono text-[12.5px] font-semibold">{o.name}</span>
-                        <div className="text-[11.5px] text-err mt-0.5 break-words">{o.error}</div>
-                      </div>
-                    </div>
-                  ))}
-              </div>
-            </div>
-          )}
-
-          {result.invalid > 0 && (
-            <div className="mb-3">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Created, but not valid</div>
-              <div className="space-y-1.5">
-                {reasonGroups(result.objects, (o) => o.warning).map((g) => (
-                  <div key={g.reason} className="border border-warn/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
-                    <AlertTriangle size={14} className="text-warn shrink-0 mt-0.5" />
-                    <div className="min-w-0">
-                      <div className="text-[12px] text-soft">
-                        {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
-                      </div>
-                      <Names names={g.names} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {result.skipped > 0 && (
-            <div className="mb-3">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Not copied</div>
-              <div className="space-y-1.5">
-                {reasonGroups(result.objects, (o) => (o.status === "skipped" ? o.reason ?? "Skipped." : undefined)).map((g) => (
-                  <div key={g.reason} className="border border-bdr rounded-lg px-3 py-2">
-                    <div className="text-[12px] text-soft">
-                      {g.reason} <span className="text-mute">— {fmtNum(g.names.length)}</span>
-                    </div>
-                    <Names names={g.names} />
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {result.fksFailed > 0 && (
-            <div className="mb-3">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-mute mb-1.5">Foreign keys not added</div>
-              <div className="space-y-1.5">
-                {result.foreignKeys
-                  .filter((f) => f.status === "failed")
-                  .map((f) => (
-                    <div key={`${f.table}.${f.name}`} className="border border-warn/30 rounded-lg px-3 py-2 flex items-start gap-2.5">
-                      <AlertTriangle size={14} className="text-warn shrink-0 mt-0.5" />
-                      <div className="min-w-0">
-                        <span className="font-mono text-[12.5px] font-semibold">{f.name}</span>
-                        <span className="text-[11px] text-mute"> on {f.table}</span>
-                        <div className="text-[11.5px] text-err mt-0.5 break-words">{f.error}</div>
-                      </div>
-                    </div>
-                  ))}
-              </div>
-              <p className="text-[11.5px] text-mute mt-1.5">
-                A foreign key names a second table. One that points at a table this copy did not bring across cannot be added
-                until that table is there — copy it and run this again, and the missing keys are filled in.
-              </p>
-            </div>
-          )}
-
-          {/* what this kind carries, in the backend's own words — the same sentence the
-              confirmation dialog was written from, so the two cannot describe different copies */}
-          <p className="text-[11.5px] text-mute">{objectCopyKindSummary(plan, result.kind)?.note}</p>
-        </section>
-      )}
-
       {!loading && !busy && !plan && !run?.error && (
         <div className="border border-dashed border-bdr rounded-xl p-10 text-center text-mute text-[12.5px]">
           <Database size={20} className="mx-auto mb-2 opacity-60" />
@@ -493,16 +820,24 @@ function ObjectPicker({
   plan,
   names,
   onChange,
+  ignored,
+  onIgnore,
 }: {
   plan: ObjectCopyPlan;
   names: string[];
   onChange: (next: string[]) => void;
+  /** names on this target's always-ignore list for the kind being shown */
+  ignored: string[];
+  onIgnore: (names: string[]) => void;
 }) {
   const [filter, setFilter] = useState("");
   const [leftPicked, setLeftPicked] = useState<string[]>([]);
   const [rightPicked, setRightPicked] = useState<string[]>([]);
 
   const chosen = useMemo(() => new Set(names), [names]);
+  const ignoredSet = useMemo(() => new Set(ignored), [ignored]);
+  /** whatever is highlighted in either list and not ignored yet */
+  const toIgnore = [...leftPicked, ...rightPicked].filter((n) => !ignoredSet.has(n));
   // both lists stay in the dictionary's order however the names were moved about, so the same
   // object is always in the same place
   const available = useMemo(() => {
@@ -561,6 +896,7 @@ function ObjectPicker({
               <option key={i.name} value={i.name} className="px-1 py-0.5">
                 {i.name}
                 {itemTag(i)}
+                {ignoredSet.has(i.name) ? " · ignored" : ""}
               </option>
             ))}
           </select>
@@ -584,6 +920,15 @@ function ObjectPicker({
           <Btn variant="toolbar" title="Leave every object out" onClick={() => remove([...chosen])} disabled={!selected.length}>
             <ChevronsLeft size={14} />
           </Btn>
+          <Btn
+            variant="toolbar"
+            title="Always ignore the highlighted objects for this target"
+            aria-label="Always ignore the highlighted objects for this target"
+            onClick={() => { onIgnore(toIgnore); setLeftPicked([]); setRightPicked([]); }}
+            disabled={!toIgnore.length}
+          >
+            <EyeOff size={14} />
+          </Btn>
         </div>
 
         <div className="min-w-0 flex-1">
@@ -602,6 +947,7 @@ function ObjectPicker({
               <option key={i.name} value={i.name} className="px-1 py-0.5">
                 {i.name}
                 {itemTag(i)}
+                {ignoredSet.has(i.name) ? " · ignored" : ""}
               </option>
             ))}
           </select>

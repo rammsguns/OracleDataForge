@@ -165,6 +165,14 @@ export default function Workspace() {
             <ObjectEditor object={tab.payload!} tabId={tab.id} />
           </div>
         ))}
+        {/* The Migration tab is kept alive the same way: a compare over hundreds of tables, its
+            selection, apply report and a running copy are too costly to rebuild on every visit.
+            Closing the tab is what clears it. */}
+        {canView("migration") && s.tabs.filter((tab) => tab.kind === "migration").map((tab) => (
+          <div key={tab.id} className="h-full min-h-0" hidden={tab.id !== active.id}>
+            <MigrationAssistant />
+          </div>
+        ))}
         {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>
         {active.kind === "worksheet" && <SqlWorksheet key={active.id} />}
         {active.kind === "data" && <DataBrowser table={active.payload!} />}
@@ -173,7 +181,6 @@ export default function Workspace() {
         {active.kind === "erd" && <ErDiagram />}
         {active.kind === "history" && <QueryHistory />}
         {active.kind === "perf" && <PerformanceMonitor />}
-        {active.kind === "migration" && <MigrationAssistant />}
         {active.kind === "dba" && <DbaAdvisor />}
         {active.kind === "dbamanager" && <DbaManager />}
         {active.kind === "sessions" && <Sessions />}

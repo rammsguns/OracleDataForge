@@ -630,6 +630,11 @@ export interface ObjectCopyObjectResult {
   /** created, and still not working — a view the target cannot compile yet */
   warning?: string;
   statements: number;
+  /** failed: the statement Oracle rejected */
+  sql?: string;
+  /** invalid after creation: the target's own compilation errors, one per line */
+  compileErrors?: string[];
+  ms?: number;
 }
 
 /** One foreign key of a copied table, added once every table in the run existed. */
@@ -659,6 +664,8 @@ export interface ObjectCopyResult {
   invalid: number;
   fksCreated: number;
   fksFailed: number;
+  /** set when the run gave up at the first error that every later object would hit too */
+  stopped?: { error: string; object: string; advice: string; fix?: string };
   timedOut: boolean;
   elapsedMs: number;
   note?: string;
@@ -685,6 +692,8 @@ export interface TableColumnMeta {
   scale: number | null;
   nullable: boolean;
   dataDefault: string | null;
+  /** GENERATED … AS IDENTITY; its backing ISEQ$$_ sequence is never listed in `dataDefault` */
+  identity?: "ALWAYS" | "BY DEFAULT" | null;
   comment: string | null;
   pk: boolean;
   position: number;
@@ -698,6 +707,8 @@ export interface TableIndexMeta {
   status: string;
   tablespace: string | null;
   constraintBacked: boolean;
+  /** Per column: the expression behind a function-based (or DESC) index column, else null. */
+  expressions?: (string | null)[];
 }
 
 export interface TableConstraintMeta {
@@ -781,12 +792,16 @@ export interface ApplyStmtResult {
   ok: boolean;
   error?: string;
   line?: number;
+  /** how long the statement took on the server */
+  ms?: number;
 }
 
 export interface ApplyTableResult {
   results: ApplyStmtResult[];
   failed: boolean;
   applied: number;
+  /** set when the run gave up at a privilege error, whatever "continue past errors" said */
+  stopped?: { error: string; sql: string; advice: string; fix?: string };
 }
 
 export interface TableStats {
@@ -1043,8 +1058,8 @@ export const api = {
   importData: (id: string, req: ImportRequest, confirm = false) =>
     request<ImportResult>(`/api/connections/${id}/import`, { ...req, confirm }),
   tableMeta: (id: string, name: string) => request<TableMeta>(`/api/connections/${id}/table?name=${encodeURIComponent(name)}`),
-  applyTableDdl: (id: string, statements: string[], confirm = false) =>
-    request<ApplyTableResult>(`/api/connections/${id}/table/apply`, { statements, confirm }),
+  applyTableDdl: (id: string, statements: string[], confirm = false, continueOnError = false) =>
+    request<ApplyTableResult>(`/api/connections/${id}/table/apply`, { statements, confirm, continueOnError }),
   /** Rows of a table plus their ROWIDs — the Data Browser edit-mode read (any browsing role). */
   tableRows: async (id: string, name: string, transactionId?: string) => {
     const result = await request<TableRowsResult>(`/api/connections/${id}/table/rows?name=${encodeURIComponent(name)}`, undefined, undefined, transactionId ? { 'X-Dataforge-Transaction': transactionId } : undefined);
