@@ -45,6 +45,7 @@ import {
   copyMetadataType,
   copyStatusTypes,
   copyInternalError,
+  copyJobDdl,
   copyConnectionLost,
   copyStatements,
   copyTransforms,
@@ -3873,6 +3874,8 @@ interface ObjectCopyKindSummary {
   hasTablespace: boolean;
   /** replacing one is its own create statement, so "drop and recreate" is the wrong name for it */
   replaceInPlace: boolean;
+  /** objects of this kind run by themselves once created (jobs) — the UI offers whether to enable them */
+  activates: boolean;
   /**
    * What objects of this kind are built on — "tables", "tables and views" — so the browser can
    * say which run to do first about a blocked object instead of always saying "tables". Empty
@@ -4079,6 +4082,15 @@ const OBJECT_COPY_LIST_SQL: Record<CopyKind, string> = {
   //     materialized view log, a container table, a Text index table — which are the
   //     dictionary's business and fail or misfire in a target that has no such thing
   //   · `generated = 'Y'` leaves out the ones Oracle named for something of its own
+  // DBMS_SCHEDULER jobs this schema's owner created. Two families are Oracle's own and left out:
+  // `DBMS_JOB$_n` is how 19c runs a legacy DBMS_JOB job (its number is assigned by the database
+  // and recreating it under that name in another one is asking for a clash), and `MV_RF$J_…`
+  // is a materialized view's refresh schedule, which arrives with the materialized view.
+  jobs: `SELECT job_name AS "name" FROM user_scheduler_jobs
+     WHERE job_name NOT LIKE 'DBMS\\_JOB$\\_%' ESCAPE '\\'
+       AND job_name NOT LIKE 'MV\\_RF$J\\_%' ESCAPE '\\'
+       AND job_subname IS NULL
+     ORDER BY job_name`,
   triggers: `SELECT t.trigger_name AS "name" FROM user_triggers t
      WHERE t.base_object_type IN ('TABLE', 'VIEW')
        AND t.table_owner = USER
@@ -4209,7 +4221,8 @@ async function oraCopyObjectDdl(
   kind: CopyKind,
   name: string,
   fromSchema: string,
-  toSchema: string
+  toSchema: string,
+  opts: { enableJobs?: boolean } = {}
 ): Promise<string[]> {
   // `copyMetadataType` rather than `objectType`: DBMS_METADATA calls it MATERIALIZED_VIEW
   // where the dictionary calls it MATERIALIZED VIEW, and the dictionary's spelling here earns
@@ -4220,6 +4233,11 @@ async function oraCopyObjectDdl(
   });
   const ddl = rows[0]?.ddl;
   if (ddl == null) return [];
+  // A job is a DBMS_SCHEDULER call whose code lives in string arguments, so the qualifiers
+  // that matter are inside literals — and it is created switched off unless asked otherwise.
+  if (kind === "jobs") {
+    return copyStatements(copyJobDdl(retargetSchema(String(ddl), fromSchema, toSchema, { literals: true }), opts.enableJobs === true));
+  }
   return copyStatements(retargetSchema(String(ddl), fromSchema, toSchema));
 }
 
@@ -4345,6 +4363,7 @@ async function oraObjectCopyPlan(
       replaceNote: spec.replaceNote,
       hasTablespace: spec.hasTablespace,
       replaceInPlace: spec.replaceInPlace,
+      activates: spec.activates === true,
       baseLabel: copyBaseLabel(spec.kind),
       selected: spec.kind === kind,
       total: of.length,
@@ -4409,7 +4428,7 @@ async function oraObjectCopy(
   target: LiveConnection,
   kind: CopyKind,
   existing: CopyExisting,
-  opts: { names: string[] | null; preserveTablespace: boolean }
+  opts: { names: string[] | null; preserveTablespace: boolean; enableJobs?: boolean }
 ): Promise<ObjectCopyResult> {
   const t0 = Date.now();
   const deadline = t0 + OBJECT_COPY_BUDGET_MS;
@@ -4476,7 +4495,7 @@ async function oraObjectCopy(
           continue;
         }
         try {
-          const statements = await oraCopyObjectDdl(srcConn, kind, name, sourceSchema, targetSchema);
+          const statements = await oraCopyObjectDdl(srcConn, kind, name, sourceSchema, targetSchema, { enableJobs: opts.enableJobs });
           if (!statements.length) {
             objects.push({ ...base, status: "skipped", reason: "The source has no readable DDL for this object." });
             continue;
@@ -4530,7 +4549,8 @@ async function oraObjectCopy(
           }
           // A missing privilege is the account's problem, not this object's: every object after
           // it would fail the same way, so stop here and say what to grant instead.
-          if (/ORA-01031/.test(errMsg(e))) stopped = { object: name, error: errMsg(e), ...copyPrivilegeAdvice(kind, targetSchema, !running) };
+          // ORA-27486 is the scheduler's own spelling of the same refusal.
+          if (/ORA-01031|ORA-27486/.test(errMsg(e))) stopped = { object: name, error: errMsg(e), ...copyPrivilegeAdvice(kind, targetSchema, !running) };
         }
       }
 
@@ -4641,6 +4661,7 @@ const COPY_CREATE_PRIVILEGE: Record<CopyKind, string> = {
   sequences: "CREATE SEQUENCE", tables: "CREATE TABLE", indexes: "CREATE TABLE", views: "CREATE VIEW",
   mviews: "CREATE MATERIALIZED VIEW", synonyms: "CREATE SYNONYM", packages: "CREATE PROCEDURE",
   procedures: "CREATE PROCEDURE", functions: "CREATE PROCEDURE", types: "CREATE TYPE", triggers: "CREATE TRIGGER",
+  jobs: "CREATE JOB",
 };
 
 /** What to do about an ORA-01031 — worded for whoever has to ask a DBA for the grant. */
@@ -5796,6 +5817,7 @@ function readCopyRequest(
     // dictionary can answer, so `normalizeNames` gets them once the listing is in hand
     names: src.names,
     preserveTablespace: src.preserveTablespace === true || src.preserveTablespace === "true",
+    enableJobs: src.enableJobs === true || src.enableJobs === "true",
   };
 }
 
@@ -5806,6 +5828,8 @@ interface CopyRequest {
   /** the names the caller picked, unvalidated — absent means every object of the kind */
   names: unknown;
   preserveTablespace: boolean;
+  /** jobs only: keep the source's enabled state rather than landing every one disabled */
+  enableJobs: boolean;
 }
 
 /** Both connections, or the reason the copy cannot be set up at all. */
@@ -5920,6 +5944,13 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
       : parsed.preserveTablespace
       ? ` Each one keeps the tablespace it has in ${plan.sourceSchema}, and fails if ${target.name} has no tablespace of that name.`
       : ` They are created in ${plan.targetSchema}'s default tablespace.`;
+    // The one kind that does something by itself once it exists, so whether it will is said
+    // before it happens rather than discovered at the next start date.
+    const enableLine = !copyKindSpec(kind).activates
+      ? ""
+      : parsed.enableJobs
+      ? ` Jobs enabled in ${plan.sourceSchema} are enabled in ${plan.targetSchema} too, and start running on their schedule against ${target.name}'s data.`
+      : ` Every job is created DISABLED; enable the ones you want in ${plan.targetSchema} afterwards.`;
     return confirmRequired(res, describeOperation({
       level: existing === "replace" && conflicts ? "destructive" : "write",
       verb: `COPY ${copyKindSpec(kind).label.toUpperCase()}`,
@@ -5932,6 +5963,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
         conflictLine +
         blockedLine +
         tablespaceLine +
+        enableLine +
         ` ${copyKindSpec(kind).note} Objects that fail are reported and the rest of the copy continues.`,
       confirmLabel:
         existing === "replace" && conflicts ? `Replace and copy ${total} object(s)` : `Copy ${total} object(s)`,
@@ -5939,7 +5971,7 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
   }
 
   try {
-    res.json(await oraObjectCopy(source, target, kind, existing, { names, preserveTablespace: parsed.preserveTablespace }));
+    res.json(await oraObjectCopy(source, target, kind, existing, { names, preserveTablespace: parsed.preserveTablespace, enableJobs: parsed.enableJobs }));
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), target.host) });
   }

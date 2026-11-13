@@ -566,7 +566,7 @@ export interface CompileBatchResult {
  * kind, chosen or not), so the two sides cannot drift into disagreeing about what a copy
  * contains. Adding a kind is a change to the server plus this one line.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers" | "jobs";
 
 /** What a copy does with an object the target already has. */
 export type CopyExisting = "skip" | "replace";
@@ -582,6 +582,8 @@ export interface ObjectCopyKindSummary {
   hasTablespace: boolean;
   /** replacing one is its own create statement, so nothing is dropped and the choice is not called that */
   replaceInPlace: boolean;
+  /** objects of this kind run by themselves once created (jobs) — the UI offers whether to enable them */
+  activates: boolean;
   /** what objects of this kind are built on — "tables", "tables and views" — empty when nothing */
   baseLabel: string;
   selected: boolean;
@@ -1047,6 +1049,8 @@ export const api = {
       /** the objects to copy; omitted (not empty) means every object of the kind */
       names?: string[];
       preserveTablespace: boolean;
+      /** jobs only: keep the source's enabled state instead of creating every job disabled */
+      enableJobs?: boolean;
     },
     confirm = false
   ) => request<ObjectCopyResult>(`/api/connections/${targetId}/objects/copy`, { ...req, confirm }),

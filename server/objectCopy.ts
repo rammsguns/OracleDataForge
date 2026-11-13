@@ -21,7 +21,7 @@
  * be described: an entry in `OBJECT_COPY_KINDS`, a listing query beside it in `index.ts`, and
  * — for a kind built on a table — the query that says which table each one belongs to.
  */
-export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers";
+export type CopyKind = "sequences" | "tables" | "indexes" | "views" | "mviews" | "synonyms" | "packages" | "procedures" | "functions" | "types" | "triggers" | "jobs";
 
 export interface CopyKindSpec {
   kind: CopyKind;
@@ -98,6 +98,13 @@ export interface CopyKindSpec {
    * report rather than a wrong line in it.
    */
   compiled: boolean;
+  /**
+   * Objects of this kind start doing things on their own once they exist — a scheduler job
+   * runs at its next start date in whatever database it lands in. The copy creates them
+   * switched off unless the caller asks for the source's enabled state, and the UI offers
+   * that choice only for a kind where it means something.
+   */
+  activates?: boolean;
   /** what the copy brings with the object, and what it does not — shown in the UI, so it has to be true */
   note: string;
   /** what replacing an existing one costs here — a table, an index and a view are three different bets */
@@ -240,6 +247,21 @@ export const OBJECT_COPY_KINDS: CopyKindSpec[] = [
     note: "The trigger's PL/SQL as the source wrote it, on the table or view it fires for, and enabled or disabled the way the source has it. Not what that code calls: a trigger whose packages or tables are not in the target is still created, and stays invalid until they are. Triggers on the schema or the database itself are not offered — those are not part of copying a schema's objects.",
     replaceNote:
       "Each existing trigger is replaced in place rather than dropped, so the table is never briefly without one. What it does changes at that moment though: from then on every insert, update and delete on that table runs the source's code rather than the target's.",
+  },
+  {
+    kind: "jobs",
+    label: "Scheduler Jobs",
+    objectType: "JOB",
+    metadataType: "PROCOBJ",
+    foreignKeys: false,
+    requiresTable: false,
+    hasTablespace: false,
+    replaceInPlace: false,
+    compiled: false,
+    activates: true,
+    note: "The DBMS_SCHEDULER job as the source defines it — its action, schedule, class and attributes — with schema qualifiers inside the job action repointed at the target. Not the procedures, programs, schedules or credentials it names: a job whose program or schedule is not in the target is refused, and one whose procedure is not there fails when it runs. Jobs Oracle made for itself (legacy DBMS_JOB jobs and materialized-view refreshes) are not offered.",
+    replaceNote:
+      "Each existing job is dropped with DBMS_SCHEDULER.DROP_JOB and recreated, losing its run history. A job that is running at that moment is not stopped — the drop is refused and reported instead.",
   },
 ];
 
@@ -413,7 +435,19 @@ export function copyStatements(ddl: string): string[] {
  * deliberately narrow: only `SOURCE.` immediately before a name is a schema qualifier, and a
  * source and target that are the same schema make the whole pass a no-op.
  */
-export function retargetSchema(ddl: string, from: string, to: string): string {
+export function retargetSchema(
+  ddl: string,
+  from: string,
+  to: string,
+  /**
+   * Also repoint qualifiers *inside* plain '…' literals. Off for ordinary DDL, where a literal
+   * is data; on for a scheduler job, whose DDL is a call to DBMS_SCHEDULER and whose code —
+   * the job action, a program name — exists only as string arguments to it. The literal is
+   * unescaped, retargeted by the same rules, and escaped again, so a quote inside the job's
+   * own code survives the round trip.
+   */
+  opts: { literals?: boolean } = {}
+): string {
   const src = from.trim().toUpperCase();
   const dst = to.trim().toUpperCase();
   if (!src || !dst || src === dst) return ddl;
@@ -422,6 +456,12 @@ export function retargetSchema(ddl: string, from: string, to: string): string {
   let i = 0;
   while (i < ddl.length) {
     const protectedEnd = copyTextEnd(ddl, i);
+    if (protectedEnd !== null && opts.literals && ddl[i] === "'" && protectedEnd - i >= 2 && ddl[protectedEnd - 1] === "'") {
+      const body = ddl.slice(i + 1, protectedEnd - 1).replace(/''/g, "'");
+      out += `'${retargetSchema(body, from, to, opts).replace(/'/g, "''")}'`;
+      i = protectedEnd;
+      continue;
+    }
     if (protectedEnd !== null && ddl[i] !== '"') {
       out += ddl.slice(i, protectedEnd);
       i = protectedEnd;
@@ -577,6 +617,9 @@ export function dropStatement(kind: CopyKind, name: string): string | null {
   const ident = copyIdent(name);
   if (!ident) return null;
   if (kind === "tables") return `DROP TABLE ${ident} CASCADE CONSTRAINTS PURGE`;
+  // A job is not dropped by DDL at all. `force => FALSE` makes a running one refuse the drop
+  // (ORA-27478) rather than be killed mid-run by a copy.
+  if (kind === "jobs") return `BEGIN dbms_scheduler.drop_job(job_name => '${ident.replace(/'/g, "''")}', force => FALSE); END;`;
   return `DROP ${spec.objectType} ${ident}`;
 }
 
@@ -645,4 +688,45 @@ export function copyInternalError(message: string, where: "source" | "target"): 
 /** The session is gone after this error — the run has to reconnect before the next object. */
 export function copyConnectionLost(message: string): boolean {
   return /ORA-(00600|07445|03113|03114|03135)\b|NJS-500|DPI-1080|NJS-003/.test(message);
+}
+
+/** `s` with every literal, quoted identifier and comment blanked out, offsets unchanged. */
+function copyCodeMask(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length;) {
+    const end = copyTextEnd(s, i);
+    if (end !== null) {
+      out += s.slice(i, end).replace(/[^\n]/g, " ");
+      i = end;
+      continue;
+    }
+    out += s[i++];
+  }
+  return out;
+}
+
+/**
+ * A scheduler job's DDL with its "switch on" taken out, unless `enable` asks to keep it.
+ *
+ * DBMS_METADATA writes an enabled job as `create_job(…, enabled=>FALSE, …)` followed by
+ * `dbms_scheduler.enable('"JOB"')` — so the copy of a production job would start running in
+ * the target at its next start date, against whatever data the target holds. By default the
+ * enable call is removed and any `enabled=>TRUE` turned off, and the job lands DISABLED for
+ * someone to switch on deliberately. Both are matched only in code, never inside the job's own
+ * action text, which is a string literal and may well mention dbms_scheduler itself.
+ */
+export function copyJobDdl(ddl: string, enable: boolean): string {
+  if (enable) return ddl;
+  const mask = copyCodeMask(ddl);
+  const edits: [number, number, string][] = [];
+  for (const m of mask.matchAll(/\b(?:sys\s*\.\s*)?dbms_scheduler\s*\.\s*enable\s*\([^;]*\)\s*;/gi)) {
+    edits.push([m.index!, m.index! + m[0].length, ""]);
+  }
+  for (const m of mask.matchAll(/\benabled\s*=>\s*TRUE\b/gi)) {
+    edits.push([m.index!, m.index! + m[0].length, "enabled=>FALSE"]);
+  }
+  edits.sort((a, b) => b[0] - a[0]);
+  let out = ddl;
+  for (const [a, b, r] of edits) out = out.slice(0, a) + r + out.slice(b);
+  return out;
 }

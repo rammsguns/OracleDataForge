@@ -25,6 +25,8 @@ export interface ObjectCopyRun {
   existing: CopyExisting;
   /** copy each object into the tablespace it came from, rather than the target's default */
   preserveTablespace: boolean;
+  /** jobs only: enable the ones the source has enabled, rather than creating all of them disabled */
+  enableJobs?: boolean;
   plan?: ObjectCopyPlan;
   result?: ObjectCopyResult;
   error?: string;
@@ -131,7 +133,7 @@ export async function loadObjectCopyPlan(
 /** Change what the run will copy, without going back to the server for it. */
 export function setObjectCopyOptions(
   key: string,
-  next: { kind?: CopyKind; names?: string[]; existing?: CopyExisting; preserveTablespace?: boolean }
+  next: { kind?: CopyKind; names?: string[]; existing?: CopyExisting; preserveTablespace?: boolean; enableJobs?: boolean }
 ): void {
   patch(key, next);
 }
@@ -150,6 +152,7 @@ export async function startObjectCopy(key: string, confirm: boolean): Promise<Co
     names: cur.names,
     existing: cur.existing,
     preserveTablespace: cur.preserveTablespace,
+    enableJobs: cur.enableJobs === true,
   };
   if (!confirm) {
     // ask the server first: it re-reads both dictionaries, decides whether this needs
