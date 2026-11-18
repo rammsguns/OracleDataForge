@@ -247,11 +247,15 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         if (type === 'NCLOB') return oracledb.NCLOB;
         if (type === 'RAW') return oracledb.BUFFER;
         if (type === 'DATE') return oracledb.DATE;
-        if (['NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE'].includes(type)) return oracledb.NUMBER;
+        // NUMBER/FLOAT travel as exact decimal text (see numberIndexes); IEEE binary types are exact as JS numbers.
+        if (type === 'NUMBER' || type === 'FLOAT') return oracledb.STRING;
+        if (type === 'BINARY_FLOAT' || type === 'BINARY_DOUBLE') return oracledb.NUMBER;
         if (['NCHAR', 'NVARCHAR2'].includes(type)) return oracledb.DB_TYPE_NVARCHAR;
         return oracledb.STRING;
       }) : undefined;
-      plans.push({ name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types });
+      // Oracle NUMBER holds up to 38 significant digits; a JS number keeps ~15-17. Fetch as text.
+      const numberIndexes = columns.flatMap((column, i) => ['NUMBER', 'FLOAT'].includes(sourceColumns.find(c => c.COLUMN_NAME === column)!.DATA_TYPE) ? [i] : []);
+      plans.push({ name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types, numberIndexes });
       rowidColumns.push(...sourceColumns.filter(c => c.DATA_TYPE === 'ROWID' || c.DATA_TYPE === 'UROWID').map(c => `${name}.${c.COLUMN_NAME}`));
       for (const c of targetColumns.filter(c => c.IDENTITY_COLUMN === 'YES' && columns.includes(c.COLUMN_NAME))) {
         identities.push({ name, column: c.COLUMN_NAME, always: c.GENERATION_TYPE === 'ALWAYS', options: identitySequenceOptions(c.IDENTITY_OPTIONS) });
@@ -261,7 +265,16 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       await target.execute(alter(id, 'BY DEFAULT'));
       changed.push(id);
     }
-    for (const { name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types } of plans) {
+    // NUMBER text is fetched with '.' as the decimal point, while Oracle converts text back to
+    // NUMBER using the target session's NLS decimal character. Match it, without altering the
+    // (pooled) session.
+    let decimal = '.';
+    if (plans.some(plan => plan.numberIndexes.length)) {
+      const nls = await target.execute<{ VALUE?: unknown }>(`SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_NUMERIC_CHARACTERS'`, [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      const value = nls.rows?.[0]?.VALUE;
+      if (typeof value === 'string' && value.length >= 1) decimal = value[0];
+    }
+    for (const { name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types, numberIndexes } of plans) {
       current = name;
       const cols = columns.map(quoteCopyName).join(', ');
       const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : zonedColumns.has(c) ? `TO_CHAR(${zonedColumns.get(c) ? `CAST(${quoteCopyName(c)} AS TIMESTAMP WITH TIME ZONE)` : quoteCopyName(c)}, '${timestampTzFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
@@ -269,11 +282,11 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       const identityIndexes = identities.filter(id => id.name === name).map(id => columns.indexOf(id.column));
       const query = await source.execute<unknown[]>(`SELECT ${projection} FROM ${quoteCopyName(name)}${rowLimit ? ' WHERE ROWNUM <= :row_limit' : ''}`, rowLimit ? { row_limit: rowLimit } : [], {
         resultSet: true, outFormat: oracledb.OUT_FORMAT_ARRAY,
-        ...(hasLargeText ? { fetchArraySize: 1, prefetchRows: 0,
-          fetchTypeHandler: (meta: Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0]) => {
-            if (meta.dbType === oracledb.CLOB || meta.dbType === oracledb.NCLOB) return { type: oracledb.STRING };
-          },
-        } : {}),
+        fetchTypeHandler: (meta: Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0]) => {
+          if (meta.dbType === oracledb.DB_TYPE_NUMBER) return { type: oracledb.STRING };
+          if (hasLargeText && (meta.dbType === oracledb.CLOB || meta.dbType === oracledb.NCLOB)) return { type: oracledb.STRING };
+        },
+        ...(hasLargeText ? { fetchArraySize: 1, prefetchRows: 0 } : {}),
       });
       const cursor = query.resultSet!;
       try {
@@ -288,8 +301,12 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
           }
           total += rows.length;
           if (total > maxTotal) throw new Error(`Copy exceeds the ${maxTotal.toLocaleString('en-US')}-row limit. Raise the total row limit (up to 1,000,000) or use a bulk migration tool for larger copies.`);
-          if (rows.some(row => row.some(value => typeof value === 'number' && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))))) {
+          // Guard: NUMBER columns must arrive as text. A JS number here would already be rounded.
+          if (rows.some(row => numberIndexes.some(i => typeof row[i] === 'number' && (!Number.isFinite(row[i] as number) || (Number.isInteger(row[i]) && !Number.isSafeInteger(row[i] as number)))))) {
             throw new Error('A numeric value exceeds JavaScript’s safe range. Use a database-native migration to preserve its precision.');
+          }
+          if (decimal !== '.') {
+            for (const row of rows) for (const i of numberIndexes) if (typeof row[i] === 'string') row[i] = (row[i] as string).replace('.', decimal);
           }
           const failed = await insert({ name, sql: `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values})`, rows, error: '', bytes: 0, types });
           if (failed) {

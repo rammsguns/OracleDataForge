@@ -316,6 +316,36 @@ test('ROWID and UROWID columns copy their text form and warn that the addresses 
   assert.match(result.warnings!.join(' '), /ROWID\/UROWID values were copied as-is in LINKS\.RID/);
 });
 
+test('NUMBER values beyond JavaScript precision are fetched and bound as exact text in the target decimal format', async () => {
+  for (const [nls, expected] of [['.,', ['12345678901234567890123456789012345678', '-0.000000000000000000123456789012345678901', '9007199254740993.25']], [',.', ['12345678901234567890123456789012345678', '-0,000000000000000000123456789012345678901', '9007199254740993,25']]] as const) {
+    const metadata = [col('BIG'), col('RATE', 'BINARY_DOUBLE'), col('NOTE', 'CLOB')];
+    const values = ['12345678901234567890123456789012345678', '-0.000000000000000000123456789012345678901', '9007199254740993.25'];
+    let handler: oracledb.ExecuteOptions['fetchTypeHandler'];
+    const source = { execute: async (query: string, _binds: unknown, options: oracledb.ExecuteOptions) => {
+      if (query.includes('user_tab_cols')) return { rows: metadata };
+      handler = options.fetchTypeHandler;
+      let i = 0;
+      return { resultSet: { getRows: async () => i < values.length ? [[values[i++], 1e300, 'x']] : [], close: async () => {} } };
+    } } as unknown as oracledb.Connection;
+    const bound: unknown[] = [];
+    const target = {
+      execute: async (query: string) => query.includes('nls_session_parameters') ? { rows: [{ VALUE: nls }] } : { rows: metadata },
+      executeMany: async (_sql: string, rows: unknown[][], options: oracledb.ExecuteManyOptions) => {
+        assert.deepEqual((options.bindDefs as oracledb.BindDefinition[]).map(b => b.type), [oracledb.STRING, oracledb.NUMBER, oracledb.CLOB]);
+        bound.push(rows[0][0]);
+        assert.equal(rows[0][1], 1e300);
+        return {};
+      },
+      commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+    } as unknown as oracledb.Connection;
+    assert.equal((await copyTableRows(source, target, ['LEDGER'])).totalRows, 3);
+    assert.deepEqual(bound, expected);
+    const meta = (dbType: unknown) => ({ name: 'X', dbType }) as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0];
+    assert.equal(handler!(meta(oracledb.DB_TYPE_NUMBER), [])?.type, oracledb.STRING);
+    assert.equal(handler!(meta(oracledb.DB_TYPE_BINARY_DOUBLE), []), undefined);
+  }
+});
+
 test('native vectors and nulls retain their representation and explicit bind type during retries', async () => {
   for (const vector of [new Float32Array([0.1, -2]), new Float64Array([1.123456789, -2]), new Int8Array([1, -2]), new Uint8Array([255, 0]), new oracledb.SparseVector({ numDimensions: 8, indices: new Uint32Array([1]), values: new Float32Array([0.5]) }), null]) {
     const columns = [col(), col('DESCRIPTION_EMBEDDING', 'VECTOR')];
