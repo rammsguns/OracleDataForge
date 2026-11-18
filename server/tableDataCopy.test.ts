@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import oracledb from 'oracledb';
-import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, type CopyColumn } from './tableDataCopy.ts';
+import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, parseCopyRowLimit, type CopyColumn } from './tableDataCopy.ts';
 
 const col = (name = 'ID', type = 'NUMBER'): CopyColumn => ({ COLUMN_NAME: name, DATA_TYPE: type, VIRTUAL_COLUMN: 'NO', IDENTITY_COLUMN: 'NO', IDENTITY_OPTIONS: 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N, SCALE_FLAG: N, EXTEND_FLAG: N, SESSION_FLAG: N, KEEP_VALUE: N' });
 test('matches columns by name, safely quotes identifiers, and rejects unsupported targets', () => {
@@ -80,11 +80,14 @@ function foreignKeySessions(data: Record<string, (number | null)[][]>, parents: 
   const inserted = new Map<string, Set<number>>();
   const attempts: string[] = [];
   let commits = 0, rollbacks = 0;
-  const source = { execute: async (sql: string) => {
+  const queries: string[] = [];
+  const source = { execute: async (sql: string, binds?: { row_limit?: number }) => {
     if (sql.includes('user_tab_cols')) return { rows: [col(), col('PARENT_ID')] };
+    queries.push(sql);
     const table = /FROM "([^"]+)"/.exec(sql)![1];
+    const rows = binds && !Array.isArray(binds) && binds.row_limit ? data[table].slice(0, binds.row_limit) : data[table];
     let index = 0;
-    return { resultSet: { getRows: async () => index < data[table].length ? [data[table][index++]] : [], close: async () => {} } };
+    return { resultSet: { getRows: async () => index < rows.length ? [rows[index++]] : [], close: async () => {} } };
   } } as unknown as oracledb.Connection;
   const target = {
     execute: async () => ({ rows: [col(), col('PARENT_ID')] }),
@@ -105,7 +108,7 @@ function foreignKeySessions(data: Record<string, (number | null)[][]>, parents: 
     commit: async () => { commits++; },
     rollback: async () => { rollbacks++; inserted.clear(); },
   } as unknown as oracledb.Connection;
-  return { source, target, attempts, inserted, stats: () => ({ commits, rollbacks }) };
+  return { source, target, attempts, inserted, queries, stats: () => ({ commits, rollbacks }) };
 }
 
 test('self-referencing child-before-parent rows across batches are retried, never duplicating successful rows', async () => {
@@ -130,6 +133,34 @@ test('missing parents and true row cycles roll back rather than loop or commit p
     assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1 });
     assert.equal(s.inserted.size, 0);
   }
+});
+
+test('a row limit samples each table, skips children whose parents were not sampled, and commits the rest', async () => {
+  const s = foreignKeySessions({ P: [[1, null], [2, null], [3, null]], C: [[10, 3], [11, 1], [12, 2]] }, { C: 'P' });
+  const result = await copyTableRows(s.source, s.target, ['P', 'C'], 'append', { rowLimit: 2 });
+  assert.ok(s.queries.every(q => q.includes('WHERE ROWNUM <= :row_limit')));
+  assert.deepEqual(result.tables, [{ name: 'P', rows: 2 }, { name: 'C', rows: 1, skipped: 1 }]);
+  assert.equal(result.totalRows, 3);
+  assert.equal(result.skippedRows, 1);
+  assert.match(result.warnings![0], /C \(1\)/);
+  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
+  assert.deepEqual([...s.inserted.get('C')!], [11]);
+});
+
+test('without a row limit, every row is read and unresolved parents still roll back', async () => {
+  const s = foreignKeySessions({ P: [[1, null]], C: [[10, 3]] }, { C: 'P' });
+  await assert.rejects(copyTableRows(s.source, s.target, ['P', 'C']), /Cannot resolve parent data/);
+  assert.ok(s.queries.every(q => !q.includes('ROWNUM')));
+  assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1 });
+});
+
+test('row limits apply to count validation and reject invalid values', () => {
+  assert.equal(validateCopyCounts({ BIG: 5_000_000, SMALL: 10 }, 1000), 1010);
+  assert.throws(() => validateCopyCounts({ BIG: 5_000_000 }), /row limit per table/);
+  assert.throws(() => validateCopyCounts(Object.fromEntries(Array.from({ length: 3 }, (_, i) => [`T${i}`, 50_000])), 40_000), /lower the row limit/);
+  assert.deepEqual(parseCopyRowLimit(undefined), { rowLimit: null });
+  assert.deepEqual(parseCopyRowLimit(500), { rowLimit: 500 });
+  for (const bad of [0, -1, 1.5, '10', 100001]) assert.ok('error' in parseCopyRowLimit(bad));
 });
 
 test('non-FK batch errors are fatal and are never retried', async () => {

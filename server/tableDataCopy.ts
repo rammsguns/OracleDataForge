@@ -1,5 +1,5 @@
 import oracledb from 'oracledb';
-import type { TableDependency } from '../src/utils/tableDataDependencies.ts';
+import { limitedCopyCount, TABLE_COPY_MAX_ROWS, type TableDependency } from '../src/utils/tableDataDependencies.ts';
 
 export async function readTableDependencies(conn: oracledb.Connection, schema: string): Promise<TableDependency[]> {
   const result = await conn.execute<{ TABLE_NAME: string; CONSTRAINT_NAME: string; R_OWNER: string; PARENT_TABLE: string | null }>(
@@ -72,12 +72,23 @@ export async function countCopyRows(source: oracledb.Connection, names: string[]
   return counts;
 }
 
-export function validateCopyCounts(counts: Record<string, number>) {
-  const oversized = Object.entries(counts).filter(([, count]) => count > 100000);
-  if (oversized.length) throw new Error('Cannot copy tables exceeding the 100,000-row limit: ' + oversized.map(([name, count]) => name + ' (' + count.toLocaleString('en-US') + ' rows)').join(', ') + '.');
-  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
-  if (total > 100000) throw new Error('Selected tables contain ' + total.toLocaleString('en-US') + ' rows, exceeding the 100,000-row limit per copy. Select fewer tables.');
+/** Validates the rows that will actually be copied, after any per-table row limit. */
+export function validateCopyCounts(counts: Record<string, number>, rowLimit?: number | null) {
+  const effective = Object.entries(counts).map(([name, count]) => [name, limitedCopyCount(count, rowLimit)] as const);
+  const oversized = effective.filter(([, count]) => count > TABLE_COPY_MAX_ROWS);
+  if (oversized.length) throw new Error('Cannot copy tables exceeding the 100,000-row limit: ' + oversized.map(([name, count]) => name + ' (' + count.toLocaleString('en-US') + ' rows)').join(', ') + '. Set a row limit per table.');
+  const total = effective.reduce((sum, [, count]) => sum + count, 0);
+  if (total > TABLE_COPY_MAX_ROWS) throw new Error('Selected tables contain ' + total.toLocaleString('en-US') + ' rows to copy, exceeding the 100,000-row limit per copy. Select fewer tables or lower the row limit per table.');
   return total;
+}
+
+/** Accepts no limit (undefined/null) or a whole number of rows from 1 to the per-copy maximum. */
+export function parseCopyRowLimit(value: unknown): { rowLimit: number | null } | { error: string } {
+  if (value === undefined || value === null) return { rowLimit: null };
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > TABLE_COPY_MAX_ROWS) {
+    return { error: 'Row limit must be a whole number from 1 to 100,000, or omitted to copy all rows.' };
+  }
+  return { rowLimit: value };
 }
 
 export async function nonEmptyCopyTables(target: oracledb.Connection, names: string[]) {
@@ -109,9 +120,17 @@ export async function deleteCopyRows(target: oracledb.Connection, names: string[
   }
 }
 
-/** Row DML is one transaction. Identity DDL runs only before DML or after commit/rollback. */
-export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], mode: 'append' | 'replace' = 'append') {
-  const results: { name: string; rows: number }[] = [];
+/**
+ * Row DML is one transaction. Identity DDL runs only before DML or after commit/rollback.
+ * `names` must already be in dependency order (parents first); FK-blocked rows are retried.
+ * With `rowLimit`, each table contributes at most that many rows. A sample can contain child
+ * rows whose parent rows were not sampled, so those unresolvable rows are skipped and reported
+ * instead of rolling back the whole copy. Without a limit, any unresolved row is fatal.
+ */
+export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], mode: 'append' | 'replace' = 'append', options: { rowLimit?: number | null } = {}) {
+  const rowLimit = options.rowLimit ?? null;
+  const results: { name: string; rows: number; skipped?: number }[] = [];
+  const skipped: Record<string, number> = Object.create(null);
   let total = 0;
   type Pending = { name: string; sql: string; rows: unknown[][]; error: string; types?: oracledb.DbType[] };
   let pending: Pending[] = [];
@@ -202,7 +221,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
       const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : `:${i + 1}`).join(', ');
       const identityIndexes = identities.filter(id => id.name === name).map(id => columns.indexOf(id.column));
-      const query = await source.execute<unknown[]>(`SELECT ${projection} FROM ${quoteCopyName(name)}`, [], {
+      const query = await source.execute<unknown[]>(`SELECT ${projection} FROM ${quoteCopyName(name)}${rowLimit ? ' WHERE ROWNUM <= :row_limit' : ''}`, rowLimit ? { row_limit: rowLimit } : [], {
         resultSet: true, outFormat: oracledb.OUT_FORMAT_ARRAY,
         ...(hasLargeText ? { fetchArraySize: 1, prefetchRows: 0,
           fetchTypeHandler: (meta: Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0]) => {
@@ -249,8 +268,17 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         if (failed) next.push(failed);
       }
       const remaining = next.reduce((n, b) => n + b.rows.length, 0);
+      if (remaining === before && rowLimit) {
+        // No further progress is possible: these rows reference parent rows outside the sample.
+        for (const batch of next) skipped[batch.name] = (skipped[batch.name] ?? 0) + batch.rows.length;
+        break;
+      }
       if (remaining === before) throw new Error(`Cannot resolve parent data for ${[...new Set(next.map(b => b.name))].join(', ')} (${remaining} rows). Required parent keys are missing or the rows form a non-insertable cycle. ${next[0].error}`);
       pending = next;
+    }
+    for (const result of results) {
+      const count = skipped[result.name];
+      if (count) { result.rows -= count; result.skipped = count; total -= count; }
     }
     await target.commit();
   } catch (e) {
@@ -269,5 +297,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     catch (e) { warnings.push(`Rows are committed. Before generating new IDs, run: ${sql}; — ${(e as Error).message}`); }
   }
   warnings.push(...(await restore()).map(failure => `Rows are committed. Restore the identity mode: ${failure}`));
-  return { tables: results, totalRows: total, ...(warnings.length ? { warnings } : {}) };
+  const skippedRows = Object.values(skipped).reduce((n, c) => n + c, 0);
+  if (skippedRows) warnings.unshift(`${skippedRows.toLocaleString('en-US')} sampled rows were skipped because their parent rows were not in the sample: ${Object.entries(skipped).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ')}.`);
+  return { tables: results, totalRows: total, ...(skippedRows ? { skippedRows } : {}), ...(warnings.length ? { warnings } : {}) };
 }

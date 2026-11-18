@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { indexTableDependencies, tableDataSelection, type TableDependency } from './tableDataDependencies';
+import { indexTableDependencies, limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_TABLES, type TableDependency } from './tableDataDependencies';
 
 const fk = (table: string, parent: string | null, local = true): TableDependency => ({ table, parent, local, parentSchema: local ? 'TARGET' : 'EXTERNAL', constraint: `FK_${table}_${parent}` });
 
@@ -48,12 +48,28 @@ test('cycles and self-references are detected without hanging', () => {
   assert.deepEqual(tableDataSelection(['A'], ['A'], [fk('A', 'A')]).cycles, ['A']);
 });
 
-test('dependency expansion never silently truncates the 25-table limit', () => {
-  const names = Array.from({ length: 26 }, (_, i) => `T${i}`);
+test('dependency expansion never silently truncates the table limit', () => {
+  const size = TABLE_COPY_MAX_TABLES + 1;
+  const names = Array.from({ length: size }, (_, i) => `T${i}`);
   const r = tableDataSelection(['T0'], names, names.slice(0, -1).map((n, i) => fk(n, names[i + 1])));
-  assert.equal(r.names.length, 26);
+  assert.equal(r.names.length, size);
   assert.equal(r.overLimit, true);
-  assert.equal(r.names[0], 'T25');
+  assert.equal(r.names[0], `T${size - 1}`);
+});
+
+test('selecting every table orders all parents before their children', () => {
+  const all = ['ITEMS', 'AUDIT', 'ORDERS', 'CUSTOMERS', 'REGIONS'];
+  const r = tableDataSelection(all, all, [fk('ITEMS', 'ORDERS'), fk('ORDERS', 'CUSTOMERS'), fk('CUSTOMERS', 'REGIONS')]);
+  assert.equal(r.names.length, all.length);
+  const at = (n: string) => r.names.indexOf(n);
+  assert.ok(at('REGIONS') < at('CUSTOMERS') && at('CUSTOMERS') < at('ORDERS') && at('ORDERS') < at('ITEMS'));
+  assert.deepEqual(r.added, []);
+});
+
+test('row limits cap each table count only when set', () => {
+  assert.equal(limitedCopyCount(500, 100), 100);
+  assert.equal(limitedCopyCount(50, 100), 50);
+  assert.equal(limitedCopyCount(500, null), 500);
 });
 
 test('server selection detects new dependencies not in the reviewed table list', () => {

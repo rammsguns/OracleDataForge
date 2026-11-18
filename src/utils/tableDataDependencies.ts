@@ -8,6 +8,14 @@ export interface TableDependency {
 
 export type TableDependencyIndex = Map<string, TableDependency[]>;
 
+/** Shared by the client and server so both enforce the same copy limits. */
+export const TABLE_COPY_MAX_TABLES = 1000;
+export const TABLE_COPY_MAX_ROWS = 100000;
+
+/** Rows a table contributes to a copy when an optional per-table row limit applies. */
+export const limitedCopyCount = (count: number, rowLimit?: number | null) =>
+  rowLimit ? Math.min(count, rowLimit) : count;
+
 export function indexTableDependencies(dependencies: TableDependency[]): TableDependencyIndex {
   const index: TableDependencyIndex = new Map();
   for (const dependency of dependencies) {
@@ -46,5 +54,5 @@ export function tableDataSelection(roots: string[], available: string[], depende
     order.push(table);
   };
   for (const table of roots) if (allowed.has(table)) visit(table);
-  return { names: order, added: order.filter(n => !roots.includes(n)), cycles: [...cycles], warnings: [...warnings], overLimit: selected.size > 25 };
+  return { names: order, added: order.filter(n => !roots.includes(n)), cycles: [...cycles], warnings: [...warnings], overLimit: selected.size > TABLE_COPY_MAX_TABLES };
 }

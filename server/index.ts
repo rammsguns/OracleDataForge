@@ -1,8 +1,8 @@
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
-import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies } from './tableDataCopy.ts';
-import { tableDataSelection } from '../src/utils/tableDataDependencies.ts';
+import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit } from './tableDataCopy.ts';
+import { tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
 import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
@@ -6015,14 +6015,17 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     const plan = await oraObjectCopyPlan(source, target, 'tables');
     if (plan.targetSystemSchema || plan.sameSchema) return res.status(400).json({ error: 'Copying into this schema is blocked.' });
     const names = req.body.names;
-    if (!Array.isArray(names) || !names.length || names.length > 25 || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
-      return res.status(400).json({ error: 'Select 1–25 distinct tables that exist in both schemas. Create missing tables using Copy objects first.' });
+    const limit = parseCopyRowLimit(req.body.rowLimit);
+    if ('error' in limit) return res.status(400).json({ error: limit.error });
+    const { rowLimit } = limit;
+    if (!Array.isArray(names) || !names.length || names.length > TABLE_COPY_MAX_TABLES || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
+      return res.status(400).json({ error: `Select 1–${TABLE_COPY_MAX_TABLES} distinct tables that exist in both schemas. Create missing tables using Copy objects first.` });
     }
     dst = await getOraConn(target);
     const dependencies = await readTableDependencies(dst, plan.targetSchema);
     const selection = tableDataSelection(names, plan.items.filter(i => i.existsInTarget).map(i => i.name), dependencies);
     if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
-      selection.overLimit ? 'Required parent tables exceed the 25-table limit. Use a custom migration.' :
+      selection.overLimit ? `Required parent tables exceed the ${TABLE_COPY_MAX_TABLES}-table limit. Use a custom migration.` :
       `Additional parent tables are required: ${selection.added.join(', ')}. Re-read tables and review the updated selection.` });
     src = await getOraConn(source);
     src.callTimeout = 30000;
@@ -6030,7 +6033,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     await src.execute('SET TRANSACTION READ ONLY');
     const sourceCounts = await countCopyRows(src, selection.names);
     let sourceTotal: number;
-    try { sourceTotal = validateCopyCounts(sourceCounts); }
+    try { sourceTotal = validateCopyCounts(sourceCounts, rowLimit); }
     catch (e) { return res.status(400).json({ error: errMsg(e) }); }
     const occupied = await nonEmptyCopyTables(dst, selection.names);
     if (req.body.checkOnly === true) return res.json({ occupied, sourceCounts, sourceTotal });
@@ -6039,13 +6042,13 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     if (!acknowledged(req)) return confirmRequired(res, describeOperation({
       level: mode === 'replace' ? 'destructive' : 'write', verb: 'COPY TABLE DATA', target: plan.targetSchema,
       title: `Copy data into ${plan.targetSchema}?`,
-      body: `Source count: ${sourceTotal.toLocaleString()} rows. ${occupied.length ? 'Existing rows found in: ' + occupied.join(', ') + '. ' : 'Selected target tables are currently empty. '}${mode === 'replace' ? 'DELETE ALL existing rows in every selected table, including automatically selected parents, then copy' : 'Append (preserve existing rows; duplicate keys may fail)'} rows from ${plan.sourceSchema} to ${selection.names.join(' → ')} on ${target.name}. Rows waiting for parent keys are retried after other rows are loaded; foreign keys remain enabled. Unresolved parent keys or duplicate keys roll back the entire copy. All copied rows commit together in a separate session. ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after rows commit. These schema changes commit separately. Pause other target writes during copying. If interrupted, identity settings may need manual repair. Target triggers run on attempts, including retries; autonomous trigger changes cannot be rolled back. ${selection.warnings.join(' ')} Parent row coverage has not been validated. Limit: 100,000 rows across 25 tables.`,
+      body: `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table; sampled child rows whose parent rows were not sampled are skipped and reported)` : ''} across ${selection.names.length} table(s), inserted parents first. ${occupied.length ? 'Existing rows found in: ' + occupied.join(', ') + '. ' : 'Selected target tables are currently empty. '}${mode === 'replace' ? 'DELETE ALL existing rows in every selected table, including automatically selected parents, then copy' : 'Append (preserve existing rows; duplicate keys may fail)'} rows from ${plan.sourceSchema} to ${selection.names.join(' → ')} on ${target.name}. Rows waiting for parent keys are retried after other rows are loaded; foreign keys remain enabled. ${rowLimit ? 'Rows whose parent keys are still missing are skipped and reported; duplicate keys roll back the entire copy.' : 'Unresolved parent keys or duplicate keys roll back the entire copy.'} All copied rows commit together in a separate session. ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after rows commit. These schema changes commit separately. Pause other target writes during copying. If interrupted, identity settings may need manual repair. Target triggers run on attempts, including retries; autonomous trigger changes cannot be rolled back. ${selection.warnings.join(' ')} Parent row coverage has not been validated. Limit: 100,000 rows across ${TABLE_COPY_MAX_TABLES} tables.`,
       confirmLabel: mode === 'replace' ? 'Delete existing data and copy' : 'Append data',
     }));
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
-    res.json(await copyTableRows(src, dst, selection.names, mode));
+    res.json(await copyTableRows(src, dst, selection.names, mode, { rowLimit }));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
     try {
