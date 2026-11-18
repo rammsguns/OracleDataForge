@@ -295,6 +295,27 @@ test('zoned timestamps keep their zone as text, and LOCAL TIME ZONE values conve
   assert.match(sql, /VALUES \(:1, TO_TIMESTAMP_TZ\(:2, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\), TO_TIMESTAMP_TZ\(:3, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\)\)/);
 });
 
+test('ROWID and UROWID columns copy their text form and warn that the addresses refer to the source', async () => {
+  for (const type of ['ROWID', 'UROWID']) assert.deepEqual(copyColumns([col('RID', type)], [col('RID', type)]), ['RID']);
+  assert.throws(() => copyColumns([col('RID', 'UROWID')], [col('RID', 'VARCHAR2')]), /incompatible/);
+  const metadata = [col(), col('RID', 'UROWID')];
+  const rows = [[1, 'AAAR3sAAEAAAACXAAA'], [2, '*BAMAAJ0CwQL+'], [3, null]];
+  const source = { execute: async (query: string) => {
+    if (query.includes('user_tab_cols')) return { rows: metadata };
+    assert.match(query, /SELECT "ID", "RID" FROM "LINKS"/);
+    let fetched = false;
+    return { resultSet: { getRows: async () => { if (fetched) return []; fetched = true; return rows; }, close: async () => {} } };
+  } } as unknown as oracledb.Connection;
+  const target = {
+    execute: async () => ({ rows: metadata }),
+    executeMany: async (insert: string, binds: unknown[][]) => { assert.match(insert, /VALUES \(:1, :2\)/); assert.deepEqual(binds, rows); return {}; },
+    commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+  } as unknown as oracledb.Connection;
+  const result = await copyTableRows(source, target, ['LINKS']);
+  assert.equal(result.totalRows, 3);
+  assert.match(result.warnings!.join(' '), /ROWID\/UROWID values were copied as-is in LINKS\.RID/);
+});
+
 test('native vectors and nulls retain their representation and explicit bind type during retries', async () => {
   for (const vector of [new Float32Array([0.1, -2]), new Float64Array([1.123456789, -2]), new Int8Array([1, -2]), new Uint8Array([255, 0]), new oracledb.SparseVector({ numDimensions: 8, indices: new Uint32Array([1]), values: new Float32Array([0.5]) }), null]) {
     const columns = [col(), col('DESCRIPTION_EMBEDDING', 'VECTOR')];

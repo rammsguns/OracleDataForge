@@ -13,7 +13,9 @@ export async function readTableDependencies(conn: oracledb.Connection, schema: s
 }
 
 export interface CopyColumn { COLUMN_NAME: string; DATA_TYPE: string; VIRTUAL_COLUMN: string; IDENTITY_COLUMN: string; GENERATION_TYPE?: string | null; IDENTITY_OPTIONS?: string | null }
-const supported = new Set(['NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'DATE', 'RAW', 'VECTOR', 'JSON', 'CLOB', 'NCLOB']);
+const supported = new Set(['NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'DATE', 'RAW', 'VECTOR', 'JSON', 'CLOB', 'NCLOB',
+  // Fetched by the driver as their text form and converted back by Oracle on insert.
+  'ROWID', 'UROWID']);
 const isTimestamp = (type: string) => /^TIMESTAMP(?:\([0-9]\))?$/.test(type);
 const isTimestampTz = (type: string) => /^TIMESTAMP(?:\([0-9]\))? WITH TIME ZONE$/.test(type);
 const isTimestampLtz = (type: string) => /^TIMESTAMP(?:\([0-9]\))? WITH LOCAL TIME ZONE$/.test(type);
@@ -144,6 +146,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     if (pending.reduce((n, b) => n + b.bytes, 0) > 64 * 1024 * 1024) throw new Error('Pending parent-dependent rows exceed the 64 MB retry limit. Use a bulk migration tool.');
   };
   const identities: { name: string; column: string; always: boolean; options: string }[] = [];
+  const rowidColumns: string[] = [];
   const changed: typeof identities = [];
   const alter = (id: typeof identities[number], clause: string) =>
     `ALTER TABLE ${quoteCopyName(id.name)} MODIFY (${quoteCopyName(id.column)} GENERATED ${clause} AS IDENTITY)`;
@@ -249,6 +252,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         return oracledb.STRING;
       }) : undefined;
       plans.push({ name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types });
+      rowidColumns.push(...sourceColumns.filter(c => c.DATA_TYPE === 'ROWID' || c.DATA_TYPE === 'UROWID').map(c => `${name}.${c.COLUMN_NAME}`));
       for (const c of targetColumns.filter(c => c.IDENTITY_COLUMN === 'YES' && columns.includes(c.COLUMN_NAME))) {
         identities.push({ name, column: c.COLUMN_NAME, always: c.GENERATION_TYPE === 'ALWAYS', options: identitySequenceOptions(c.IDENTITY_OPTIONS) });
       }
@@ -321,6 +325,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
   for (const batch of pending) skipped[batch.name] = (skipped[batch.name] ?? 0) + batch.rows.length;
   const skippedRows = Object.values(skipped).reduce((n, c) => n + c, 0);
   if (skippedRows) warnings.unshift(`${skippedRows.toLocaleString('en-US')} rows were not copied because their parent rows ${rowLimit ? 'were not in the sample' : 'do not exist in the source or target'}: ${Object.entries(skipped).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ')}.`);
+  if (rowidColumns.length) warnings.push(`ROWID/UROWID values were copied as-is in ${rowidColumns.join(', ')}. They address rows in the source database, so they will not locate rows in the target; update them if your application relies on them.`);
   const tables = names.map(name => ({ name, rows: committed[name] ?? 0, ...(skipped[name] ? { skipped: skipped[name] } : {}) }));
   return { tables, totalRows: tables.reduce((n, t) => n + t.rows, 0), ...(skippedRows ? { skippedRows } : {}), ...(warnings.length ? { warnings } : {}) };
 }
