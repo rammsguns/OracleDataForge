@@ -1033,9 +1033,9 @@ export const api = {
     request<ObjectCopyPlan>(
       `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
     ),
-  /** Copies into empty target tables only; each table commits as soon as it is loaded. */
-  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number) =>
-    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal }),
+  /** Copies into empty target tables (or truncates them first); each table commits as soon as it is loaded. */
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false) =>
+    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate }),
   tableDataPlan: (targetId: string, sourceId: string) =>
     request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; targetOccupied: string[]; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
   /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */

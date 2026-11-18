@@ -1,7 +1,7 @@
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
-import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTotalLimit } from './tableDataCopy.ts';
+import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
 import { tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
 import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
@@ -6022,6 +6022,8 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     const total = parseCopyTotalLimit(req.body.maxTotal);
     if ('error' in total) return res.status(400).json({ error: total.error });
     const { maxTotal } = total;
+    if (req.body.truncate !== undefined && typeof req.body.truncate !== 'boolean') return res.status(400).json({ error: 'truncate must be true or false.' });
+    const truncate = req.body.truncate === true;
     if (!Array.isArray(names) || !names.length || names.length > TABLE_COPY_MAX_TABLES || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
       return res.status(400).json({ error: `Select 1–${TABLE_COPY_MAX_TABLES} distinct tables that exist in both schemas. Create missing tables using Copy objects first.` });
     }
@@ -6033,9 +6035,10 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     const inTarget = plan.items.filter(i => i.existsInTarget).map(i => i.name);
     const occupied = new Set(await nonEmptyCopyTables(dst, inTarget));
     const notEmpty = names.filter((n: string) => occupied.has(n));
-    if (notEmpty.length) return res.status(409).json({ error: `Copy only into empty tables. These target tables already contain rows: ${notEmpty.join(', ')}. Empty them or deselect them, then re-read tables.` });
-    // A parent that already has rows in the target is not copied; its rows serve as the parents.
-    const selection = tableDataSelection(names, inTarget.filter(n => !occupied.has(n)), dependencies);
+    if (notEmpty.length && !truncate) return res.status(409).json({ error: `Copy only into empty tables. These target tables already contain rows: ${notEmpty.join(', ')}. Empty them, deselect them, or choose to truncate target tables before copying, then re-read tables.` });
+    // Without truncation, a parent that already has rows in the target is not copied; its rows
+    // serve as the parents. With truncation, every selected table is emptied and copied.
+    const selection = tableDataSelection(names, truncate ? inTarget : inTarget.filter(n => !occupied.has(n)), dependencies);
     if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
       selection.overLimit ? `Required parent tables exceed the ${TABLE_COPY_MAX_TABLES}-table limit. Use a custom migration.` :
       `Additional parent tables are required: ${selection.added.join(', ')}. Re-read tables and review the updated selection.` });
@@ -6046,21 +6049,30 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     let sourceTotal: number;
     try { sourceTotal = validateCopyCounts(sourceCounts, rowLimit, maxTotal); }
     catch (e) { return res.status(400).json({ error: errMsg(e) }); }
-    const filledParents = [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && occupied.has(d.parent)).map(d => d.parent!)))];
+    const toTruncate = truncate ? selection.names.filter(n => occupied.has(n)) : [];
+    if (toTruncate.length) {
+      const blocked = await truncateBlocker(dst, toTruncate, selection.names);
+      if (blocked) return res.status(409).json({ error: blocked });
+    }
+    const filledParents = truncate ? [] : [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && occupied.has(d.parent)).map(d => d.parent!)))];
     if (!acknowledged(req)) return confirmRequired(res, describeOperation({
-      level: 'write', verb: 'COPY TABLE DATA', target: plan.targetSchema,
+      level: toTruncate.length ? 'destructive' : 'write', verb: toTruncate.length ? 'TRUNCATE AND COPY TABLE DATA' : 'COPY TABLE DATA', target: plan.targetSchema,
       title: `Copy data into ${plan.targetSchema}?`,
-      body: `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table)` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
+      body: (toTruncate.length ? `TRUNCATE permanently removes ALL rows from ${toTruncate.length} target table(s) before copying: ${toTruncate.join(', ')}. Truncation cannot be rolled back, even if the copy then fails, and DELETE triggers do not fire. Foreign keys between the selected tables are briefly disabled for the truncation and re-enabled before copying. ` : '') + `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table)` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
         `Each table is committed as soon as its rows are inserted, so undo only needs to hold one table at a time. If a table fails, it is rolled back, but tables committed before it keep their rows — empty them before retrying. ` +
         `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${rowLimit ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
         (filledParents.length ? `Parent tables that already contain rows are not copied; their existing rows are used: ${filledParents.join(', ')}. ` : '') +
         `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Target triggers run on attempts, including retries. ${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
-      confirmLabel: 'Copy data',
+      confirmLabel: toTruncate.length ? `Truncate ${toTruncate.length} table(s) and copy` : 'Copy data',
     }));
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
-    res.json(await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal }));
+    const truncated = toTruncate.length ? await truncateCopyTables(dst, toTruncate, selection.names) : [];
+    let outcome: Awaited<ReturnType<typeof copyTableRows>>;
+    try { outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal }); }
+    catch (e) { throw truncated.length ? new Error(`${errMsg(e)} These tables were truncated before the copy started: ${truncated.join(', ')}.`) : e; }
+    res.json({ ...outcome, ...(truncated.length ? { truncated } : {}) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
     try {

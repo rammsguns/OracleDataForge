@@ -120,6 +120,63 @@ export async function nonEmptyCopyTables(target: oracledb.Connection, names: str
   return occupied;
 }
 
+type ReferenceRow = { CHILD_OWNER: string; CHILD_TABLE: string; CONSTRAINT_NAME: string; PARENT_TABLE: string };
+
+/** Enabled foreign keys (in any schema) that reference the given tables of this schema. */
+async function referencesTo(target: oracledb.Connection, tables: string[]): Promise<ReferenceRow[]> {
+  if (!tables.length) return [];
+  const result = await target.execute<ReferenceRow>(
+    `SELECT fk.owner AS child_owner, fk.table_name AS child_table, fk.constraint_name, pk.table_name AS parent_table
+     FROM all_constraints fk JOIN user_constraints pk ON fk.r_owner = USER AND fk.r_constraint_name = pk.constraint_name
+     WHERE fk.constraint_type = 'R' AND fk.status = 'ENABLED' AND pk.table_name IN (${tables.map((_, i) => ':' + (i + 1)).join(', ')})
+     ORDER BY fk.table_name, fk.constraint_name`, tables, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+  return result.rows ?? [];
+}
+
+/**
+ * Why `tables` cannot be truncated, or null. A table may only be truncated when every enabled
+ * foreign key referencing it comes from a table in `selection` (which is emptied or copied
+ * too); otherwise truncation would orphan rows that the copy does not replace.
+ */
+export async function truncateBlocker(target: oracledb.Connection, tables: string[], selection: string[]): Promise<string | null> {
+  const user = (await target.execute<{ U: string }>('SELECT USER AS u FROM dual', [], { outFormat: oracledb.OUT_FORMAT_OBJECT })).rows?.[0]?.U;
+  const inSelection = new Set(selection);
+  const outside = (await referencesTo(target, tables)).filter(r => r.CHILD_OWNER !== user || !inSelection.has(r.CHILD_TABLE));
+  if (!outside.length) return null;
+  return 'Truncation blocked: ' + outside.map(r => `${r.CHILD_OWNER}.${r.CHILD_TABLE} (${r.CONSTRAINT_NAME}) references ${r.PARENT_TABLE}`).join('; ') +
+    '. Select those child tables too, or empty them first.';
+}
+
+/**
+ * TRUNCATEs `tables` (DDL: immediate, no undo, cannot be rolled back, DELETE triggers do not
+ * fire). Foreign keys within the selection that reference them are disabled for the truncation
+ * and re-enabled straight after, before any rows are copied.
+ */
+export async function truncateCopyTables(target: oracledb.Connection, tables: string[], selection: string[]) {
+  const blocked = await truncateBlocker(target, tables, selection);
+  if (blocked) throw new Error(blocked);
+  const refs = await referencesTo(target, tables);
+  const disabled: ReferenceRow[] = [];
+  const constraintSql = (r: ReferenceRow, action: string) => `ALTER TABLE ${quoteCopyName(r.CHILD_TABLE)} ${action} CONSTRAINT ${quoteCopyName(r.CONSTRAINT_NAME)}`;
+  const truncated: string[] = [];
+  let failure: unknown;
+  try {
+    for (const r of refs) { await target.execute(constraintSql(r, 'DISABLE')); disabled.push(r); }
+    for (const name of tables) { await target.execute(`TRUNCATE TABLE ${quoteCopyName(name)}`); truncated.push(name); }
+  } catch (e) { failure = e; }
+  const enableFailures: string[] = [];
+  for (const r of disabled) {
+    try { await target.execute(constraintSql(r, 'ENABLE')); }
+    catch (e) { enableFailures.push(`${constraintSql(r, 'ENABLE')}; — ${(e as Error).message}`); }
+  }
+  if (failure || enableFailures.length) {
+    const done = truncated.length ? ` Already truncated (cannot be undone): ${truncated.join(', ')}.` : ' No tables were truncated.';
+    const repair = enableFailures.length ? ` Re-enable these foreign keys: ${enableFailures.join(' ')}` : '';
+    throw new Error(`${failure ? `Truncation failed: ${(failure as Error).message}.` : 'Foreign keys could not be re-enabled after truncation.'}${done}${repair} No rows were copied.`);
+  }
+  return truncated;
+}
+
 /**
  * Copies tables in the given order, which must be dependency order (parents first), and
  * COMMITS EACH TABLE as soon as its rows are inserted, so undo only has to hold one table.

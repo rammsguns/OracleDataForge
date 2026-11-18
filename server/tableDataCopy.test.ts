@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import oracledb from 'oracledb';
-import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, quoteCopyName, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
+import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, quoteCopyName, truncateBlocker, truncateCopyTables, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
 
 const col = (name = 'ID', type = 'NUMBER'): CopyColumn => ({ COLUMN_NAME: name, DATA_TYPE: type, VIRTUAL_COLUMN: 'NO', IDENTITY_COLUMN: 'NO', IDENTITY_OPTIONS: 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N, SCALE_FLAG: N, EXTEND_FLAG: N, SESSION_FLAG: N, KEEP_VALUE: N' });
 test('matches columns by name, safely quotes identifiers, and rejects unsupported targets', () => {
@@ -442,6 +442,47 @@ test('checks actual row existence using quoted names', async () => {
   const target = { execute: async (sql: string) => { sqls.push(sql); return { rows: sql.includes('EMPTY') ? [] : [[1]] }; } } as unknown as oracledb.Connection;
   assert.deepEqual(await nonEmptyCopyTables(target, ['EMPTY', 'a"b']), ['a"b']);
   assert.equal(sqls[1], 'SELECT 1 FROM "a""b" WHERE ROWNUM = 1');
+});
+
+function truncateTarget(refs: { CHILD_OWNER: string; CHILD_TABLE: string; CONSTRAINT_NAME: string; PARENT_TABLE: string }[], fail?: (sql: string) => boolean) {
+  const sqls: string[] = [];
+  const target = { execute: async (sql: string, binds?: string[]) => {
+    if (sql.includes('FROM dual')) return { rows: [{ U: 'APP' }] };
+    if (sql.includes('all_constraints')) return { rows: refs.filter(r => binds!.includes(r.PARENT_TABLE)) };
+    sqls.push(sql);
+    if (fail?.(sql)) throw new Error('ORA-00054: resource busy');
+    return {};
+  } } as unknown as oracledb.Connection;
+  return { target, sqls };
+}
+const ref = (child: string, parent: string, owner = 'APP') => ({ CHILD_OWNER: owner, CHILD_TABLE: child, CONSTRAINT_NAME: `FK_${child}_${parent}`, PARENT_TABLE: parent });
+
+test('truncation disables foreign keys inside the selection, truncates, then re-enables them', async () => {
+  const t = truncateTarget([ref('ORDERS', 'CUSTOMERS'), ref('CUSTOMERS', 'CUSTOMERS')]);
+  assert.deepEqual(await truncateCopyTables(t.target, ['CUSTOMERS', 'ORDERS'], ['CUSTOMERS', 'ORDERS']), ['CUSTOMERS', 'ORDERS']);
+  assert.deepEqual(t.sqls, [
+    'ALTER TABLE "ORDERS" DISABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"', 'ALTER TABLE "CUSTOMERS" DISABLE CONSTRAINT "FK_CUSTOMERS_CUSTOMERS"',
+    'TRUNCATE TABLE "CUSTOMERS"', 'TRUNCATE TABLE "ORDERS"',
+    'ALTER TABLE "ORDERS" ENABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"', 'ALTER TABLE "CUSTOMERS" ENABLE CONSTRAINT "FK_CUSTOMERS_CUSTOMERS"',
+  ]);
+});
+
+test('truncation is blocked by references from tables outside the selection or other schemas', async () => {
+  for (const outside of [ref('INVOICES', 'CUSTOMERS'), ref('ORDERS', 'CUSTOMERS', 'OTHER')]) {
+    const t = truncateTarget([outside]);
+    assert.match((await truncateBlocker(t.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']))!, /Truncation blocked: .*references CUSTOMERS/);
+    await assert.rejects(truncateCopyTables(t.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), /Truncation blocked/);
+    assert.deepEqual(t.sqls, []);
+  }
+  assert.equal(await truncateBlocker(truncateTarget([ref('ORDERS', 'CUSTOMERS')]).target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), null);
+});
+
+test('a failed truncation still re-enables foreign keys and reports what was already truncated', async () => {
+  const t = truncateTarget([ref('ORDERS', 'CUSTOMERS')], sql => sql === 'TRUNCATE TABLE "ORDERS"');
+  await assert.rejects(truncateCopyTables(t.target, ['CUSTOMERS', 'ORDERS'], ['CUSTOMERS', 'ORDERS']), /Truncation failed: ORA-00054.*Already truncated \(cannot be undone\): CUSTOMERS\. No rows were copied\./);
+  assert.equal(t.sqls.at(-1), 'ALTER TABLE "ORDERS" ENABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"');
+  const e = truncateTarget([ref('ORDERS', 'CUSTOMERS')], sql => sql.includes('ENABLE'));
+  await assert.rejects(truncateCopyTables(e.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), /could not be re-enabled.*Re-enable these foreign keys: ALTER TABLE "ORDERS" ENABLE CONSTRAINT/);
 });
 
 test('message-only and code-only manager FK errors from the thin driver are retried', async () => {
