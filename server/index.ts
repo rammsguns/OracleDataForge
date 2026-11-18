@@ -5979,6 +5979,8 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
 });
 
 const activeDataCopies = new Set<string>();
+/** Per-round-trip timeout while copying rows; planning queries keep 30 seconds. */
+const TABLE_COPY_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, async (req, res) => {
   const parsed = readCopyRequest(req.query as Record<string, unknown>, routeId(req));
   if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -6068,10 +6070,18 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
+    // Planning queries keep the short timeout; the copy itself fetches and inserts large
+    // batches (and LOBs), so each round trip gets far longer before it is treated as hung.
+    src.callTimeout = TABLE_COPY_CALL_TIMEOUT_MS;
+    dst.callTimeout = TABLE_COPY_CALL_TIMEOUT_MS;
     const truncated = toTruncate.length ? await truncateCopyTables(dst, toTruncate, selection.names) : [];
     let outcome: Awaited<ReturnType<typeof copyTableRows>>;
     try { outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal }); }
-    catch (e) { throw truncated.length ? new Error(`${errMsg(e)} These tables were truncated before the copy started: ${truncated.join(', ')}.`) : e; }
+    catch (e) {
+      let message = errMsg(e);
+      if (/NJS-123/.test(message)) message += ` A single database call ran longer than ${TABLE_COPY_CALL_TIMEOUT_MS / 60000} minutes; check for locks on the target tables or copy the slow table with a per-table row limit.`;
+      throw new Error(truncated.length ? `${message} These tables were truncated before the copy started: ${truncated.join(', ')}.` : message);
+    }
     res.json({ ...outcome, ...(truncated.length ? { truncated } : {}) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
