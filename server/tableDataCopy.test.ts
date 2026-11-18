@@ -236,12 +236,16 @@ test('post-commit sequence failure returns repair warnings and still restores AL
   assert.equal(s.stats().rollbacks, 0);
 });
 
-test('timestamp precisions are supported without accepting timezone or unrelated types', () => {
+test('timestamp precisions and zoned timestamps are supported without accepting unrelated types', () => {
   for (const type of ['TIMESTAMP', 'TIMESTAMP(0)', 'TIMESTAMP(6)', 'TIMESTAMP(9)']) {
     assert.deepEqual(copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), ['ORDER_TS']);
   }
   assert.throws(() => copyColumns([col('ORDER_TS', 'TIMESTAMP(9)')], [col('ORDER_TS', 'TIMESTAMP(6)')]), /incompatible/);
-  for (const type of ['TIMESTAMP(10)', 'TIMESTAMP(6) WITH TIME ZONE', 'TIMESTAMP(6) WITH LOCAL TIME ZONE']) {
+  for (const type of ['TIMESTAMP(6) WITH TIME ZONE', 'TIMESTAMP WITH TIME ZONE', 'TIMESTAMP(9) WITH LOCAL TIME ZONE']) {
+    assert.deepEqual(copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), ['ORDER_TS']);
+  }
+  assert.throws(() => copyColumns([col('ORDER_TS', 'TIMESTAMP(6) WITH TIME ZONE')], [col('ORDER_TS', 'TIMESTAMP(6)')]), /incompatible/);
+  for (const type of ['TIMESTAMP(10)', 'TIMESTAMP(6) WITH TIME ZONES', 'INTERVAL DAY(2) TO SECOND(6)']) {
     assert.throws(() => copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), /not supported/);
   }
 });
@@ -270,6 +274,26 @@ test('timestamp text and nulls reach Oracle conversion binds unchanged, includin
   assert.equal(committed, true);
 });
 
+
+test('zoned timestamps keep their zone as text, and LOCAL TIME ZONE values convert through a zoned cast', async () => {
+  const metadata = [col(), col('RECEIVED_DATE_TIME', 'TIMESTAMP(6) WITH TIME ZONE'), col('SEEN_AT', 'TIMESTAMP(6) WITH LOCAL TIME ZONE')];
+  const rows = [[1, '2026-09-08 12:34:56.123456000 AMERICA/CHICAGO', '2026-09-08 17:34:56.123456000 +00:00'], [2, null, null]];
+  let sql = '';
+  const source = { execute: async (query: string) => {
+    if (query.includes('user_tab_cols')) return { rows: metadata };
+    assert.match(query, /TO_CHAR\("RECEIVED_DATE_TIME", 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\) AS "RECEIVED_DATE_TIME"/);
+    assert.match(query, /TO_CHAR\(CAST\("SEEN_AT" AS TIMESTAMP WITH TIME ZONE\), 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\) AS "SEEN_AT"/);
+    let fetched = false;
+    return { resultSet: { getRows: async () => { if (fetched) return []; fetched = true; return rows; }, close: async () => {} } };
+  } } as unknown as oracledb.Connection;
+  const target = {
+    execute: async () => ({ rows: metadata }),
+    executeMany: async (insert: string, binds: unknown[][]) => { sql = insert; assert.deepEqual(binds, rows); return {}; },
+    commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+  } as unknown as oracledb.Connection;
+  assert.equal((await copyTableRows(source, target, ['MESSAGES'])).totalRows, 2);
+  assert.match(sql, /VALUES \(:1, TO_TIMESTAMP_TZ\(:2, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\), TO_TIMESTAMP_TZ\(:3, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\)\)/);
+});
 
 test('native vectors and nulls retain their representation and explicit bind type during retries', async () => {
   for (const vector of [new Float32Array([0.1, -2]), new Float64Array([1.123456789, -2]), new Int8Array([1, -2]), new Uint8Array([255, 0]), new oracledb.SparseVector({ numDimensions: 8, indices: new Uint32Array([1]), values: new Float32Array([0.5]) }), null]) {

@@ -15,6 +15,12 @@ export async function readTableDependencies(conn: oracledb.Connection, schema: s
 export interface CopyColumn { COLUMN_NAME: string; DATA_TYPE: string; VIRTUAL_COLUMN: string; IDENTITY_COLUMN: string; GENERATION_TYPE?: string | null; IDENTITY_OPTIONS?: string | null }
 const supported = new Set(['NUMBER', 'FLOAT', 'BINARY_FLOAT', 'BINARY_DOUBLE', 'VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'DATE', 'RAW', 'VECTOR', 'JSON', 'CLOB', 'NCLOB']);
 const isTimestamp = (type: string) => /^TIMESTAMP(?:\([0-9]\))?$/.test(type);
+const isTimestampTz = (type: string) => /^TIMESTAMP(?:\([0-9]\))? WITH TIME ZONE$/.test(type);
+const isTimestampLtz = (type: string) => /^TIMESTAMP(?:\([0-9]\))? WITH LOCAL TIME ZONE$/.test(type);
+// Zoned timestamps travel as text with their zone (region name or offset), so the instant and
+// the original zone survive. LOCAL TIME ZONE values are read as zoned values in the session's
+// zone and the target converts them to its own database zone: the instant is what is kept.
+const timestampTzFormat = 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR';
 // Transfer timestamps as explicit text: JS Date would discard sub-millisecond precision.
 const timestampFormat = 'SYYYY-MM-DD HH24:MI:SS.FF9';
 // Runtime vector metadata is not yet declared by the installed @types/oracledb.
@@ -37,7 +43,7 @@ export function copyColumns(source: CopyColumn[], target: CopyColumn[]): string[
     if (dest.IDENTITY_COLUMN === 'YES' && !['ALWAYS', 'BY DEFAULT', 'BY DEFAULT ON NULL'].includes(dest.GENERATION_TYPE ?? '')) {
       throw new Error(`Identity column ${c.COLUMN_NAME} has an unknown generation mode.`);
     }
-    if (!supported.has(c.DATA_TYPE) && !isTimestamp(c.DATA_TYPE)) throw new Error(`Column ${c.COLUMN_NAME}: ${c.DATA_TYPE} is not supported by data copy.`);
+    if (!supported.has(c.DATA_TYPE) && !isTimestamp(c.DATA_TYPE) && !isTimestampTz(c.DATA_TYPE) && !isTimestampLtz(c.DATA_TYPE)) throw new Error(`Column ${c.COLUMN_NAME}: ${c.DATA_TYPE} is not supported by data copy.`);
   }
   return writable.map(c => c.COLUMN_NAME);
 }
@@ -214,6 +220,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       const sourceColumns = await read(source), targetColumns = await read(target);
       const columns = copyColumns(sourceColumns, targetColumns);
       const timestampColumns = new Set(sourceColumns.filter(c => isTimestamp(c.DATA_TYPE)).map(c => c.COLUMN_NAME));
+      const zonedColumns = new Map(sourceColumns.filter(c => isTimestampTz(c.DATA_TYPE) || isTimestampLtz(c.DATA_TYPE)).map(c => [c.COLUMN_NAME, isTimestampLtz(c.DATA_TYPE)] as const));
       const jsonColumns = new Set(sourceColumns.filter(c => c.DATA_TYPE === 'JSON').map(c => c.COLUMN_NAME));
       const hasLargeText = sourceColumns.some(c => ['JSON', 'CLOB', 'NCLOB'].includes(c.DATA_TYPE));
       const vectors = sourceColumns.filter(c => c.DATA_TYPE === 'VECTOR');
@@ -241,7 +248,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         if (['NCHAR', 'NVARCHAR2'].includes(type)) return oracledb.DB_TYPE_NVARCHAR;
         return oracledb.STRING;
       }) : undefined;
-      plans.push({ name, columns, timestampColumns, jsonColumns, hasLargeText, types });
+      plans.push({ name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types });
       for (const c of targetColumns.filter(c => c.IDENTITY_COLUMN === 'YES' && columns.includes(c.COLUMN_NAME))) {
         identities.push({ name, column: c.COLUMN_NAME, always: c.GENERATION_TYPE === 'ALWAYS', options: identitySequenceOptions(c.IDENTITY_OPTIONS) });
       }
@@ -250,11 +257,11 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       await target.execute(alter(id, 'BY DEFAULT'));
       changed.push(id);
     }
-    for (const { name, columns, timestampColumns, jsonColumns, hasLargeText, types } of plans) {
+    for (const { name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types } of plans) {
       current = name;
       const cols = columns.map(quoteCopyName).join(', ');
-      const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
-      const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : `:${i + 1}`).join(', ');
+      const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : zonedColumns.has(c) ? `TO_CHAR(${zonedColumns.get(c) ? `CAST(${quoteCopyName(c)} AS TIMESTAMP WITH TIME ZONE)` : quoteCopyName(c)}, '${timestampTzFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
+      const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : zonedColumns.has(c) ? `TO_TIMESTAMP_TZ(:${i + 1}, '${timestampTzFormat}')` : `:${i + 1}`).join(', ');
       const identityIndexes = identities.filter(id => id.name === name).map(id => columns.indexOf(id.column));
       const query = await source.execute<unknown[]>(`SELECT ${projection} FROM ${quoteCopyName(name)}${rowLimit ? ' WHERE ROWNUM <= :row_limit' : ''}`, rowLimit ? { row_limit: rowLimit } : [], {
         resultSet: true, outFormat: oracledb.OUT_FORMAT_ARRAY,
