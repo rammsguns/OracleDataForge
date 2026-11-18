@@ -1,5 +1,5 @@
 import oracledb from 'oracledb';
-import { limitedCopyCount, TABLE_COPY_MAX_ROWS, type TableDependency } from '../src/utils/tableDataDependencies.ts';
+import { limitedCopyCount, TABLE_COPY_DEFAULT_TOTAL_ROWS, TABLE_COPY_MAX_ROWS, type TableDependency } from '../src/utils/tableDataDependencies.ts';
 
 export async function readTableDependencies(conn: oracledb.Connection, schema: string): Promise<TableDependency[]> {
   const result = await conn.execute<{ TABLE_NAME: string; CONSTRAINT_NAME: string; R_OWNER: string; PARENT_TABLE: string | null }>(
@@ -72,23 +72,35 @@ export async function countCopyRows(source: oracledb.Connection, names: string[]
   return counts;
 }
 
-/** Validates the rows that will actually be copied, after any per-table row limit. */
-export function validateCopyCounts(counts: Record<string, number>, rowLimit?: number | null) {
+/**
+ * Validates the rows that will actually be copied, after any per-table row limit, against the
+ * chosen total limit (default 100,000; at most 1,000,000).
+ */
+export function validateCopyCounts(counts: Record<string, number>, rowLimit?: number | null, maxTotal = TABLE_COPY_DEFAULT_TOTAL_ROWS) {
+  const cap = maxTotal.toLocaleString('en-US');
   const effective = Object.entries(counts).map(([name, count]) => [name, limitedCopyCount(count, rowLimit)] as const);
-  const oversized = effective.filter(([, count]) => count > TABLE_COPY_MAX_ROWS);
-  if (oversized.length) throw new Error('Cannot copy tables exceeding the 100,000-row limit: ' + oversized.map(([name, count]) => name + ' (' + count.toLocaleString('en-US') + ' rows)').join(', ') + '. Set a row limit per table.');
+  const oversized = effective.filter(([, count]) => count > maxTotal);
+  if (oversized.length) throw new Error(`Cannot copy tables exceeding the ${cap}-row limit: ` + oversized.map(([name, count]) => name + ' (' + count.toLocaleString('en-US') + ' rows)').join(', ') + '. Set a row limit per table or raise the total row limit.');
   const total = effective.reduce((sum, [, count]) => sum + count, 0);
-  if (total > TABLE_COPY_MAX_ROWS) throw new Error('Selected tables contain ' + total.toLocaleString('en-US') + ' rows to copy, exceeding the 100,000-row limit per copy. Select fewer tables or lower the row limit per table.');
+  if (total > maxTotal) throw new Error('Selected tables contain ' + total.toLocaleString('en-US') + ` rows to copy, exceeding the ${cap}-row limit per copy. Select fewer tables, lower the row limit per table, or raise the total row limit.`);
   return total;
 }
 
-/** Accepts no limit (undefined/null) or a whole number of rows from 1 to the per-copy maximum. */
+const wholeRows = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= TABLE_COPY_MAX_ROWS;
+
+/** Accepts no limit (undefined/null) or a whole number of rows from 1 to 1,000,000. */
 export function parseCopyRowLimit(value: unknown): { rowLimit: number | null } | { error: string } {
   if (value === undefined || value === null) return { rowLimit: null };
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > TABLE_COPY_MAX_ROWS) {
-    return { error: 'Row limit must be a whole number from 1 to 100,000, or omitted to copy all rows.' };
-  }
+  if (!wholeRows(value)) return { error: 'Row limit per table must be a whole number from 1 to 1,000,000, or omitted to copy all rows.' };
   return { rowLimit: value };
+}
+
+/** The total rows one copy may move: default 100,000, selectable from 1 to 1,000,000. */
+export function parseCopyTotalLimit(value: unknown): { maxTotal: number } | { error: string } {
+  if (value === undefined || value === null) return { maxTotal: TABLE_COPY_DEFAULT_TOTAL_ROWS };
+  if (!wholeRows(value)) return { error: 'Total row limit must be a whole number from 1 to 1,000,000.' };
+  return { maxTotal: value };
 }
 
 export async function nonEmptyCopyTables(target: oracledb.Connection, names: string[]) {
@@ -127,8 +139,9 @@ export async function deleteCopyRows(target: oracledb.Connection, names: string[
  * rows whose parent rows were not sampled, so those unresolvable rows are skipped and reported
  * instead of rolling back the whole copy. Without a limit, any unresolved row is fatal.
  */
-export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], mode: 'append' | 'replace' = 'append', options: { rowLimit?: number | null } = {}) {
+export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], mode: 'append' | 'replace' = 'append', options: { rowLimit?: number | null; maxTotal?: number } = {}) {
   const rowLimit = options.rowLimit ?? null;
+  const maxTotal = options.maxTotal ?? TABLE_COPY_DEFAULT_TOTAL_ROWS;
   const results: { name: string; rows: number; skipped?: number }[] = [];
   const skipped: Record<string, number> = Object.create(null);
   let total = 0;
@@ -242,7 +255,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
             throw new Error(`${name}: source identity values cannot be null; generating replacement IDs would change relationships.`);
           }
           total += rows.length;
-          if (total > 100000) throw new Error('Copy exceeds the 100,000-row limit. Use a bulk migration tool for larger copies.');
+          if (total > maxTotal) throw new Error(`Copy exceeds the ${maxTotal.toLocaleString('en-US')}-row limit. Raise the total row limit (up to 1,000,000) or use a bulk migration tool for larger copies.`);
           if (rows.some(row => row.some(value => typeof value === 'number' && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))))) {
             throw new Error('A numeric value exceeds JavaScript’s safe range. Use a database-native migration to preserve its precision.');
           }

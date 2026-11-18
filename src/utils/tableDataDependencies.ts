@@ -10,7 +10,10 @@ export type TableDependencyIndex = Map<string, TableDependency[]>;
 
 /** Shared by the client and server so both enforce the same copy limits. */
 export const TABLE_COPY_MAX_TABLES = 1000;
-export const TABLE_COPY_MAX_ROWS = 100000;
+/** Hard ceiling for the total rows in one copy; the user picks a total limit up to this. */
+export const TABLE_COPY_MAX_ROWS = 1000000;
+/** Total row limit used when none is chosen. */
+export const TABLE_COPY_DEFAULT_TOTAL_ROWS = 100000;
 
 /** Rows a table contributes to a copy when an optional per-table row limit applies. */
 export const limitedCopyCount = (count: number, rowLimit?: number | null) =>

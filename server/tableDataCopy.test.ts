@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import oracledb from 'oracledb';
-import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, parseCopyRowLimit, type CopyColumn } from './tableDataCopy.ts';
+import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
 
 const col = (name = 'ID', type = 'NUMBER'): CopyColumn => ({ COLUMN_NAME: name, DATA_TYPE: type, VIRTUAL_COLUMN: 'NO', IDENTITY_COLUMN: 'NO', IDENTITY_OPTIONS: 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N, SCALE_FLAG: N, EXTEND_FLAG: N, SESSION_FLAG: N, KEEP_VALUE: N' });
 test('matches columns by name, safely quotes identifiers, and rejects unsupported targets', () => {
@@ -160,7 +160,23 @@ test('row limits apply to count validation and reject invalid values', () => {
   assert.throws(() => validateCopyCounts(Object.fromEntries(Array.from({ length: 3 }, (_, i) => [`T${i}`, 50_000])), 40_000), /lower the row limit/);
   assert.deepEqual(parseCopyRowLimit(undefined), { rowLimit: null });
   assert.deepEqual(parseCopyRowLimit(500), { rowLimit: 500 });
-  for (const bad of [0, -1, 1.5, '10', 100001]) assert.ok('error' in parseCopyRowLimit(bad));
+  assert.deepEqual(parseCopyRowLimit(1_000_000), { rowLimit: 1_000_000 });
+  for (const bad of [0, -1, 1.5, '10', 1_000_001]) assert.ok('error' in parseCopyRowLimit(bad));
+});
+
+test('the total row limit defaults to 100,000 and is selectable up to 1,000,000', async () => {
+  assert.deepEqual(parseCopyTotalLimit(undefined), { maxTotal: 100_000 });
+  assert.deepEqual(parseCopyTotalLimit(1_000_000), { maxTotal: 1_000_000 });
+  for (const bad of [0, 2.5, '500', 1_000_001]) assert.ok('error' in parseCopyTotalLimit(bad));
+  assert.equal(validateCopyCounts({ A: 600_000, B: 400_000 }, null, 1_000_000), 1_000_000);
+  assert.throws(() => validateCopyCounts({ A: 600_000, B: 400_001 }, null, 1_000_000), /1,000,000-row limit/);
+  assert.throws(() => validateCopyCounts({ A: 300 }, null, 200), /200-row limit/);
+  // The copy itself enforces the chosen total, not the default.
+  const big = sessions(false, Array.from({ length: 150_000 }, () => [1]));
+  assert.equal((await copyTableRows(big.source, big.target, ['T'], 'append', { maxTotal: 1_000_000 })).totalRows, 150_000);
+  const small = sessions(false, Array.from({ length: 11 }, () => [1]));
+  await assert.rejects(copyTableRows(small.source, small.target, ['T'], 'append', { maxTotal: 10 }), /10-row limit/);
+  assert.deepEqual(small.stats().commits, 0);
 });
 
 test('non-FK batch errors are fatal and are never retried', async () => {
