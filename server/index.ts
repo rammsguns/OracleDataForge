@@ -2,7 +2,8 @@ import { readPerformanceResources, type ResourceReport } from "./performanceReso
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
 import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
-import { tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
+import { limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
+import { createCopyProgress, type CopyProgress } from '../src/utils/tableDataProgress.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
 import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
 import { appendDbaAudit, readDbaAudit } from "./dbaAudit.ts";
@@ -5979,6 +5980,12 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
 });
 
 const activeDataCopies = new Set<string>();
+/** Progress of the running (or most recent) data copy into each target connection. */
+const dataCopyProgress = new Map<string, CopyProgress>();
+app.get('/api/connections/:id/tables/copy-data/progress', requireSchemaMetadataAccess, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ progress: dataCopyProgress.get(routeId(req)) ?? null });
+});
 /** Per-round-trip timeout while copying rows; planning queries keep 30 seconds. */
 const TABLE_COPY_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, async (req, res) => {
@@ -6070,18 +6077,32 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
+    const tracker = createCopyProgress({ sourceSchema: plan.sourceSchema, targetSchema: plan.targetSchema,
+      tables: selection.names.map(name => ({ name, planned: limitedCopyCount(sourceCounts[name] ?? 0, rowLimit) })) });
+    dataCopyProgress.set(target.id, tracker.progress);
+    tracker.log(`Copy started: ${sourceTotal.toLocaleString('en-US')} rows in ${selection.names.length} table(s) from ${plan.sourceSchema} into ${plan.targetSchema}${rowLimit ? ` (at most ${rowLimit.toLocaleString('en-US')} per table)` : ''}.`);
     // Planning queries keep the short timeout; the copy itself fetches and inserts large
     // batches (and LOBs), so each round trip gets far longer before it is treated as hung.
     src.callTimeout = TABLE_COPY_CALL_TIMEOUT_MS;
     dst.callTimeout = TABLE_COPY_CALL_TIMEOUT_MS;
-    const truncated = toTruncate.length ? await truncateCopyTables(dst, toTruncate, selection.names) : [];
+    let truncated: string[] = [];
     let outcome: Awaited<ReturnType<typeof copyTableRows>>;
-    try { outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal }); }
-    catch (e) {
+    try {
+      if (toTruncate.length) {
+        tracker.truncating(toTruncate);
+        truncated = await truncateCopyTables(dst, toTruncate, selection.names);
+        tracker.truncated(truncated);
+      }
+      outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal, onProgress: tracker.event });
+    } catch (e) {
       let message = errMsg(e);
       if (/NJS-123/.test(message)) message += ` A single database call ran longer than ${TABLE_COPY_CALL_TIMEOUT_MS / 60000} minutes; check for locks on the target tables or copy the slow table with a per-table row limit.`;
-      throw new Error(truncated.length ? `${message} These tables were truncated before the copy started: ${truncated.join(', ')}.` : message);
+      if (truncated.length) message += ` These tables were truncated before the copy started: ${truncated.join(', ')}.`;
+      tracker.finish(message);
+      throw new Error(message);
     }
+    for (const warning of outcome.warnings ?? []) tracker.log(warning, 'warn');
+    tracker.finish();
     res.json({ ...outcome, ...(truncated.length ? { truncated } : {}) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {

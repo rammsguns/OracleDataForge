@@ -1036,6 +1036,9 @@ export const api = {
   /** Copies into empty target tables (or truncates them first); each table commits as soon as it is loaded. */
   copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false) =>
     request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate }),
+  /** Live progress of the running (or most recent) data copy into `targetId`; null if none since the server started. */
+  tableDataProgress: (targetId: string) =>
+    request<{ progress: import('./tableDataProgress').CopyProgress | null }>(`/api/connections/${targetId}/tables/copy-data/progress`, undefined, undefined, undefined, 'no-store'),
   tableDataPlan: (targetId: string, sourceId: string) =>
     request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; targetOccupied: string[]; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
   /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */

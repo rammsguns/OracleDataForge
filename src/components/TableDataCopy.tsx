@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, ConfirmRequiredError } from '../utils/api';
 import { indexTableDependencies, limitedCopyCount, tableDataSelection, TABLE_COPY_DEFAULT_TOTAL_ROWS, TABLE_COPY_MAX_ROWS, TABLE_COPY_MAX_TABLES } from '../utils/tableDataDependencies';
+import type { CopyProgress } from '../utils/tableDataProgress';
 import { useStudio } from '../state/store';
 import { Btn, Spinner } from './ui';
 
@@ -11,6 +12,19 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<Awaited<ReturnType<typeof api.copyTableData>> | null>(null);
+  const [progress, setProgress] = useState<CopyProgress | null>(null);
+  const [copying, setCopying] = useState(false);
+  const refreshProgress = async () => {
+    try { setProgress((await api.tableDataProgress(targetId)).progress); } catch { /* keep the last known progress */ }
+  };
+  // Show a copy that is already running (for example after reloading the page).
+  useEffect(() => { setProgress(null); if (targetId) void refreshProgress(); }, [targetId]);
+  const polling = copying || progress?.state === 'running';
+  useEffect(() => {
+    if (!polling || !targetId) return;
+    const timer = setInterval(() => { void refreshProgress(); }, 1000);
+    return () => clearInterval(timer);
+  }, [polling, targetId]);
   const [limitRows, setLimitRows] = useState(false);
   const [truncate, setTruncate] = useState(false);
   const [rowLimitText, setRowLimitText] = useState('1000');
@@ -31,6 +45,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   };
   const copy = async (confirmed = false) => {
     setBusy(true); setError(''); setResult(null);
+    if (confirmed) setCopying(true);
     try {
       const outcome = await api.copyTableData(targetId, sourceId, names, confirmed, rowLimit, maxTotal, truncate);
       setResult(outcome); setRoots([]);
@@ -48,7 +63,10 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
           try { setPlan(await api.tableDataPlan(targetId, sourceId)); } catch { /* keep the error visible */ }
         }
       }
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+      if (confirmed) { setCopying(false); void refreshProgress(); }
+    }
   };
   const blocked = plan?.targetReadOnly || plan?.targetSystemSchema || plan?.sameSchema;
   const occupiedSet = useMemo(() => new Set(plan?.targetOccupied ?? []), [plan?.targetOccupied]);
@@ -84,6 +102,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     <Btn variant="outline" disabled={busy || !sourceId || !targetId || sourceId === targetId} onClick={() => void read()}>Read tables</Btn>
     {busy && <div role="status"><Spinner /> Working… Keep this tab open until the copy finishes.</div>}
     {error && <p role="alert" className="text-err">{error}</p>}
+    {progress && <CopyProgressPanel progress={progress} />}
     {plan && <>
       <p>{plan.sourceSchema} → {plan.targetSchema}</p>
       <p className={sourceTotal > maxTotal ? 'text-err' : undefined}>Rows to copy: {sourceTotal.toLocaleString()} / {capLabel}. Counts are checked again before copying.</p>
@@ -152,5 +171,61 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
       {!!names.length && <p className="text-mute">Insert order (parents before children): {names.join(' → ')}</p>}
     </>}
     {result && <div role="status" className="border border-ok/40 rounded p-3"><p className="text-ok">Committed {result.totalRows.toLocaleString()} rows.</p>{!!result.truncated?.length && <p className="text-warn">Truncated before copying: {result.truncated.join(', ')}.</p>}{result.warnings?.map((warning, i) => <p key={i} className="text-warn whitespace-pre-wrap">{warning}</p>)}{result.tables.map(t => <p key={t.name}>{t.name}: {t.rows.toLocaleString()} rows{t.skipped ? <span className="text-warn"> ({t.skipped.toLocaleString()} skipped — parent rows missing)</span> : null}</p>)}</div>}
+  </div>;
+}
+
+const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const duration = (ms: number) => {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+  return h ? `${h}h ${m}m ${sec}s` : m ? `${m}m ${sec}s` : `${sec}s`;
+};
+
+function CopyProgressPanel({ progress: p }: { progress: CopyProgress }) {
+  const now = Date.now();
+  const running = p.state === 'running';
+  const done = p.tables.filter(t => t.status === 'committed');
+  const current = p.tables.find(t => t.name === p.current && t.status === 'copying');
+  const remaining = p.tables.filter(t => t.status === 'waiting' || t.status === 'truncating' || t.status === 'truncated');
+  const rolledBack = p.tables.filter(t => t.status === 'rolled back');
+  const remainingRows = remaining.reduce((n, t) => n + t.planned, 0) + (current ? Math.max(0, current.planned - current.copied) : 0);
+  const pct = p.plannedRows ? Math.min(100, (p.copiedRows / p.plannedRows) * 100) : running ? 0 : 100;
+  const idle = now - p.updatedAt;
+  const elapsed = (p.finishedAt ?? now) - p.startedAt;
+  return <div role="status" aria-live="polite" className={`border rounded p-3 space-y-2 ${p.state === 'failed' ? 'border-err/50' : p.state === 'succeeded' ? 'border-ok/40' : 'border-bdr'}`}>
+    <div className="flex items-center gap-3 flex-wrap">
+      <span className={`font-semibold ${p.state === 'failed' ? 'text-err' : p.state === 'succeeded' ? 'text-ok' : ''}`}>
+        {running ? <><Spinner /> Copying {p.sourceSchema} → {p.targetSchema}</> : p.state === 'succeeded' ? `Last copy finished (${p.sourceSchema} → ${p.targetSchema})` : `Last copy failed (${p.sourceSchema} → ${p.targetSchema})`}
+      </span>
+      <span className="text-mute">Started {clock(p.startedAt)} · {running ? 'elapsed' : 'took'} {duration(elapsed)}</span>
+      {running && <span className={idle > 60000 ? 'text-warn' : 'text-mute'}>Last activity {duration(idle)} ago</span>}
+    </div>
+    <div className="h-2 rounded bg-bdr overflow-hidden" aria-hidden="true">
+      <div className={`h-2 ${p.state === 'failed' ? 'bg-err' : 'bg-ok'} transition-[width] duration-500`} style={{ width: `${pct}%` }} />
+    </div>
+    <p>Rows: <span className="font-mono">{p.copiedRows.toLocaleString()} / {p.plannedRows.toLocaleString()}</span> ({pct.toFixed(1)}%){running ? <> · <span className="font-mono">{remainingRows.toLocaleString()}</span> remaining</> : null}</p>
+    <p>Tables: <span className="text-ok">{done.length} committed</span>{current ? ' · 1 copying' : ''} · {remaining.length} remaining{rolledBack.length ? <span className="text-err"> · {rolledBack.length} rolled back</span> : null} · of {p.tables.length}</p>
+    {current && <p>Now copying <span className="font-mono">{current.name}</span>: {current.copied.toLocaleString()} / {current.planned.toLocaleString()} rows{current.startedAt ? ` (for ${duration(now - current.startedAt)})` : ''}</p>}
+    {running && idle > 60000 && <p className="text-warn">No new rows for {duration(idle)}. A large batch or LOB may still be transferring, or the table may be locked; each database call times out after 10 minutes.</p>}
+    {p.error && <p className="text-err">{p.error}</p>}
+    <details>
+      <summary className="cursor-pointer">Copied tables ({done.length})</summary>
+      <div className="max-h-48 overflow-auto font-mono text-[11px]">
+        {done.map(t => <p key={t.name}>{t.name}: {t.committed.toLocaleString()} rows{t.startedAt && t.finishedAt ? ` · ${duration(t.finishedAt - t.startedAt)}` : ''}{t.committed < t.planned ? <span className="text-warn"> ({(t.planned - t.committed).toLocaleString()} not copied)</span> : null}</p>)}
+      </div>
+    </details>
+    <details open={running && remaining.length <= 25}>
+      <summary className="cursor-pointer">Remaining tables ({remaining.length})</summary>
+      <div className="max-h-48 overflow-auto font-mono text-[11px]">
+        {remaining.map(t => <p key={t.name}>{t.name}: {t.planned.toLocaleString()} rows{t.status !== 'waiting' ? <span className="text-warn"> ({t.status})</span> : null}</p>)}
+        {rolledBack.map(t => <p key={t.name} className="text-err">{t.name}: rolled back</p>)}
+      </div>
+    </details>
+    <details open>
+      <summary className="cursor-pointer">Log ({p.log.length})</summary>
+      <div className="max-h-60 overflow-auto font-mono text-[11px] space-y-0.5">
+        {[...p.log].reverse().map((entry, i) => <p key={p.log.length - i} className={entry.level === 'error' ? 'text-err' : entry.level === 'warn' ? 'text-warn' : 'text-soft'}><span className="text-mute">{clock(entry.at)}</span> {entry.message}</p>)}
+      </div>
+    </details>
   </div>;
 }

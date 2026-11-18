@@ -572,3 +572,19 @@ test('unavailable or invalid counts fail closed', async () => {
     await assert.rejects(countCopyRows(source, ['T']), /Cannot determine source row count/);
   }
 });
+
+test('reports progress: table start, inserted rows, and each commit', async () => {
+  const s = sessions();
+  const events: unknown[] = [];
+  await copyTableRows(s.source, s.target, ['PARENT', 'CHILD'], { onProgress: e => events.push(e) });
+  assert.deepEqual(events, [
+    { kind: 'table', name: 'PARENT' }, { kind: 'rows', name: 'PARENT', rows: 2 }, { kind: 'committed', name: 'PARENT', rows: 2 },
+    { kind: 'table', name: 'CHILD' }, { kind: 'rows', name: 'CHILD', rows: 2 }, { kind: 'committed', name: 'CHILD', rows: 2 },
+  ]);
+});
+
+test('a failing progress listener never breaks the copy', async () => {
+  const s = sessions();
+  const outcome = await copyTableRows(s.source, s.target, ['PARENT'], { onProgress: () => { throw new Error('listener'); } });
+  assert.equal(outcome.totalRows, 2);
+});

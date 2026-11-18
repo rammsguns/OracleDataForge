@@ -1,4 +1,5 @@
 import oracledb from 'oracledb';
+import type { CopyProgressEvent } from '../src/utils/tableDataProgress.ts';
 import { limitedCopyCount, TABLE_COPY_DEFAULT_TOTAL_ROWS, TABLE_COPY_MAX_ROWS, type TableDependency } from '../src/utils/tableDataDependencies.ts';
 
 export async function readTableDependencies(conn: oracledb.Connection, schema: string): Promise<TableDependency[]> {
@@ -201,15 +202,17 @@ export async function truncateCopyTables(target: oracledb.Connection, tables: st
  * - CLOB/NCLOB/JSON values up to INLINE_LOB_CHARS are read as text; larger values are streamed
  *   into a temporary LOB on the target, so their size is not limited by memory.
  */
-export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], options: { rowLimit?: number | null; maxTotal?: number } = {}) {
+export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], options: { rowLimit?: number | null; maxTotal?: number; onProgress?: (event: CopyProgressEvent) => void } = {}) {
   const rowLimit = options.rowLimit ?? null;
+  // Progress reporting must never break the copy.
+  const emit = (event: CopyProgressEvent) => { try { options.onProgress?.(event); } catch { /* ignore */ } };
   const maxTotal = options.maxTotal ?? TABLE_COPY_DEFAULT_TOTAL_ROWS;
   let total = 0;
   type Pending = { name: string; sql: string; rows: unknown[][]; error: string; bytes: number; types?: oracledb.DbType[] };
   let pending: Pending[] = [];
   const committed: Record<string, number> = Object.create(null);
   let uncommitted: Record<string, number> = Object.create(null);
-  const note = (name: string, rows: number) => { if (rows) uncommitted[name] = (uncommitted[name] ?? 0) + rows; };
+  const note = (name: string, rows: number) => { if (rows) { uncommitted[name] = (uncommitted[name] ?? 0) + rows; emit({ kind: 'rows', name, rows }); } };
   const checkPendingBytes = () => {
     if (pending.reduce((n, b) => n + b.bytes, 0) > 64 * 1024 * 1024) throw new Error('Pending parent-dependent rows exceed the 64 MB retry limit. Use a bulk migration tool.');
   };
@@ -276,6 +279,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
   };
   /** Retry parent-blocked rows until no more of them can be inserted. */
   const retryPending = async () => {
+    if (pending.length) emit({ kind: 'retry', rows: pending.reduce((n, b) => n + b.rows.length, 0) });
     for (let pass = 0; pending.length; pass++) {
       if (pass >= 100) throw new Error('Parent dependency retry limit reached.');
       const before = pending.reduce((n, b) => n + b.rows.length, 0);
@@ -288,9 +292,10 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       if (pending.reduce((n, b) => n + b.rows.length, 0) === before) return;
     }
   };
-  const commitTable = async () => {
+  const commitTable = async (table: string) => {
     await target.commit();
     for (const [name, rows] of Object.entries(uncommitted)) committed[name] = (committed[name] ?? 0) + rows;
+    for (const name of new Set([table, ...Object.keys(uncommitted)])) emit({ kind: 'committed', name, rows: committed[name] ?? 0 });
     uncommitted = Object.create(null);
   };
   const committedSummary = () => Object.entries(committed).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ');
@@ -390,6 +395,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     }
     for (const { name, columns, timestampColumns, zonedColumns, jsonColumns, hasLargeText, types, numberIndexes } of plans) {
       current = name;
+      emit({ kind: 'table', name });
       const cols = columns.map(quoteCopyName).join(', ');
       const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : zonedColumns.has(c) ? `TO_CHAR(${zonedColumns.get(c) ? `CAST(${quoteCopyName(c)} AS TIMESTAMP WITH TIME ZONE)` : quoteCopyName(c)}, '${timestampTzFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
       const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : zonedColumns.has(c) ? `TO_TIMESTAMP_TZ(:${i + 1}, '${timestampTzFormat}')` : `:${i + 1}`).join(', ');
@@ -421,6 +427,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
           }
           const failed = await insert({ name, sql: `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values})`, rows, error: '', bytes: 0, types });
           if (failed) {
+            emit({ kind: 'deferred', name, rows: failed.rows.length });
             pending.push(failed);
             checkPendingBytes();
           }
@@ -429,7 +436,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       // Earlier parent-blocked rows may now have their parents (and this table's own
       // self-references resolve here), then the table is committed on its own.
       await retryPending();
-      await commitTable();
+      await commitTable(name);
     }
     current = '';
   } catch (e) {
@@ -450,6 +457,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
   }
   // Rows are committed. Cleanup failures must not be reported as a failed/retryable copy.
   const warnings: string[] = [];
+  if (identities.some(id => committed[id.name]) || changed.length) emit({ kind: 'finishing' });
   warnings.push(...(await synchronize()).map(failure => `Rows are committed. Before generating new IDs, run: ${failure}`));
   warnings.push(...(await restore()).map(failure => `Rows are committed. Restore the identity mode: ${failure}`));
   const skipped: Record<string, number> = Object.create(null);
