@@ -398,7 +398,8 @@ test('JSON and large Unicode CLOB/NCLOB text are bound without parsing or trunca
     if (sql.includes('user_tab_cols')) return { rows: columns };
     assert.match(sql, /JSON_SERIALIZE\("DOC" RETURNING CLOB EXTENDED ERROR ON ERROR\)/);
     const handler = options.fetchTypeHandler!;
-    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0], [])?.type, oracledb.STRING);
+    // LOBs arrive as locators: small ones are read as text, large ones are streamed.
+    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0], []), undefined);
     assert.equal(options.fetchArraySize, 1);
     let i = 0;
     return { resultSet: { getRows: async (size: number) => { assert.equal(size, 1); return i < documents.length ? [[documents[i++], text, null]] : []; }, close: async () => {} } };
@@ -421,19 +422,54 @@ test('JSON and large Unicode CLOB/NCLOB text are bound without parsing or trunca
 });
 
 
-test('oversized CLOB rows roll back and close their source cursor before any insert', async () => {
-  const columns = [col('BODY', 'CLOB')];
-  let closed = false, rolledBack = false;
-  const source = { execute: async (sql: string) => sql.includes('user_tab_cols') ? { rows: columns } : {
-    resultSet: { getRows: async () => [['x'.repeat(16 * 1024 * 1024 + 1)]], close: async () => { closed = true; } },
+import { Duplex } from 'node:stream';
+const LobBase = (oracledb as unknown as { Lob: typeof Duplex }).Lob;
+class FakeLob extends LobBase {
+  text: string; written: string[] = []; destroyed = false; kind: oracledb.DbType; reads = 0;
+  constructor(text = '', kind: oracledb.DbType = oracledb.CLOB) { super({ decodeStrings: false }); this.text = text; this.kind = kind; }
+  get length() { return this.text.length; }
+  get type() { return this.kind; }
+  async getData(offset?: number, amount?: number) { this.reads++; return offset ? this.text.slice(offset - 1, offset - 1 + amount!) : this.text; }
+  override _write(data: unknown, _encoding: unknown, cb: (e?: Error | null) => void) { assert.equal(typeof data, 'string'); this.written.push(data as string); cb(); }
+  override _destroy(_e: unknown, cb: (e?: Error | null) => void) { this.destroyed = true; cb(); }
+}
+
+test('small LOBs are read as text, large LOBs stream into temporary target LOBs, including retries', async () => {
+  const columns = [col('ID'), col('BODY', 'CLOB'), col('NATIONAL', 'NCLOB')];
+  const big = '日本語🙂'.repeat(300000);
+  const small = new FakeLob('short'), large = new FakeLob(big, oracledb.NCLOB);
+  const temps: FakeLob[] = [];
+  let attempts = 0, committed = false;
+  const source = { execute: async (sql: string) => {
+    if (sql.includes('user_tab_cols')) return { rows: columns };
+    let sent = false;
+    return { resultSet: { getRows: async () => sent ? [] : (sent = true, [['1', small, large]]), close: async () => {} } };
   } } as unknown as oracledb.Connection;
   const target = {
-    execute: async () => ({ rows: columns }), executeMany: async () => assert.fail('must not insert oversized data'),
-    commit: async () => assert.fail('must not commit'), rollback: async () => { rolledBack = true; },
+    execute: async (sql: string, binds: { val: unknown; type?: unknown }[]) => {
+      if (sql.includes('user_tab_cols')) return { rows: columns };
+      if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
+      assert.match(sql, /^INSERT INTO "DOCS"/);
+      assert.deepEqual(binds.slice(0, 2), [{ type: oracledb.STRING, val: '1' }, { type: oracledb.CLOB, val: 'short' }]);
+      assert.equal(binds[2].val, temps[0]);
+      assert.equal(binds[2].type, undefined);
+      if (attempts++ === 0) throw Object.assign(new Error('ORA-02291: parent missing'), { errorNum: 2291 });
+      return {};
+    },
+    createLob: async (type: oracledb.DbType) => { assert.equal(type, oracledb.NCLOB); const lob = new FakeLob('', type); temps.push(lob); return lob; },
+    executeMany: async () => assert.fail('streamed rows are inserted one by one'),
+    commit: async () => { committed = true; }, rollback: async () => assert.fail('unexpected rollback'),
   } as unknown as oracledb.Connection;
-  await assert.rejects(copyTableRows(source, target, ['DOCS']), /16 MB/);
-  assert.equal(closed, true);
-  assert.equal(rolledBack, true);
+  assert.equal((await copyTableRows(source, target, ['DOCS'])).totalRows, 1);
+  assert.equal(attempts, 2);
+  assert.equal(temps.length, 1);
+  assert.equal(temps[0].written.join(''), big);
+  assert.ok(large.reads > 1, 'large LOBs are read in chunks');
+  assert.ok(temps[0].written.every(chunk => !/[\ud800-\udbff]$/.test(chunk) && !/^[\udc00-\udfff]/.test(chunk)), 'chunks never split a surrogate pair');
+  assert.equal(large.destroyed, true);
+  assert.equal(small.destroyed, true);
+  assert.equal(temps[0].destroyed, true);
+  assert.equal(committed, true);
 });
 
 

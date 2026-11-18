@@ -36,6 +36,15 @@ function oracleErrorNumber(error: { errorNum?: number; code?: string; message?: 
   return match ? Number(match[1]) : undefined;
 }
 
+/** LOBs up to this many characters are read into memory and batched; larger ones are streamed. */
+export const INLINE_LOB_CHARS = 1024 * 1024;
+const LOB_CHUNK_CHARS = 256 * 1024;
+// The Lob class is exported at runtime but only declared as an interface by @types/oracledb.
+const LobClass = (oracledb as unknown as { Lob: abstract new () => oracledb.Lob }).Lob;
+const isLob = (value: unknown): value is oracledb.Lob => value instanceof LobClass;
+/** Size of pending rows for the retry memory limit; streamed LOBs live in the database, not here. */
+const rowBytes = (rows: unknown[][]) => Buffer.byteLength(JSON.stringify(rows, (_key, value) => isLob(value) ? null : value));
+
 export function copyColumns(source: CopyColumn[], target: CopyColumn[]): string[] {
   const writable = source.filter(c => c.VIRTUAL_COLUMN !== 'YES');
   if (!writable.length) throw new Error('No columns to copy.');
@@ -189,6 +198,8 @@ export async function truncateCopyTables(target: oracledb.Connection, tables: st
  *   rows; the error says which ones so they can be emptied before a retry.
  * - Identity DDL (ALWAYS → BY DEFAULT) runs before the first insert; sequences are synchronized
  *   and ALWAYS restored after the last commit or after the rollback, never mid-transaction.
+ * - CLOB/NCLOB/JSON values up to INLINE_LOB_CHARS are read as text; larger values are streamed
+ *   into a temporary LOB on the target, so their size is not limited by memory.
  */
 export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], options: { rowLimit?: number | null; maxTotal?: number } = {}) {
   const rowLimit = options.rowLimit ?? null;
@@ -227,6 +238,23 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     return failures;
   };
   const insert = async (batch: Pending): Promise<Pending | null> => {
+    if (batch.rows.some(row => row.some(isLob))) {
+      // Streamed LOBs are bound one row at a time; executeMany cannot bind LOB objects.
+      const failed: unknown[][] = [];
+      let error = '';
+      for (const row of batch.rows) {
+        try {
+          await target.execute(batch.sql, row.map((val, i) => isLob(val) || !batch.types ? { val } : { type: batch.types[i], val }) as oracledb.BindParameters, { autoCommit: false });
+          note(batch.name, 1);
+          release([row]);
+        } catch (e) {
+          if (oracleErrorNumber(e as Error) !== 2291) throw new Error(`${batch.name}: ${(e as Error).message}`);
+          failed.push(row);
+          error = (e as Error).message;
+        }
+      }
+      return failed.length ? { ...batch, rows: failed, error, bytes: rowBytes(failed) } : null;
+    }
     const bindDefs = batch.types?.map((type, i) => ({ type,
       ...(type === oracledb.STRING || type === oracledb.DB_TYPE_NVARCHAR || type === oracledb.BUFFER ? {
         maxSize: Math.max(1, ...batch.rows.map(row => Buffer.isBuffer(row[i]) ? row[i].length : typeof row[i] === 'string' ? Buffer.byteLength(row[i]) : 0)),
@@ -244,7 +272,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     }
     note(batch.name, batch.rows.length - offsets.size);
     const rows = batch.rows.filter((_, i) => offsets.has(i));
-    return { ...batch, rows, error: errors[0].message, bytes: Buffer.byteLength(JSON.stringify(rows)) };
+    return { ...batch, rows, error: errors[0].message, bytes: rowBytes(rows) };
   };
   /** Retry parent-blocked rows until no more of them can be inserted. */
   const retryPending = async () => {
@@ -267,6 +295,35 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
   };
   const committedSummary = () => Object.entries(committed).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ');
   let current = '';
+  // Temporary target LOBs holding streamed values; freed once their row is inserted or skipped.
+  const tempLobs = new Set<oracledb.Lob>();
+  const release = (rows: unknown[][]) => {
+    for (const row of rows) for (const value of row) if (isLob(value) && tempLobs.delete(value)) value.destroy();
+  };
+  const readLob = async (lob: oracledb.Lob): Promise<string | oracledb.Lob> => {
+    if (lob.length <= INLINE_LOB_CHARS) {
+      try { return await lob.getData() as string; } finally { lob.destroy(); }
+    }
+    const copy: oracledb.Lob = await target.createLob(lob.type as oracledb.DbType);
+    tempLobs.add(copy);
+    const write = (text: string) => new Promise<void>((resolve, reject) => copy.write(text, e => e ? reject(e) : resolve()));
+    try {
+      // Offsets and lengths count UTF-16 code units; a chunk never ends mid surrogate pair.
+      let carry = '';
+      for (let offset = 1; offset <= lob.length;) {
+        const part = await lob.getData(offset, LOB_CHUNK_CHARS) as string | null;
+        if (!part) break;
+        offset += part.length;
+        let text = carry + part;
+        const last = text.charCodeAt(text.length - 1);
+        carry = last >= 0xd800 && last <= 0xdbff ? text.slice(-1) : '';
+        if (carry) text = text.slice(0, -1);
+        if (text) await write(text);
+      }
+      if (carry) await write(carry);
+    } finally { lob.destroy(); }
+    return copy;
+  };
   try {
     // Preflight every table before inserting any data.
     const plans = [];
@@ -341,7 +398,6 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         resultSet: true, outFormat: oracledb.OUT_FORMAT_ARRAY,
         fetchTypeHandler: (meta: Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0]) => {
           if (meta.dbType === oracledb.DB_TYPE_NUMBER) return { type: oracledb.STRING };
-          if (hasLargeText && (meta.dbType === oracledb.CLOB || meta.dbType === oracledb.NCLOB)) return { type: oracledb.STRING };
         },
         ...(hasLargeText ? { fetchArraySize: 1, prefetchRows: 0 } : {}),
       });
@@ -350,9 +406,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         for (;;) {
           const rows = await cursor.getRows(hasLargeText ? 1 : 200);
           if (!rows.length) break;
-          if (hasLargeText && rows.some(row => row.reduce<number>((bytes, value) => bytes + (typeof value === 'string' ? Buffer.byteLength(value) : 0), 0) > 16 * 1024 * 1024)) {
-            throw new Error(`${name}: text values exceed the 16 MB per-row copy limit. Use a bulk migration tool.`);
-          }
+          if (hasLargeText) for (const row of rows) for (let i = 0; i < row.length; i++) if (isLob(row[i])) row[i] = await readLob(row[i] as oracledb.Lob);
           if (rows.some(row => identityIndexes.some(index => row[index] == null))) {
             throw new Error(`${name}: source identity values cannot be null; generating replacement IDs would change relationships.`);
           }
@@ -390,6 +444,9 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     const failures = [...await synchronize(), ...await restore()];
     if (failures.length) throw new Error(`${message}${partial} Identity repair failed. Run: ${failures.join(' ')}`);
     throw new Error(`${message}${partial}`);
+  } finally {
+    for (const lob of tempLobs) lob.destroy();
+    tempLobs.clear();
   }
   // Rows are committed. Cleanup failures must not be reported as a failed/retryable copy.
   const warnings: string[] = [];
