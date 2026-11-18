@@ -5356,13 +5356,14 @@ app.post("/api/connections/test", requireFullAccess, async (req, res) => {
  * requires the whole endpoint identity to match what it was saved against.
  */
 const SAME_ENDPOINT_ERROR =
-  "The server, port, user or engine changed — re-enter the password for the new destination.";
+  "The server, port, user, engine or wallet changed — re-enter the password for the new destination.";
 const sameEndpoint = (a: ConnConfig, b: ConnConfig) =>
   a.engine === b.engine &&
   a.host === b.host &&
   Number(a.port) === Number(b.port) &&
   a.user === b.user &&
-  (a.database ?? "") === (b.database ?? "") &&
+  // The database / service name is deliberately not compared: it picks a service on the
+  // same server, port and user, so the stored password goes to no new destination.
   // A wallet is part of the destination's identity: swapping in a different wallet points
   // the same alias at a different Autonomous Database, which is exactly the substitution
   // the stored-password rule exists to stop.
