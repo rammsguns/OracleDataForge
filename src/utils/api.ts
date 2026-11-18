@@ -1033,12 +1033,11 @@ export const api = {
     request<ObjectCopyPlan>(
       `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
     ),
-  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, mode: 'append' | 'replace' = 'append', rowLimit: number | null = null, maxTotal?: number) =>
-    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, mode, rowLimit, maxTotal }),
-  checkTableData: (targetId: string, sourceId: string, names: string[], rowLimit: number | null = null, maxTotal?: number) =>
-    request<{ occupied: string[]; sourceCounts: Record<string, number>; sourceTotal: number }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, checkOnly: true, rowLimit, maxTotal }),
+  /** Copies into empty target tables only; each table commits as soon as it is loaded. */
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number) =>
+    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal }),
   tableDataPlan: (targetId: string, sourceId: string) =>
-    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
+    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; targetOccupied: string[]; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
   /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */
   objectCopy: (
     targetId: string,

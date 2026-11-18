@@ -5997,7 +5997,8 @@ app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, as
       try { Object.assign(sourceCounts, await countCopyRows(src, [item.name])); }
       catch (e) { countErrors[item.name] = errMsg(e); }
     }
-    res.json({ ...plan, sourceCounts, countErrors, dependencies: await readTableDependencies(conn, plan.targetSchema) });
+    const targetOccupied = await nonEmptyCopyTables(conn, plan.items.filter(i => i.existsInTarget).map(i => i.name));
+    res.json({ ...plan, sourceCounts, countErrors, targetOccupied, dependencies: await readTableDependencies(conn, plan.targetSchema) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally { await Promise.allSettled([...(conn ? [conn.close()] : []), ...(src ? [src.close()] : [])]); }
 });
@@ -6025,33 +6026,41 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
       return res.status(400).json({ error: `Select 1–${TABLE_COPY_MAX_TABLES} distinct tables that exist in both schemas. Create missing tables using Copy objects first.` });
     }
     dst = await getOraConn(target);
+    dst.callTimeout = 30000;
     const dependencies = await readTableDependencies(dst, plan.targetSchema);
-    const selection = tableDataSelection(names, plan.items.filter(i => i.existsInTarget).map(i => i.name), dependencies);
+    // Data is only ever copied into empty tables: tables are committed one by one, so a copy
+    // must never mix with, or be mistaken for, rows that were already there.
+    const inTarget = plan.items.filter(i => i.existsInTarget).map(i => i.name);
+    const occupied = new Set(await nonEmptyCopyTables(dst, inTarget));
+    const notEmpty = names.filter((n: string) => occupied.has(n));
+    if (notEmpty.length) return res.status(409).json({ error: `Copy only into empty tables. These target tables already contain rows: ${notEmpty.join(', ')}. Empty them or deselect them, then re-read tables.` });
+    // A parent that already has rows in the target is not copied; its rows serve as the parents.
+    const selection = tableDataSelection(names, inTarget.filter(n => !occupied.has(n)), dependencies);
     if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
       selection.overLimit ? `Required parent tables exceed the ${TABLE_COPY_MAX_TABLES}-table limit. Use a custom migration.` :
       `Additional parent tables are required: ${selection.added.join(', ')}. Re-read tables and review the updated selection.` });
     src = await getOraConn(source);
     src.callTimeout = 30000;
-    dst.callTimeout = 30000;
     await src.execute('SET TRANSACTION READ ONLY');
     const sourceCounts = await countCopyRows(src, selection.names);
     let sourceTotal: number;
     try { sourceTotal = validateCopyCounts(sourceCounts, rowLimit, maxTotal); }
     catch (e) { return res.status(400).json({ error: errMsg(e) }); }
-    const occupied = await nonEmptyCopyTables(dst, selection.names);
-    if (req.body.checkOnly === true) return res.json({ occupied, sourceCounts, sourceTotal });
-    const mode = req.body.mode;
-    if (mode !== 'append' && mode !== 'replace') return res.status(400).json({ error: 'Choose append or replace before copying.' });
+    const filledParents = [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && occupied.has(d.parent)).map(d => d.parent!)))];
     if (!acknowledged(req)) return confirmRequired(res, describeOperation({
-      level: mode === 'replace' ? 'destructive' : 'write', verb: 'COPY TABLE DATA', target: plan.targetSchema,
+      level: 'write', verb: 'COPY TABLE DATA', target: plan.targetSchema,
       title: `Copy data into ${plan.targetSchema}?`,
-      body: `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table; sampled child rows whose parent rows were not sampled are skipped and reported)` : ''} across ${selection.names.length} table(s), inserted parents first. ${occupied.length ? 'Existing rows found in: ' + occupied.join(', ') + '. ' : 'Selected target tables are currently empty. '}${mode === 'replace' ? 'DELETE ALL existing rows in every selected table, including automatically selected parents, then copy' : 'Append (preserve existing rows; duplicate keys may fail)'} rows from ${plan.sourceSchema} to ${selection.names.join(' → ')} on ${target.name}. Rows waiting for parent keys are retried after other rows are loaded; foreign keys remain enabled. ${rowLimit ? 'Rows whose parent keys are still missing are skipped and reported; duplicate keys roll back the entire copy.' : 'Unresolved parent keys or duplicate keys roll back the entire copy.'} All copied rows commit together in a separate session. ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after rows commit. These schema changes commit separately. Pause other target writes during copying. If interrupted, identity settings may need manual repair. Target triggers run on attempts, including retries; autonomous trigger changes cannot be rolled back. ${selection.warnings.join(' ')} Parent row coverage has not been validated. Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
-      confirmLabel: mode === 'replace' ? 'Delete existing data and copy' : 'Append data',
+      body: `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table)` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
+        `Each table is committed as soon as its rows are inserted, so undo only needs to hold one table at a time. If a table fails, it is rolled back, but tables committed before it keep their rows — empty them before retrying. ` +
+        `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${rowLimit ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
+        (filledParents.length ? `Parent tables that already contain rows are not copied; their existing rows are used: ${filledParents.join(', ')}. ` : '') +
+        `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Target triggers run on attempts, including retries. ${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
+      confirmLabel: 'Copy data',
     }));
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
-    res.json(await copyTableRows(src, dst, selection.names, mode, { rowLimit, maxTotal }));
+    res.json(await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal }));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
     try {

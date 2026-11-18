@@ -112,42 +112,31 @@ export async function nonEmptyCopyTables(target: oracledb.Connection, names: str
   return occupied;
 }
 
-export async function deleteCopyRows(target: oracledb.Connection, names: string[]) {
-  // Reject incoming references outside the selection, including cascading deletes.
-  const refs = await target.execute<{ CHILD_OWNER: string; CHILD_TABLE: string; PARENT_TABLE: string }>(
-    `SELECT fk.owner AS child_owner, fk.table_name AS child_table, pk.table_name AS parent_table
-     FROM all_constraints fk JOIN user_constraints pk ON fk.r_owner = USER AND fk.r_constraint_name = pk.constraint_name
-     WHERE fk.constraint_type = 'R' AND fk.status = 'ENABLED' AND (fk.owner <> USER OR fk.table_name NOT IN (${names.map((_, i) => ':' + (i + 1)).join(', ')}))`, names, { outFormat: oracledb.OUT_FORMAT_OBJECT });
-  const external = refs.rows?.find(r => names.includes(r.PARENT_TABLE));
-  if (external) throw new Error('Replacement blocked: ' + external.CHILD_OWNER + '.' + external.CHILD_TABLE + ' references ' + external.PARENT_TABLE + ' outside the selection.');
-  let pending = [...names].reverse();
-  while (pending.length) {
-    const next: string[] = [];
-    for (const name of pending) {
-      try { await target.execute('DELETE FROM ' + quoteCopyName(name), [], { autoCommit: false }); }
-      catch (e) { if (oracleErrorNumber(e as Error) === 2292) next.push(name); else throw e; }
-    }
-    if (next.length === pending.length) throw new Error('Cannot delete existing rows because foreign keys still reference: ' + next.join(', ') + '. No row changes committed.');
-    pending = next;
-  }
-}
-
 /**
- * Row DML is one transaction. Identity DDL runs only before DML or after commit/rollback.
- * `names` must already be in dependency order (parents first); FK-blocked rows are retried.
- * With `rowLimit`, each table contributes at most that many rows. A sample can contain child
- * rows whose parent rows were not sampled, so those unresolvable rows are skipped and reported
- * instead of rolling back the whole copy. Without a limit, any unresolved row is fatal.
+ * Copies tables in the given order, which must be dependency order (parents first), and
+ * COMMITS EACH TABLE as soon as its rows are inserted, so undo only has to hold one table.
+ * Callers must only pass tables that are empty in the target.
+ *
+ * - Rows rejected for a missing parent key (ORA-02291) are kept in memory and retried after
+ *   every table, so self-references and cycles resolve once their parents arrive. Rows whose
+ *   parents never appear (for example, outside a `rowLimit` sample) are skipped and reported.
+ * - Any other error rolls back only the table in progress. Tables already committed keep their
+ *   rows; the error says which ones so they can be emptied before a retry.
+ * - Identity DDL (ALWAYS → BY DEFAULT) runs before the first insert; sequences are synchronized
+ *   and ALWAYS restored after the last commit or after the rollback, never mid-transaction.
  */
-export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], mode: 'append' | 'replace' = 'append', options: { rowLimit?: number | null; maxTotal?: number } = {}) {
+export async function copyTableRows(source: oracledb.Connection, target: oracledb.Connection, names: string[], options: { rowLimit?: number | null; maxTotal?: number } = {}) {
   const rowLimit = options.rowLimit ?? null;
   const maxTotal = options.maxTotal ?? TABLE_COPY_DEFAULT_TOTAL_ROWS;
-  const results: { name: string; rows: number; skipped?: number }[] = [];
-  const skipped: Record<string, number> = Object.create(null);
   let total = 0;
-  type Pending = { name: string; sql: string; rows: unknown[][]; error: string; types?: oracledb.DbType[] };
+  type Pending = { name: string; sql: string; rows: unknown[][]; error: string; bytes: number; types?: oracledb.DbType[] };
   let pending: Pending[] = [];
-  let pendingBytes = 0;
+  const committed: Record<string, number> = Object.create(null);
+  let uncommitted: Record<string, number> = Object.create(null);
+  const note = (name: string, rows: number) => { if (rows) uncommitted[name] = (uncommitted[name] ?? 0) + rows; };
+  const checkPendingBytes = () => {
+    if (pending.reduce((n, b) => n + b.bytes, 0) > 64 * 1024 * 1024) throw new Error('Pending parent-dependent rows exceed the 64 MB retry limit. Use a bulk migration tool.');
+  };
   const identities: { name: string; column: string; always: boolean; options: string }[] = [];
   const changed: typeof identities = [];
   const alter = (id: typeof identities[number], clause: string) =>
@@ -156,6 +145,16 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     const failures: string[] = [];
     for (const id of changed) {
       const sql = alter(id, 'ALWAYS');
+      try { await target.execute(sql); }
+      catch (e) { failures.push(`${sql}; — ${(e as Error).message}`); }
+    }
+    return failures;
+  };
+  /** Advance identity sequences past the copied IDs, for tables that have committed rows. */
+  const synchronize = async () => {
+    const failures: string[] = [];
+    for (const id of identities.filter(id => committed[id.name])) {
+      const sql = `ALTER TABLE ${quoteCopyName(id.name)} MODIFY (${quoteCopyName(id.column)} GENERATED AS IDENTITY (START WITH LIMIT VALUE ${id.options}))`;
       try { await target.execute(sql); }
       catch (e) { failures.push(`${sql}; — ${(e as Error).message}`); }
     }
@@ -171,14 +170,37 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     const errors = result.batchErrors ?? [];
     const fatal = errors.find(e => oracleErrorNumber(e) !== 2291);
     if (fatal) throw new Error(`${batch.name}: ${fatal.message}`);
-    if (!errors.length) return null;
+    if (!errors.length) { note(batch.name, batch.rows.length); return null; }
     const offsets = new Set<number>();
     for (const e of errors) {
       if (e.offset === undefined || e.offset < 0 || e.offset >= batch.rows.length) throw new Error('Oracle returned an invalid failed-row offset.');
       offsets.add(e.offset);
     }
-    return { ...batch, rows: batch.rows.filter((_, i) => offsets.has(i)), error: errors[0].message };
+    note(batch.name, batch.rows.length - offsets.size);
+    const rows = batch.rows.filter((_, i) => offsets.has(i));
+    return { ...batch, rows, error: errors[0].message, bytes: Buffer.byteLength(JSON.stringify(rows)) };
   };
+  /** Retry parent-blocked rows until no more of them can be inserted. */
+  const retryPending = async () => {
+    for (let pass = 0; pending.length; pass++) {
+      if (pass >= 100) throw new Error('Parent dependency retry limit reached.');
+      const before = pending.reduce((n, b) => n + b.rows.length, 0);
+      const next: Pending[] = [];
+      for (const batch of pending) {
+        const failed = await insert(batch);
+        if (failed) next.push(failed);
+      }
+      pending = next;
+      if (pending.reduce((n, b) => n + b.rows.length, 0) === before) return;
+    }
+  };
+  const commitTable = async () => {
+    await target.commit();
+    for (const [name, rows] of Object.entries(uncommitted)) committed[name] = (committed[name] ?? 0) + rows;
+    uncommitted = Object.create(null);
+  };
+  const committedSummary = () => Object.entries(committed).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ');
+  let current = '';
   try {
     // Preflight every table before inserting any data.
     const plans = [];
@@ -228,8 +250,8 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       await target.execute(alter(id, 'BY DEFAULT'));
       changed.push(id);
     }
-    if (mode === 'replace') await deleteCopyRows(target, names);
     for (const { name, columns, timestampColumns, jsonColumns, hasLargeText, types } of plans) {
+      current = name;
       const cols = columns.map(quoteCopyName).join(', ');
       const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
       const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : `:${i + 1}`).join(', ');
@@ -243,7 +265,6 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         } : {}),
       });
       const cursor = query.resultSet!;
-      let count = 0;
       try {
         for (;;) {
           const rows = await cursor.getRows(hasLargeText ? 1 : 200);
@@ -259,58 +280,40 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
           if (rows.some(row => row.some(value => typeof value === 'number' && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))))) {
             throw new Error('A numeric value exceeds JavaScript’s safe range. Use a database-native migration to preserve its precision.');
           }
-          const failed = await insert({ name, sql: `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values})`, rows, error: '', types });
+          const failed = await insert({ name, sql: `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values})`, rows, error: '', bytes: 0, types });
           if (failed) {
-            pendingBytes += Buffer.byteLength(JSON.stringify(failed.rows));
-            if (pendingBytes > 64 * 1024 * 1024) throw new Error('Pending parent-dependent rows exceed the 64 MB retry limit. Use a bulk migration tool.');
             pending.push(failed);
+            checkPendingBytes();
           }
-          count += rows.length;
         }
       } finally { await cursor.close(); }
-      results.push({ name, rows: count });
+      // Earlier parent-blocked rows may now have their parents (and this table's own
+      // self-references resolve here), then the table is committed on its own.
+      await retryPending();
+      await commitTable();
     }
-    // Only failed FK rows are retried. Successful rows stay in this transaction and are
-    // never inserted twice. Later batches/tables may supply their missing parents.
-    for (let pass = 0; pending.length; pass++) {
-      if (pass >= 100) throw new Error('Parent dependency retry limit reached; no rows were committed.');
-      const before = pending.reduce((n, b) => n + b.rows.length, 0);
-      const next: Pending[] = [];
-      for (const batch of pending) {
-        const failed = await insert(batch);
-        if (failed) next.push(failed);
-      }
-      const remaining = next.reduce((n, b) => n + b.rows.length, 0);
-      if (remaining === before && rowLimit) {
-        // No further progress is possible: these rows reference parent rows outside the sample.
-        for (const batch of next) skipped[batch.name] = (skipped[batch.name] ?? 0) + batch.rows.length;
-        break;
-      }
-      if (remaining === before) throw new Error(`Cannot resolve parent data for ${[...new Set(next.map(b => b.name))].join(', ')} (${remaining} rows). Required parent keys are missing or the rows form a non-insertable cycle. ${next[0].error}`);
-      pending = next;
-    }
-    for (const result of results) {
-      const count = skipped[result.name];
-      if (count) { result.rows -= count; result.skipped = count; total -= count; }
-    }
-    await target.commit();
+    current = '';
   } catch (e) {
-    // Never run restoration DDL unless rollback succeeded: DDL would commit pending rows.
+    const message = (e as Error).message.replace(/\.?\s*$/, '.');
+    const kept = committedSummary();
+    const partial = kept
+      ? ` Tables already committed keep their rows: ${kept}.${current ? ` ${current} was rolled back.` : ''} Empty the copied tables before retrying.`
+      : ' No rows were committed.';
+    // Never run DDL unless rollback succeeded: DDL would commit the table in progress.
     try { await target.rollback(); }
-    catch (rollbackError) { throw new Error(`${(e as Error).message}. Rollback failed: ${(rollbackError as Error).message}. Identity modes may need manual restoration for ${changed.map(id => `${id.name}.${id.column}`).join(', ')}.`); }
-    const failures = await restore();
-    if (failures.length) throw new Error(`${(e as Error).message}. Rows rolled back, but identity restoration failed. Run: ${failures.join(' ')}`);
-    throw e;
+    catch (rollbackError) { throw new Error(`${message}${partial} Rollback failed: ${(rollbackError as Error).message}. Identity modes may need manual restoration for ${changed.map(id => `${id.name}.${id.column}`).join(', ')}.`); }
+    const failures = [...await synchronize(), ...await restore()];
+    if (failures.length) throw new Error(`${message}${partial} Identity repair failed. Run: ${failures.join(' ')}`);
+    throw new Error(`${message}${partial}`);
   }
   // Rows are committed. Cleanup failures must not be reported as a failed/retryable copy.
   const warnings: string[] = [];
-  for (const id of identities) {
-    const sql = `ALTER TABLE ${quoteCopyName(id.name)} MODIFY (${quoteCopyName(id.column)} GENERATED AS IDENTITY (START WITH LIMIT VALUE ${id.options}))`;
-    try { await target.execute(sql); }
-    catch (e) { warnings.push(`Rows are committed. Before generating new IDs, run: ${sql}; — ${(e as Error).message}`); }
-  }
+  warnings.push(...(await synchronize()).map(failure => `Rows are committed. Before generating new IDs, run: ${failure}`));
   warnings.push(...(await restore()).map(failure => `Rows are committed. Restore the identity mode: ${failure}`));
+  const skipped: Record<string, number> = Object.create(null);
+  for (const batch of pending) skipped[batch.name] = (skipped[batch.name] ?? 0) + batch.rows.length;
   const skippedRows = Object.values(skipped).reduce((n, c) => n + c, 0);
-  if (skippedRows) warnings.unshift(`${skippedRows.toLocaleString('en-US')} sampled rows were skipped because their parent rows were not in the sample: ${Object.entries(skipped).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ')}.`);
-  return { tables: results, totalRows: total, ...(skippedRows ? { skippedRows } : {}), ...(warnings.length ? { warnings } : {}) };
+  if (skippedRows) warnings.unshift(`${skippedRows.toLocaleString('en-US')} rows were not copied because their parent rows ${rowLimit ? 'were not in the sample' : 'do not exist in the source or target'}: ${Object.entries(skipped).map(([n, c]) => `${n} (${c.toLocaleString('en-US')})`).join(', ')}.`);
+  const tables = names.map(name => ({ name, rows: committed[name] ?? 0, ...(skipped[name] ? { skipped: skipped[name] } : {}) }));
+  return { tables, totalRows: tables.reduce((n, t) => n + t.rows, 0), ...(skippedRows ? { skippedRows } : {}), ...(warnings.length ? { warnings } : {}) };
 }

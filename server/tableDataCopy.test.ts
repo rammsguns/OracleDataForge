@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import oracledb from 'oracledb';
-import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
+import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, quoteCopyName, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
 
 const col = (name = 'ID', type = 'NUMBER'): CopyColumn => ({ COLUMN_NAME: name, DATA_TYPE: type, VIRTUAL_COLUMN: 'NO', IDENTITY_COLUMN: 'NO', IDENTITY_OPTIONS: 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N, SCALE_FLAG: N, EXTEND_FLAG: N, SESSION_FLAG: N, KEEP_VALUE: N' });
 test('matches columns by name, safely quotes identifiers, and rejects unsupported targets', () => {
@@ -53,15 +53,19 @@ test('always identities accept explicit source IDs', async () => {
   assert.equal((await copyTableRows(s.source, s.target, ['CATEGORIES'])).totalRows, 1);
   assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0, closed: 1, inserted: 1 });
 });
-test('commits once after all selected tables and closes every source cursor', async () => {
+test('commits each table on its own and closes every source cursor', async () => {
   const s = sessions();
   assert.deepEqual(await copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), { tables: [{ name: 'PARENT', rows: 2 }, { name: 'CHILD', rows: 2 }], totalRows: 4 });
-  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0, closed: 2, inserted: 4 });
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0, closed: 2, inserted: 4 });
 });
-test('a later table failure rolls back earlier inserts without committing', async () => {
+test('a later table failure rolls back only that table and reports the tables already committed', async () => {
   const s = sessions(true);
-  await assert.rejects(copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), /duplicate key/);
-  assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1, closed: 2, inserted: 4 });
+  await assert.rejects(copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), /duplicate key\. Tables already committed keep their rows: PARENT \(2\)\. CHILD was rolled back\. Empty the copied tables before retrying\./);
+  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 1, closed: 2, inserted: 4 });
+});
+test('a failure in the first table reports that nothing was committed', async () => {
+  const s = sessions(false, [[Number.MAX_SAFE_INTEGER + 1]]);
+  await assert.rejects(copyTableRows(s.source, s.target, ['T']), /safe range.*precision\. No rows were committed\./);
 });
 
 test('unsafe integers are refused before inserting and the transaction is rolled back', async () => {
@@ -123,35 +127,39 @@ test('self-referencing child-before-parent rows across batches are retried, neve
 test('a table-level cycle with insertable rows resolves after the later table supplies its parent', async () => {
   const s = foreignKeySessions({ A: [[1, 2]], B: [[2, null]] }, { A: 'B', B: 'A' });
   assert.equal((await copyTableRows(s.source, s.target, ['A', 'B'])).totalRows, 2);
-  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
+  // A's row waits for B, so it is inserted and committed with B.
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
 });
 
-test('missing parents and true row cycles roll back rather than loop or commit partially', async () => {
-  for (const rows of [[[1, 99], [2, null]], [[1, 2], [2, 1]]]) {
-    const s = foreignKeySessions({ T: rows }, { T: 'T' });
-    await assert.rejects(copyTableRows(s.source, s.target, ['T']), /Cannot resolve parent data/);
-    assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1 });
-    assert.equal(s.inserted.size, 0);
+test('missing parents and true row cycles are skipped rather than looping', async () => {
+  for (const [rows, copied, skipped] of [[[[1, 99], [2, null]], 1, 1], [[[1, 2], [2, 1]], 0, 2]] as const) {
+    const s = foreignKeySessions({ T: rows.map(r => [...r]) }, { T: 'T' });
+    const result = await copyTableRows(s.source, s.target, ['T']);
+    assert.equal(result.totalRows, copied);
+    assert.equal(result.skippedRows, skipped);
+    assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
   }
 });
 
 test('a row limit samples each table, skips children whose parents were not sampled, and commits the rest', async () => {
   const s = foreignKeySessions({ P: [[1, null], [2, null], [3, null]], C: [[10, 3], [11, 1], [12, 2]] }, { C: 'P' });
-  const result = await copyTableRows(s.source, s.target, ['P', 'C'], 'append', { rowLimit: 2 });
+  const result = await copyTableRows(s.source, s.target, ['P', 'C'], { rowLimit: 2 });
   assert.ok(s.queries.every(q => q.includes('WHERE ROWNUM <= :row_limit')));
   assert.deepEqual(result.tables, [{ name: 'P', rows: 2 }, { name: 'C', rows: 1, skipped: 1 }]);
   assert.equal(result.totalRows, 3);
   assert.equal(result.skippedRows, 1);
-  assert.match(result.warnings![0], /C \(1\)/);
-  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
+  assert.match(result.warnings![0], /not in the sample: C \(1\)/);
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
   assert.deepEqual([...s.inserted.get('C')!], [11]);
 });
 
-test('without a row limit, every row is read and unresolved parents still roll back', async () => {
-  const s = foreignKeySessions({ P: [[1, null]], C: [[10, 3]] }, { C: 'P' });
-  await assert.rejects(copyTableRows(s.source, s.target, ['P', 'C']), /Cannot resolve parent data/);
+test('without a row limit, every row is read and rows with missing parents are skipped and reported', async () => {
+  const s = foreignKeySessions({ P: [[1, null]], C: [[10, 3], [11, 1]] }, { C: 'P' });
+  const result = await copyTableRows(s.source, s.target, ['P', 'C']);
   assert.ok(s.queries.every(q => !q.includes('ROWNUM')));
-  assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1 });
+  assert.deepEqual(result.tables, [{ name: 'P', rows: 1 }, { name: 'C', rows: 1, skipped: 1 }]);
+  assert.match(result.warnings![0], /do not exist in the source or target: C \(1\)/);
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
 });
 
 test('row limits apply to count validation and reject invalid values', () => {
@@ -173,9 +181,9 @@ test('the total row limit defaults to 100,000 and is selectable up to 1,000,000'
   assert.throws(() => validateCopyCounts({ A: 300 }, null, 200), /200-row limit/);
   // The copy itself enforces the chosen total, not the default.
   const big = sessions(false, Array.from({ length: 150_000 }, () => [1]));
-  assert.equal((await copyTableRows(big.source, big.target, ['T'], 'append', { maxTotal: 1_000_000 })).totalRows, 150_000);
+  assert.equal((await copyTableRows(big.source, big.target, ['T'], { maxTotal: 1_000_000 })).totalRows, 150_000);
   const small = sessions(false, Array.from({ length: 11 }, () => [1]));
-  await assert.rejects(copyTableRows(small.source, small.target, ['T'], 'append', { maxTotal: 10 }), /10-row limit/);
+  await assert.rejects(copyTableRows(small.source, small.target, ['T'], { maxTotal: 10 }), /10-row limit/);
   assert.deepEqual(small.stats().commits, 0);
 });
 
@@ -200,12 +208,15 @@ test('identity DDL surrounds the row transaction; failures restore only after ro
     s.target.rollback = async () => { events.push('ROLLBACK'); };
     if (fail) await assert.rejects(copyTableRows(s.source, s.target, ['A', 'B']), /duplicate key/);
     else await copyTableRows(s.source, s.target, ['A', 'B']);
-    const boundary = events.indexOf(fail ? 'ROLLBACK' : 'COMMIT');
+    const boundary = fail ? events.indexOf('ROLLBACK') : events.lastIndexOf('COMMIT');
     const firstInsert = events.indexOf('INSERT');
+    // No DDL while any table's rows are uncommitted: DDL would commit them implicitly.
     assert.equal(events.slice(firstInsert, boundary).some(e => e.startsWith('ALTER')), false);
     assert.equal(events.slice(0, firstInsert).filter(e => e.includes('GENERATED BY DEFAULT')).length, 2);
     assert.equal(events.slice(boundary).filter(e => e.includes('GENERATED ALWAYS')).length, 2);
-    assert.equal(events.filter(e => e.includes('START WITH LIMIT VALUE')).length, fail ? 0 : 2);
+    // After a failure, only the table that was committed (A) has its sequence synchronized.
+    assert.equal(events.filter(e => e.includes('START WITH LIMIT VALUE')).length, fail ? 1 : 2);
+    assert.equal(events.filter(e => e === 'COMMIT').length, fail ? 1 : 2);
   }
 });
 
@@ -358,40 +369,11 @@ test('checks actual row existence using quoted names', async () => {
   assert.equal(sqls[1], 'SELECT 1 FROM "a""b" WHERE ROWNUM = 1');
 });
 
-test('replacement deletes children first and blocks outside references', async () => {
-  const deleted: string[] = [];
-  const target = { execute: async (sql: string) => { if (sql.includes('all_constraints')) return { rows: [] }; deleted.push(sql); return {}; } } as unknown as oracledb.Connection;
-  await deleteCopyRows(target, ['PARENT', 'CHILD']);
-  assert.deepEqual(deleted, ['DELETE FROM "CHILD"', 'DELETE FROM "PARENT"']);
-  const blocked = { execute: async () => ({ rows: [{ CHILD_OWNER: 'OTHER', CHILD_TABLE: 'CHILD', PARENT_TABLE: 'PARENT' }] }) } as unknown as oracledb.Connection;
-  await assert.rejects(deleteCopyRows(blocked, ['PARENT']), /outside the selection/);
-});
-
-test('replacement rolls back deletions when insertion fails', async () => {
-  const mock = sessions(false, [[1]]);
-  const events: string[] = [];
-  mock.target.execute = (async (sql: string) => { events.push(sql); return { rows: sql.includes('user_tab_cols') ? [col()] : [] }; }) as typeof mock.target.execute;
-  mock.target.executeMany = (async () => { throw new Error('duplicate key'); }) as typeof mock.target.executeMany;
-  await assert.rejects(copyTableRows(mock.source, mock.target, ['T'], 'replace'), /duplicate key/);
-  assert.ok(events.includes('DELETE FROM "T"'));
-  assert.equal(mock.stats().rollbacks, 1);
-  assert.equal(mock.stats().commits, 0);
-});
-
-
-test('replacement retries message-only and code-only manager FK errors from the thin driver', async () => {
+test('message-only and code-only manager FK errors from the thin driver are retried', async () => {
   for (const representation of ['message', 'code']) {
     const s = foreignKeySessions({ EMPLOYEES: [[3, 2], [2, 1], [1, null]] }, { EMPLOYEES: 'EMPLOYEES' });
-    const execute = s.target.execute.bind(s.target);
     const executeMany = s.target.executeMany.bind(s.target);
-    let deleted = false;
-    s.target.execute = (async (sql: string) => {
-      if (sql.includes('all_constraints')) return { rows: [] };
-      if (sql.startsWith('DELETE')) { deleted = true; return {}; }
-      return execute(sql);
-    }) as typeof s.target.execute;
     s.target.executeMany = (async (...args: unknown[]) => {
-      assert.ok(deleted);
       const result = await (executeMany as Function)(...args);
       result.batchErrors = result.batchErrors.map((e: { offset: number }) => ({
         offset: e.offset,
@@ -399,7 +381,7 @@ test('replacement retries message-only and code-only manager FK errors from the 
       }));
       return result;
     }) as typeof s.target.executeMany;
-    assert.equal((await copyTableRows(s.source, s.target, ['EMPLOYEES'], 'replace')).totalRows, 3);
+    assert.equal((await copyTableRows(s.source, s.target, ['EMPLOYEES'])).totalRows, 3);
     assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
     assert.equal(s.attempts.filter(a => a === 'EMPLOYEES:1').length, 1);
     assert.equal(s.inserted.get('EMPLOYEES')!.size, 3);
