@@ -6071,7 +6071,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
         `Each table is committed as soon as its rows are inserted, so undo only needs to hold one table at a time. If a table fails, it is rolled back, but tables committed before it keep their rows — empty them before retrying. ` +
         `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${rowLimit ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
         (filledParents.length ? `Parent tables that already contain rows are not copied; their existing rows are used: ${filledParents.join(', ')}. ` : '') +
-        `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Target triggers run on attempts, including retries. ${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
+        `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Each source table is read as of the moment its copy starts; pause source writes too if the tables must match one point in time. Target triggers run on attempts, including retries. ${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
       confirmLabel: toTruncate.length ? `Truncate ${toTruncate.length} table(s) and copy` : 'Copy data',
     }));
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
@@ -6081,6 +6081,11 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
       tables: selection.names.map(name => ({ name, planned: limitedCopyCount(sourceCounts[name] ?? 0, rowLimit) })) });
     dataCopyProgress.set(target.id, tracker.progress);
     tracker.log(`Copy started: ${sourceTotal.toLocaleString('en-US')} rows in ${selection.names.length} table(s) from ${plan.sourceSchema} into ${plan.targetSchema}${rowLimit ? ` (at most ${rowLimit.toLocaleString('en-US')} per table)` : ''}.`);
+    // The read-only transaction only gives the preflight counts one snapshot. End it before
+    // copying: holding one snapshot for the whole copy makes every later table read as of the
+    // copy's start, which fails with ORA-01555 once the source has overwritten that undo.
+    // Each table is now read consistently as of its own query start.
+    await src.rollback();
     // Planning queries keep the short timeout; the copy itself fetches and inserts large
     // batches (and LOBs), so each round trip gets far longer before it is treated as hung.
     src.callTimeout = TABLE_COPY_CALL_TIMEOUT_MS;
@@ -6096,6 +6101,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
       outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal, onProgress: tracker.event });
     } catch (e) {
       let message = errMsg(e);
+      if (/ORA-01555/.test(message)) message += ` The source could not rebuild a consistent read of this table: its undo was overwritten while the table was being read (the source has too little undo retention for this read). Retry with the source quieter, copy this table with a per-table row limit, or ask the DBA to raise UNDO_RETENTION on the source.`;
       if (/NJS-123/.test(message)) message += ` A single database call ran longer than ${TABLE_COPY_CALL_TIMEOUT_MS / 60000} minutes; check for locks on the target tables or copy the slow table with a per-table row limit.`;
       if (truncated.length) message += ` These tables were truncated before the copy started: ${truncated.join(', ')}.`;
       tracker.finish(message);
