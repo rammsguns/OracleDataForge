@@ -24,6 +24,8 @@ export function ConnectionWizard() {
   const [adminPassword, setAdminPassword] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  // What to run once an Administrator has unlocked the saved password for a changed destination.
+  const [pendingAction, setPendingAction] = useState<"test" | "save" | null>(null);
   // SQL Developer's "Role": the privilege sessions open with. Not a credential — it changes
   // what the same username is allowed to do once it is in.
   const [role, setRole] = useState<ConnectionRole>(editing?.role ?? "default");
@@ -65,6 +67,10 @@ export function ConnectionWizard() {
       setAdminPassword("");
       setAdminUsername("");
       setAuthPromptOpen(false);
+      const next = pendingAction;
+      setPendingAction(null);
+      if (next === "test") void test(result.password);
+      else if (next === "save") void save(result.password);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Administrator authentication failed.");
     } finally {
@@ -130,7 +136,25 @@ export function ConnectionWizard() {
     ? Boolean(name.trim() && walletId && database && user.trim())
     : Boolean(name.trim() && host.trim() && database.trim());
 
-  const liveCfg = () => ({
+  // The backend only replays the saved password to the destination it was saved for. When the
+  // server, port, user or wallet changed and no password was typed, an Administrator has to
+  // unlock the saved one first (the same check as "show password").
+  const destinationChanged = Boolean(
+    editing?.live &&
+      (authMode !== (editing.authMode === "wallet" ? "wallet" : "basic") ||
+        user.trim() !== editing.user ||
+        (wallet
+          ? walletId !== (editing.walletId ?? "") || (service && (service.host !== editing.host || service.port !== editing.port))
+          : host.trim() !== editing.host || Number(port) !== Number(editing.port)))
+  );
+  const needsAdminUnlock = (typed: string | undefined) => Boolean(editing?.live && destinationChanged && !(typed ?? password));
+  const askAdminUnlock = (action: "test" | "save") => {
+    setPendingAction(action);
+    setAuthError("");
+    setAuthPromptOpen(true);
+  };
+
+  const liveCfg = (pw: string = password) => ({
     name: name.trim(),
     engine,
     // In wallet mode the endpoint comes from the wallet, not from the form; the resolved
@@ -138,7 +162,7 @@ export function ConnectionWizard() {
     host: wallet ? service?.host ?? "" : host.trim(),
     port: wallet ? service?.port ?? 0 : port,
     user: user.trim(),
-    password,
+    password: pw,
     database: database.trim(),
     readOnly,
     role,
@@ -146,12 +170,13 @@ export function ConnectionWizard() {
     ...(wallet ? { walletId, walletPassword } : {}),
   });
 
-  const test = async () => {
+  const test = async (pw?: string) => {
+    if (needsAdminUnlock(pw)) return askAdminUnlock("test");
     setTesting("testing");
     setTestMsg("");
     try {
       // editing an existing live connection with a blank password → backend reuses the stored one
-      const r = editing?.live ? await api.testExisting(editing.id, liveCfg()) : await api.test(liveCfg());
+      const r = editing?.live ? await api.testExisting(editing.id, liveCfg(pw)) : await api.test(liveCfg(pw));
       if (r.ok) {
         setTesting("ok");
         setTestMsg(`Connected in ${r.ms} ms — ${r.version}`);
@@ -165,7 +190,8 @@ export function ConnectionWizard() {
     }
   };
 
-  const save = async () => {
+  const save = async (pw?: string) => {
+    if (needsAdminUnlock(pw)) return askAdminUnlock("save");
     if (editing) {
       const patched = {
         ...editing,
@@ -181,7 +207,7 @@ export function ConnectionWizard() {
       };
       setSaving(true);
       try {
-        await api.update(editing.id, liveCfg());
+        await api.update(editing.id, liveCfg(pw));
         s.updateConnection(patched);
         close();
       } catch (e) {
@@ -358,7 +384,7 @@ export function ConnectionWizard() {
             {/* The saved password is only reused for the endpoint it was saved against — the
                 backend refuses to replay it at a different server/port/user (see S3 in the
                 security pass), so the hint has to say when blank still works. */}
-            <Field label="Password" hint={editing?.live ? "Leave blank to keep the saved password — required again if you change the server, port or user" : undefined}>
+            <Field label="Password" hint={editing?.live ? "Leave blank to keep the saved password — an Administrator unlocks it if you change the server, port, user or wallet" : undefined}>
               <div className="relative">
                 <input className={`${inputCls} pr-9`} type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={editing?.live ? "(unchanged)" : "••••••••"} autoComplete="new-password" />
                 <button
@@ -451,7 +477,13 @@ export function ConnectionWizard() {
       {step === 2 && (
         <div className="space-y-4">
           <div className="border border-bdr rounded-xl p-4 text-[12.5px] space-y-1.5">
-            <div><span className="text-mute w-24 inline-block">Engine</span> <b>Oracle</b> <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span></div>
+            <div><span className="text-mute w-24 inline-block">Engine</span> <b>Oracle</b> {testing === "ok" ? (
+              <span className="text-[10px] font-bold bg-ok/15 text-ok rounded px-1 py-0.5 ml-1">LIVE</span>
+            ) : testing === "fail" ? (
+              <span className="text-[10px] font-bold bg-red-500/15 text-red-400 rounded px-1 py-0.5 ml-1">FAILED</span>
+            ) : (
+              <span className="text-[10px] font-bold bg-white/10 text-mute rounded px-1 py-0.5 ml-1">NOT TESTED</span>
+            )}</div>
             <div><span className="text-mute w-24 inline-block">Name</span> <b>{name}</b></div>
             <div>
               <span className="text-mute w-24 inline-block">Method</span>{" "}
@@ -488,7 +520,7 @@ export function ConnectionWizard() {
             </div>
           </div>
           <div className="flex items-start gap-3 flex-wrap">
-            <Btn variant="outline" onClick={test} disabled={testing === "testing"}>
+            <Btn variant="outline" onClick={() => void test()} disabled={testing === "testing"}>
               {testing === "testing" ? <Loader2 size={13} className="df-spin" /> : <PlugZap size={13} />}
               Test connection
             </Btn>
@@ -515,15 +547,15 @@ export function ConnectionWizard() {
             Next <ChevronRight size={13} />
           </Btn>
         ) : (
-          <Btn variant="primary" onClick={save} disabled={!name.trim() || saving}>
+          <Btn variant="primary" onClick={() => void save()} disabled={!name.trim() || saving}>
             {saving ? <Loader2 size={13} className="df-spin" /> : <CheckCircle2 size={13} />} {editing ? "Save changes" : "Save connection"}
           </Btn>
         )}
       </div>
     </Modal>
-    {authPromptOpen && <Modal title="Administrator authentication" onClose={() => { if (!authBusy) { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); } }} width={420}>
+    {authPromptOpen && <Modal title="Administrator authentication" onClose={() => { if (!authBusy) { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); setPendingAction(null); } }} width={420}>
       <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); void revealSavedPassword(); }}>
-        <p className="text-[12px] text-mute">Enter an active workspace Administrator account and password to show this saved Oracle password.</p>
+        <p className="text-[12px] text-mute">Enter an active workspace Administrator account and password {pendingAction ? "to use this saved Oracle password for the changed server, port, user or wallet." : "to show this saved Oracle password."}</p>
         <Field label="Administrator email or username">
           <input className={inputCls} autoComplete="username" value={adminUsername} onChange={(e) => setAdminUsername(e.target.value)} autoFocus />
         </Field>
@@ -532,8 +564,8 @@ export function ConnectionWizard() {
         </Field>
         {authError && <p className="text-[11.5px] text-err" role="alert">{authError}</p>}
         <div className="flex justify-end gap-2">
-          <Btn variant="outline" disabled={authBusy} onClick={() => { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); }}>Cancel</Btn>
-          <Btn variant="primary" disabled={authBusy || !adminUsername || !adminPassword} onClick={() => void revealSavedPassword()}>{authBusy ? "Checking…" : "Authenticate and show"}</Btn>
+          <Btn variant="outline" disabled={authBusy} onClick={() => { setAuthPromptOpen(false); setAdminUsername(""); setAdminPassword(""); setAuthError(""); setPendingAction(null); }}>Cancel</Btn>
+          <Btn variant="primary" disabled={authBusy || !adminUsername || !adminPassword} onClick={() => void revealSavedPassword()}>{authBusy ? "Checking…" : pendingAction ? "Authenticate and continue" : "Authenticate and show"}</Btn>
         </div>
       </form>
     </Modal>}

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import oracledb from 'oracledb';
-import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, deleteCopyRows, quoteCopyName, type CopyColumn } from './tableDataCopy.ts';
+import { copyColumns, copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, quoteCopyName, truncateBlocker, truncateCopyTables, parseCopyRowLimit, parseCopyTotalLimit, type CopyColumn } from './tableDataCopy.ts';
 
 const col = (name = 'ID', type = 'NUMBER'): CopyColumn => ({ COLUMN_NAME: name, DATA_TYPE: type, VIRTUAL_COLUMN: 'NO', IDENTITY_COLUMN: 'NO', IDENTITY_OPTIONS: 'START WITH: 1, INCREMENT BY: 1, MAX_VALUE: 9999999999999999999999999999, MIN_VALUE: 1, CYCLE_FLAG: N, CACHE_SIZE: 20, ORDER_FLAG: N, SCALE_FLAG: N, EXTEND_FLAG: N, SESSION_FLAG: N, KEEP_VALUE: N' });
 test('matches columns by name, safely quotes identifiers, and rejects unsupported targets', () => {
@@ -53,15 +53,19 @@ test('always identities accept explicit source IDs', async () => {
   assert.equal((await copyTableRows(s.source, s.target, ['CATEGORIES'])).totalRows, 1);
   assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0, closed: 1, inserted: 1 });
 });
-test('commits once after all selected tables and closes every source cursor', async () => {
+test('commits each table on its own and closes every source cursor', async () => {
   const s = sessions();
   assert.deepEqual(await copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), { tables: [{ name: 'PARENT', rows: 2 }, { name: 'CHILD', rows: 2 }], totalRows: 4 });
-  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0, closed: 2, inserted: 4 });
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0, closed: 2, inserted: 4 });
 });
-test('a later table failure rolls back earlier inserts without committing', async () => {
+test('a later table failure rolls back only that table and reports the tables already committed', async () => {
   const s = sessions(true);
-  await assert.rejects(copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), /duplicate key/);
-  assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1, closed: 2, inserted: 4 });
+  await assert.rejects(copyTableRows(s.source, s.target, ['PARENT', 'CHILD']), /duplicate key\. Tables already committed keep their rows: PARENT \(2\)\. CHILD was rolled back\. Empty the copied tables before retrying\./);
+  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 1, closed: 2, inserted: 4 });
+});
+test('a failure in the first table reports that nothing was committed', async () => {
+  const s = sessions(false, [[Number.MAX_SAFE_INTEGER + 1]]);
+  await assert.rejects(copyTableRows(s.source, s.target, ['T']), /safe range.*precision\. No rows were committed\./);
 });
 
 test('unsafe integers are refused before inserting and the transaction is rolled back', async () => {
@@ -80,11 +84,14 @@ function foreignKeySessions(data: Record<string, (number | null)[][]>, parents: 
   const inserted = new Map<string, Set<number>>();
   const attempts: string[] = [];
   let commits = 0, rollbacks = 0;
-  const source = { execute: async (sql: string) => {
+  const queries: string[] = [];
+  const source = { execute: async (sql: string, binds?: { row_limit?: number }) => {
     if (sql.includes('user_tab_cols')) return { rows: [col(), col('PARENT_ID')] };
+    queries.push(sql);
     const table = /FROM "([^"]+)"/.exec(sql)![1];
+    const rows = binds && !Array.isArray(binds) && binds.row_limit ? data[table].slice(0, binds.row_limit) : data[table];
     let index = 0;
-    return { resultSet: { getRows: async () => index < data[table].length ? [data[table][index++]] : [], close: async () => {} } };
+    return { resultSet: { getRows: async () => index < rows.length ? [rows[index++]] : [], close: async () => {} } };
   } } as unknown as oracledb.Connection;
   const target = {
     execute: async () => ({ rows: [col(), col('PARENT_ID')] }),
@@ -105,7 +112,7 @@ function foreignKeySessions(data: Record<string, (number | null)[][]>, parents: 
     commit: async () => { commits++; },
     rollback: async () => { rollbacks++; inserted.clear(); },
   } as unknown as oracledb.Connection;
-  return { source, target, attempts, inserted, stats: () => ({ commits, rollbacks }) };
+  return { source, target, attempts, inserted, queries, stats: () => ({ commits, rollbacks }) };
 }
 
 test('self-referencing child-before-parent rows across batches are retried, never duplicating successful rows', async () => {
@@ -120,16 +127,64 @@ test('self-referencing child-before-parent rows across batches are retried, neve
 test('a table-level cycle with insertable rows resolves after the later table supplies its parent', async () => {
   const s = foreignKeySessions({ A: [[1, 2]], B: [[2, null]] }, { A: 'B', B: 'A' });
   assert.equal((await copyTableRows(s.source, s.target, ['A', 'B'])).totalRows, 2);
-  assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
+  // A's row waits for B, so it is inserted and committed with B.
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
 });
 
-test('missing parents and true row cycles roll back rather than loop or commit partially', async () => {
-  for (const rows of [[[1, 99], [2, null]], [[1, 2], [2, 1]]]) {
-    const s = foreignKeySessions({ T: rows }, { T: 'T' });
-    await assert.rejects(copyTableRows(s.source, s.target, ['T']), /Cannot resolve parent data/);
-    assert.deepEqual(s.stats(), { commits: 0, rollbacks: 1 });
-    assert.equal(s.inserted.size, 0);
+test('missing parents and true row cycles are skipped rather than looping', async () => {
+  for (const [rows, copied, skipped] of [[[[1, 99], [2, null]], 1, 1], [[[1, 2], [2, 1]], 0, 2]] as const) {
+    const s = foreignKeySessions({ T: rows.map(r => [...r]) }, { T: 'T' });
+    const result = await copyTableRows(s.source, s.target, ['T']);
+    assert.equal(result.totalRows, copied);
+    assert.equal(result.skippedRows, skipped);
+    assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
   }
+});
+
+test('a row limit samples each table, skips children whose parents were not sampled, and commits the rest', async () => {
+  const s = foreignKeySessions({ P: [[1, null], [2, null], [3, null]], C: [[10, 3], [11, 1], [12, 2]] }, { C: 'P' });
+  const result = await copyTableRows(s.source, s.target, ['P', 'C'], { rowLimit: 2 });
+  assert.ok(s.queries.every(q => q.includes('WHERE ROWNUM <= :row_limit')));
+  assert.deepEqual(result.tables, [{ name: 'P', rows: 2 }, { name: 'C', rows: 1, skipped: 1 }]);
+  assert.equal(result.totalRows, 3);
+  assert.equal(result.skippedRows, 1);
+  assert.match(result.warnings![0], /not in the sample: C \(1\)/);
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
+  assert.deepEqual([...s.inserted.get('C')!], [11]);
+});
+
+test('without a row limit, every row is read and rows with missing parents are skipped and reported', async () => {
+  const s = foreignKeySessions({ P: [[1, null]], C: [[10, 3], [11, 1]] }, { C: 'P' });
+  const result = await copyTableRows(s.source, s.target, ['P', 'C']);
+  assert.ok(s.queries.every(q => !q.includes('ROWNUM')));
+  assert.deepEqual(result.tables, [{ name: 'P', rows: 1 }, { name: 'C', rows: 1, skipped: 1 }]);
+  assert.match(result.warnings![0], /do not exist in the source or target: C \(1\)/);
+  assert.deepEqual(s.stats(), { commits: 2, rollbacks: 0 });
+});
+
+test('row limits apply to count validation and reject invalid values', () => {
+  assert.equal(validateCopyCounts({ BIG: 5_000_000, SMALL: 10 }, 1000), 1010);
+  assert.throws(() => validateCopyCounts({ BIG: 5_000_000 }), /row limit per table/);
+  assert.throws(() => validateCopyCounts(Object.fromEntries(Array.from({ length: 3 }, (_, i) => [`T${i}`, 50_000])), 40_000), /lower the row limit/);
+  assert.deepEqual(parseCopyRowLimit(undefined), { rowLimit: null });
+  assert.deepEqual(parseCopyRowLimit(500), { rowLimit: 500 });
+  assert.deepEqual(parseCopyRowLimit(1_000_000), { rowLimit: 1_000_000 });
+  for (const bad of [0, -1, 1.5, '10', 1_000_001]) assert.ok('error' in parseCopyRowLimit(bad));
+});
+
+test('the total row limit defaults to 100,000 and is selectable up to 1,000,000', async () => {
+  assert.deepEqual(parseCopyTotalLimit(undefined), { maxTotal: 100_000 });
+  assert.deepEqual(parseCopyTotalLimit(1_000_000), { maxTotal: 1_000_000 });
+  for (const bad of [0, 2.5, '500', 1_000_001]) assert.ok('error' in parseCopyTotalLimit(bad));
+  assert.equal(validateCopyCounts({ A: 600_000, B: 400_000 }, null, 1_000_000), 1_000_000);
+  assert.throws(() => validateCopyCounts({ A: 600_000, B: 400_001 }, null, 1_000_000), /1,000,000-row limit/);
+  assert.throws(() => validateCopyCounts({ A: 300 }, null, 200), /200-row limit/);
+  // The copy itself enforces the chosen total, not the default.
+  const big = sessions(false, Array.from({ length: 150_000 }, () => [1]));
+  assert.equal((await copyTableRows(big.source, big.target, ['T'], { maxTotal: 1_000_000 })).totalRows, 150_000);
+  const small = sessions(false, Array.from({ length: 11 }, () => [1]));
+  await assert.rejects(copyTableRows(small.source, small.target, ['T'], { maxTotal: 10 }), /10-row limit/);
+  assert.deepEqual(small.stats().commits, 0);
 });
 
 test('non-FK batch errors are fatal and are never retried', async () => {
@@ -153,12 +208,15 @@ test('identity DDL surrounds the row transaction; failures restore only after ro
     s.target.rollback = async () => { events.push('ROLLBACK'); };
     if (fail) await assert.rejects(copyTableRows(s.source, s.target, ['A', 'B']), /duplicate key/);
     else await copyTableRows(s.source, s.target, ['A', 'B']);
-    const boundary = events.indexOf(fail ? 'ROLLBACK' : 'COMMIT');
+    const boundary = fail ? events.indexOf('ROLLBACK') : events.lastIndexOf('COMMIT');
     const firstInsert = events.indexOf('INSERT');
+    // No DDL while any table's rows are uncommitted: DDL would commit them implicitly.
     assert.equal(events.slice(firstInsert, boundary).some(e => e.startsWith('ALTER')), false);
     assert.equal(events.slice(0, firstInsert).filter(e => e.includes('GENERATED BY DEFAULT')).length, 2);
     assert.equal(events.slice(boundary).filter(e => e.includes('GENERATED ALWAYS')).length, 2);
-    assert.equal(events.filter(e => e.includes('START WITH LIMIT VALUE')).length, fail ? 0 : 2);
+    // After a failure, only the table that was committed (A) has its sequence synchronized.
+    assert.equal(events.filter(e => e.includes('START WITH LIMIT VALUE')).length, fail ? 1 : 2);
+    assert.equal(events.filter(e => e === 'COMMIT').length, fail ? 1 : 2);
   }
 });
 
@@ -178,12 +236,16 @@ test('post-commit sequence failure returns repair warnings and still restores AL
   assert.equal(s.stats().rollbacks, 0);
 });
 
-test('timestamp precisions are supported without accepting timezone or unrelated types', () => {
+test('timestamp precisions and zoned timestamps are supported without accepting unrelated types', () => {
   for (const type of ['TIMESTAMP', 'TIMESTAMP(0)', 'TIMESTAMP(6)', 'TIMESTAMP(9)']) {
     assert.deepEqual(copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), ['ORDER_TS']);
   }
   assert.throws(() => copyColumns([col('ORDER_TS', 'TIMESTAMP(9)')], [col('ORDER_TS', 'TIMESTAMP(6)')]), /incompatible/);
-  for (const type of ['TIMESTAMP(10)', 'TIMESTAMP(6) WITH TIME ZONE', 'TIMESTAMP(6) WITH LOCAL TIME ZONE']) {
+  for (const type of ['TIMESTAMP(6) WITH TIME ZONE', 'TIMESTAMP WITH TIME ZONE', 'TIMESTAMP(9) WITH LOCAL TIME ZONE']) {
+    assert.deepEqual(copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), ['ORDER_TS']);
+  }
+  assert.throws(() => copyColumns([col('ORDER_TS', 'TIMESTAMP(6) WITH TIME ZONE')], [col('ORDER_TS', 'TIMESTAMP(6)')]), /incompatible/);
+  for (const type of ['TIMESTAMP(10)', 'TIMESTAMP(6) WITH TIME ZONES', 'INTERVAL DAY(2) TO SECOND(6)']) {
     assert.throws(() => copyColumns([col('ORDER_TS', type)], [col('ORDER_TS', type)]), /not supported/);
   }
 });
@@ -212,6 +274,77 @@ test('timestamp text and nulls reach Oracle conversion binds unchanged, includin
   assert.equal(committed, true);
 });
 
+
+test('zoned timestamps keep their zone as text, and LOCAL TIME ZONE values convert through a zoned cast', async () => {
+  const metadata = [col(), col('RECEIVED_DATE_TIME', 'TIMESTAMP(6) WITH TIME ZONE'), col('SEEN_AT', 'TIMESTAMP(6) WITH LOCAL TIME ZONE')];
+  const rows = [[1, '2026-09-08 12:34:56.123456000 AMERICA/CHICAGO', '2026-09-08 17:34:56.123456000 +00:00'], [2, null, null]];
+  let sql = '';
+  const source = { execute: async (query: string) => {
+    if (query.includes('user_tab_cols')) return { rows: metadata };
+    assert.match(query, /TO_CHAR\("RECEIVED_DATE_TIME", 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\) AS "RECEIVED_DATE_TIME"/);
+    assert.match(query, /TO_CHAR\(CAST\("SEEN_AT" AS TIMESTAMP WITH TIME ZONE\), 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\) AS "SEEN_AT"/);
+    let fetched = false;
+    return { resultSet: { getRows: async () => { if (fetched) return []; fetched = true; return rows; }, close: async () => {} } };
+  } } as unknown as oracledb.Connection;
+  const target = {
+    execute: async () => ({ rows: metadata }),
+    executeMany: async (insert: string, binds: unknown[][]) => { sql = insert; assert.deepEqual(binds, rows); return {}; },
+    commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+  } as unknown as oracledb.Connection;
+  assert.equal((await copyTableRows(source, target, ['MESSAGES'])).totalRows, 2);
+  assert.match(sql, /VALUES \(:1, TO_TIMESTAMP_TZ\(:2, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\), TO_TIMESTAMP_TZ\(:3, 'SYYYY-MM-DD HH24:MI:SS.FF9 TZR'\)\)/);
+});
+
+test('ROWID and UROWID columns copy their text form and warn that the addresses refer to the source', async () => {
+  for (const type of ['ROWID', 'UROWID']) assert.deepEqual(copyColumns([col('RID', type)], [col('RID', type)]), ['RID']);
+  assert.throws(() => copyColumns([col('RID', 'UROWID')], [col('RID', 'VARCHAR2')]), /incompatible/);
+  const metadata = [col(), col('RID', 'UROWID')];
+  const rows = [[1, 'AAAR3sAAEAAAACXAAA'], [2, '*BAMAAJ0CwQL+'], [3, null]];
+  const source = { execute: async (query: string) => {
+    if (query.includes('user_tab_cols')) return { rows: metadata };
+    assert.match(query, /SELECT "ID", "RID" FROM "LINKS"/);
+    let fetched = false;
+    return { resultSet: { getRows: async () => { if (fetched) return []; fetched = true; return rows; }, close: async () => {} } };
+  } } as unknown as oracledb.Connection;
+  const target = {
+    execute: async () => ({ rows: metadata }),
+    executeMany: async (insert: string, binds: unknown[][]) => { assert.match(insert, /VALUES \(:1, :2\)/); assert.deepEqual(binds, rows); return {}; },
+    commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+  } as unknown as oracledb.Connection;
+  const result = await copyTableRows(source, target, ['LINKS']);
+  assert.equal(result.totalRows, 3);
+  assert.match(result.warnings!.join(' '), /ROWID\/UROWID values were copied as-is in LINKS\.RID/);
+});
+
+test('NUMBER values beyond JavaScript precision are fetched and bound as exact text in the target decimal format', async () => {
+  for (const [nls, expected] of [['.,', ['12345678901234567890123456789012345678', '-0.000000000000000000123456789012345678901', '9007199254740993.25']], [',.', ['12345678901234567890123456789012345678', '-0,000000000000000000123456789012345678901', '9007199254740993,25']]] as const) {
+    const metadata = [col('BIG'), col('RATE', 'BINARY_DOUBLE'), col('NOTE', 'CLOB')];
+    const values = ['12345678901234567890123456789012345678', '-0.000000000000000000123456789012345678901', '9007199254740993.25'];
+    let handler: oracledb.ExecuteOptions['fetchTypeHandler'];
+    const source = { execute: async (query: string, _binds: unknown, options: oracledb.ExecuteOptions) => {
+      if (query.includes('user_tab_cols')) return { rows: metadata };
+      handler = options.fetchTypeHandler;
+      let i = 0;
+      return { resultSet: { getRows: async () => i < values.length ? [[values[i++], 1e300, 'x']] : [], close: async () => {} } };
+    } } as unknown as oracledb.Connection;
+    const bound: unknown[] = [];
+    const target = {
+      execute: async (query: string) => query.includes('nls_session_parameters') ? { rows: [{ VALUE: nls }] } : { rows: metadata },
+      executeMany: async (_sql: string, rows: unknown[][], options: oracledb.ExecuteManyOptions) => {
+        assert.deepEqual((options.bindDefs as oracledb.BindDefinition[]).map(b => b.type), [oracledb.STRING, oracledb.NUMBER, oracledb.CLOB]);
+        bound.push(rows[0][0]);
+        assert.equal(rows[0][1], 1e300);
+        return {};
+      },
+      commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+    } as unknown as oracledb.Connection;
+    assert.equal((await copyTableRows(source, target, ['LEDGER'])).totalRows, 3);
+    assert.deepEqual(bound, expected);
+    const meta = (dbType: unknown) => ({ name: 'X', dbType }) as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0];
+    assert.equal(handler!(meta(oracledb.DB_TYPE_NUMBER), [])?.type, oracledb.STRING);
+    assert.equal(handler!(meta(oracledb.DB_TYPE_BINARY_DOUBLE), []), undefined);
+  }
+});
 
 test('native vectors and nulls retain their representation and explicit bind type during retries', async () => {
   for (const vector of [new Float32Array([0.1, -2]), new Float64Array([1.123456789, -2]), new Int8Array([1, -2]), new Uint8Array([255, 0]), new oracledb.SparseVector({ numDimensions: 8, indices: new Uint32Array([1]), values: new Float32Array([0.5]) }), null]) {
@@ -265,7 +398,8 @@ test('JSON and large Unicode CLOB/NCLOB text are bound without parsing or trunca
     if (sql.includes('user_tab_cols')) return { rows: columns };
     assert.match(sql, /JSON_SERIALIZE\("DOC" RETURNING CLOB EXTENDED ERROR ON ERROR\)/);
     const handler = options.fetchTypeHandler!;
-    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0], [])?.type, oracledb.STRING);
+    // LOBs arrive as locators: small ones are read as text, large ones are streamed.
+    assert.equal(handler({ name: 'BODY', dbType: oracledb.CLOB } as Parameters<NonNullable<oracledb.ExecuteOptions['fetchTypeHandler']>>[0], []), undefined);
     assert.equal(options.fetchArraySize, 1);
     let i = 0;
     return { resultSet: { getRows: async (size: number) => { assert.equal(size, 1); return i < documents.length ? [[documents[i++], text, null]] : []; }, close: async () => {} } };
@@ -288,19 +422,54 @@ test('JSON and large Unicode CLOB/NCLOB text are bound without parsing or trunca
 });
 
 
-test('oversized CLOB rows roll back and close their source cursor before any insert', async () => {
-  const columns = [col('BODY', 'CLOB')];
-  let closed = false, rolledBack = false;
-  const source = { execute: async (sql: string) => sql.includes('user_tab_cols') ? { rows: columns } : {
-    resultSet: { getRows: async () => [['x'.repeat(16 * 1024 * 1024 + 1)]], close: async () => { closed = true; } },
+import { Duplex } from 'node:stream';
+const LobBase = (oracledb as unknown as { Lob: typeof Duplex }).Lob;
+class FakeLob extends LobBase {
+  text: string; written: string[] = []; destroyed = false; kind: oracledb.DbType; reads = 0;
+  constructor(text = '', kind: oracledb.DbType = oracledb.CLOB) { super({ decodeStrings: false }); this.text = text; this.kind = kind; }
+  get length() { return this.text.length; }
+  get type() { return this.kind; }
+  async getData(offset?: number, amount?: number) { this.reads++; return offset ? this.text.slice(offset - 1, offset - 1 + amount!) : this.text; }
+  override _write(data: unknown, _encoding: unknown, cb: (e?: Error | null) => void) { assert.equal(typeof data, 'string'); this.written.push(data as string); cb(); }
+  override _destroy(_e: unknown, cb: (e?: Error | null) => void) { this.destroyed = true; cb(); }
+}
+
+test('small LOBs are read as text, large LOBs stream into temporary target LOBs, including retries', async () => {
+  const columns = [col('ID'), col('BODY', 'CLOB'), col('NATIONAL', 'NCLOB')];
+  const big = '日本語🙂'.repeat(300000);
+  const small = new FakeLob('short'), large = new FakeLob(big, oracledb.NCLOB);
+  const temps: FakeLob[] = [];
+  let attempts = 0, committed = false;
+  const source = { execute: async (sql: string) => {
+    if (sql.includes('user_tab_cols')) return { rows: columns };
+    let sent = false;
+    return { resultSet: { getRows: async () => sent ? [] : (sent = true, [['1', small, large]]), close: async () => {} } };
   } } as unknown as oracledb.Connection;
   const target = {
-    execute: async () => ({ rows: columns }), executeMany: async () => assert.fail('must not insert oversized data'),
-    commit: async () => assert.fail('must not commit'), rollback: async () => { rolledBack = true; },
+    execute: async (sql: string, binds: { val: unknown; type?: unknown }[]) => {
+      if (sql.includes('user_tab_cols')) return { rows: columns };
+      if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
+      assert.match(sql, /^INSERT INTO "DOCS"/);
+      assert.deepEqual(binds.slice(0, 2), [{ type: oracledb.STRING, val: '1' }, { type: oracledb.CLOB, val: 'short' }]);
+      assert.equal(binds[2].val, temps[0]);
+      assert.equal(binds[2].type, undefined);
+      if (attempts++ === 0) throw Object.assign(new Error('ORA-02291: parent missing'), { errorNum: 2291 });
+      return {};
+    },
+    createLob: async (type: oracledb.DbType) => { assert.equal(type, oracledb.NCLOB); const lob = new FakeLob('', type); temps.push(lob); return lob; },
+    executeMany: async () => assert.fail('streamed rows are inserted one by one'),
+    commit: async () => { committed = true; }, rollback: async () => assert.fail('unexpected rollback'),
   } as unknown as oracledb.Connection;
-  await assert.rejects(copyTableRows(source, target, ['DOCS']), /16 MB/);
-  assert.equal(closed, true);
-  assert.equal(rolledBack, true);
+  assert.equal((await copyTableRows(source, target, ['DOCS'])).totalRows, 1);
+  assert.equal(attempts, 2);
+  assert.equal(temps.length, 1);
+  assert.equal(temps[0].written.join(''), big);
+  assert.ok(large.reads > 1, 'large LOBs are read in chunks');
+  assert.ok(temps[0].written.every(chunk => !/[\ud800-\udbff]$/.test(chunk) && !/^[\udc00-\udfff]/.test(chunk)), 'chunks never split a surrogate pair');
+  assert.equal(large.destroyed, true);
+  assert.equal(small.destroyed, true);
+  assert.equal(temps[0].destroyed, true);
+  assert.equal(committed, true);
 });
 
 
@@ -311,40 +480,52 @@ test('checks actual row existence using quoted names', async () => {
   assert.equal(sqls[1], 'SELECT 1 FROM "a""b" WHERE ROWNUM = 1');
 });
 
-test('replacement deletes children first and blocks outside references', async () => {
-  const deleted: string[] = [];
-  const target = { execute: async (sql: string) => { if (sql.includes('all_constraints')) return { rows: [] }; deleted.push(sql); return {}; } } as unknown as oracledb.Connection;
-  await deleteCopyRows(target, ['PARENT', 'CHILD']);
-  assert.deepEqual(deleted, ['DELETE FROM "CHILD"', 'DELETE FROM "PARENT"']);
-  const blocked = { execute: async () => ({ rows: [{ CHILD_OWNER: 'OTHER', CHILD_TABLE: 'CHILD', PARENT_TABLE: 'PARENT' }] }) } as unknown as oracledb.Connection;
-  await assert.rejects(deleteCopyRows(blocked, ['PARENT']), /outside the selection/);
+function truncateTarget(refs: { CHILD_OWNER: string; CHILD_TABLE: string; CONSTRAINT_NAME: string; PARENT_TABLE: string }[], fail?: (sql: string) => boolean) {
+  const sqls: string[] = [];
+  const target = { execute: async (sql: string, binds?: string[]) => {
+    if (sql.includes('FROM dual')) return { rows: [{ U: 'APP' }] };
+    if (sql.includes('all_constraints')) return { rows: refs.filter(r => binds!.includes(r.PARENT_TABLE)) };
+    sqls.push(sql);
+    if (fail?.(sql)) throw new Error('ORA-00054: resource busy');
+    return {};
+  } } as unknown as oracledb.Connection;
+  return { target, sqls };
+}
+const ref = (child: string, parent: string, owner = 'APP') => ({ CHILD_OWNER: owner, CHILD_TABLE: child, CONSTRAINT_NAME: `FK_${child}_${parent}`, PARENT_TABLE: parent });
+
+test('truncation disables foreign keys inside the selection, truncates, then re-enables them', async () => {
+  const t = truncateTarget([ref('ORDERS', 'CUSTOMERS'), ref('CUSTOMERS', 'CUSTOMERS')]);
+  assert.deepEqual(await truncateCopyTables(t.target, ['CUSTOMERS', 'ORDERS'], ['CUSTOMERS', 'ORDERS']), ['CUSTOMERS', 'ORDERS']);
+  assert.deepEqual(t.sqls, [
+    'ALTER TABLE "ORDERS" DISABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"', 'ALTER TABLE "CUSTOMERS" DISABLE CONSTRAINT "FK_CUSTOMERS_CUSTOMERS"',
+    'TRUNCATE TABLE "CUSTOMERS"', 'TRUNCATE TABLE "ORDERS"',
+    'ALTER TABLE "ORDERS" ENABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"', 'ALTER TABLE "CUSTOMERS" ENABLE CONSTRAINT "FK_CUSTOMERS_CUSTOMERS"',
+  ]);
 });
 
-test('replacement rolls back deletions when insertion fails', async () => {
-  const mock = sessions(false, [[1]]);
-  const events: string[] = [];
-  mock.target.execute = (async (sql: string) => { events.push(sql); return { rows: sql.includes('user_tab_cols') ? [col()] : [] }; }) as typeof mock.target.execute;
-  mock.target.executeMany = (async () => { throw new Error('duplicate key'); }) as typeof mock.target.executeMany;
-  await assert.rejects(copyTableRows(mock.source, mock.target, ['T'], 'replace'), /duplicate key/);
-  assert.ok(events.includes('DELETE FROM "T"'));
-  assert.equal(mock.stats().rollbacks, 1);
-  assert.equal(mock.stats().commits, 0);
+test('truncation is blocked by references from tables outside the selection or other schemas', async () => {
+  for (const outside of [ref('INVOICES', 'CUSTOMERS'), ref('ORDERS', 'CUSTOMERS', 'OTHER')]) {
+    const t = truncateTarget([outside]);
+    assert.match((await truncateBlocker(t.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']))!, /Truncation blocked: .*references CUSTOMERS/);
+    await assert.rejects(truncateCopyTables(t.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), /Truncation blocked/);
+    assert.deepEqual(t.sqls, []);
+  }
+  assert.equal(await truncateBlocker(truncateTarget([ref('ORDERS', 'CUSTOMERS')]).target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), null);
 });
 
+test('a failed truncation still re-enables foreign keys and reports what was already truncated', async () => {
+  const t = truncateTarget([ref('ORDERS', 'CUSTOMERS')], sql => sql === 'TRUNCATE TABLE "ORDERS"');
+  await assert.rejects(truncateCopyTables(t.target, ['CUSTOMERS', 'ORDERS'], ['CUSTOMERS', 'ORDERS']), /Truncation failed: ORA-00054.*Already truncated \(cannot be undone\): CUSTOMERS\. No rows were copied\./);
+  assert.equal(t.sqls.at(-1), 'ALTER TABLE "ORDERS" ENABLE CONSTRAINT "FK_ORDERS_CUSTOMERS"');
+  const e = truncateTarget([ref('ORDERS', 'CUSTOMERS')], sql => sql.includes('ENABLE'));
+  await assert.rejects(truncateCopyTables(e.target, ['CUSTOMERS'], ['CUSTOMERS', 'ORDERS']), /could not be re-enabled.*Re-enable these foreign keys: ALTER TABLE "ORDERS" ENABLE CONSTRAINT/);
+});
 
-test('replacement retries message-only and code-only manager FK errors from the thin driver', async () => {
+test('message-only and code-only manager FK errors from the thin driver are retried', async () => {
   for (const representation of ['message', 'code']) {
     const s = foreignKeySessions({ EMPLOYEES: [[3, 2], [2, 1], [1, null]] }, { EMPLOYEES: 'EMPLOYEES' });
-    const execute = s.target.execute.bind(s.target);
     const executeMany = s.target.executeMany.bind(s.target);
-    let deleted = false;
-    s.target.execute = (async (sql: string) => {
-      if (sql.includes('all_constraints')) return { rows: [] };
-      if (sql.startsWith('DELETE')) { deleted = true; return {}; }
-      return execute(sql);
-    }) as typeof s.target.execute;
     s.target.executeMany = (async (...args: unknown[]) => {
-      assert.ok(deleted);
       const result = await (executeMany as Function)(...args);
       result.batchErrors = result.batchErrors.map((e: { offset: number }) => ({
         offset: e.offset,
@@ -352,7 +533,7 @@ test('replacement retries message-only and code-only manager FK errors from the 
       }));
       return result;
     }) as typeof s.target.executeMany;
-    assert.equal((await copyTableRows(s.source, s.target, ['EMPLOYEES'], 'replace')).totalRows, 3);
+    assert.equal((await copyTableRows(s.source, s.target, ['EMPLOYEES'])).totalRows, 3);
     assert.deepEqual(s.stats(), { commits: 1, rollbacks: 0 });
     assert.equal(s.attempts.filter(a => a === 'EMPLOYEES:1').length, 1);
     assert.equal(s.inserted.get('EMPLOYEES')!.size, 3);
@@ -390,4 +571,20 @@ test('unavailable or invalid counts fail closed', async () => {
     const source = { execute: async () => ({ rows: [{ ROW_COUNT: value }] }) } as unknown as oracledb.Connection;
     await assert.rejects(countCopyRows(source, ['T']), /Cannot determine source row count/);
   }
+});
+
+test('reports progress: table start, inserted rows, and each commit', async () => {
+  const s = sessions();
+  const events: unknown[] = [];
+  await copyTableRows(s.source, s.target, ['PARENT', 'CHILD'], { onProgress: e => events.push(e) });
+  assert.deepEqual(events, [
+    { kind: 'table', name: 'PARENT' }, { kind: 'rows', name: 'PARENT', rows: 2 }, { kind: 'committed', name: 'PARENT', rows: 2 },
+    { kind: 'table', name: 'CHILD' }, { kind: 'rows', name: 'CHILD', rows: 2 }, { kind: 'committed', name: 'CHILD', rows: 2 },
+  ]);
+});
+
+test('a failing progress listener never breaks the copy', async () => {
+  const s = sessions();
+  const outcome = await copyTableRows(s.source, s.target, ['PARENT'], { onProgress: () => { throw new Error('listener'); } });
+  assert.equal(outcome.totalRows, 2);
 });
