@@ -1034,13 +1034,19 @@ export const api = {
       `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
     ),
   /** Copies into empty target tables (or truncates them first); each table commits as soon as it is loaded. */
-  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false) =>
-    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate }),
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false, lobRowLimit: number | null = null, disableTriggers = false, tableRowLimits: Record<string, number> = {}, tableFilters: Record<string, string> = {}) =>
+    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate, lobRowLimit, disableTriggers, tableRowLimits, tableFilters }),
+  /** Checks a WHERE filter for one source table and returns how many rows it selects. */
+  countTableDataFilter: (targetId: string, sourceId: string, table: string, where: string) =>
+    request<{ count: number }>(`/api/connections/${targetId}/tables/copy-data/count`, { sourceId, table, where }),
   /** Live progress of the running (or most recent) data copy into `targetId`; null if none since the server started. */
   tableDataProgress: (targetId: string) =>
     request<{ progress: import('./tableDataProgress').CopyProgress | null }>(`/api/connections/${targetId}/tables/copy-data/progress`, undefined, undefined, undefined, 'no-store'),
+  /** Asks the running data copy into `targetId` to stop: the table in progress rolls back, committed tables keep their rows. */
+  stopTableDataCopy: (targetId: string) =>
+    request<{ stopping: boolean }>(`/api/connections/${targetId}/tables/copy-data/stop`, {}),
   tableDataPlan: (targetId: string, sourceId: string) =>
-    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; targetOccupied: string[]; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
+    request<ObjectCopyPlan & { sourceCounts: Record<string, number>; countErrors: Record<string, string>; targetOccupied: string[]; targetCounts?: Record<string, number>; lobTables?: string[]; dependencies: import('./tableDataDependencies').TableDependency[] }>(`/api/connections/${targetId}/tables/copy-data?source=${encodeURIComponent(sourceId)}`),
   /** Run it — unacknowledged calls come back as ConfirmRequiredError with the dialog wording. */
   objectCopy: (
     targetId: string,

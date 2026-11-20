@@ -77,3 +77,19 @@ test('server selection detects new dependencies not in the reviewed table list',
   const r = tableDataSelection(reviewed, ['P', 'C', 'NEW_PARENT'], [fk('C', 'P'), fk('P', 'NEW_PARENT')]);
   assert.deepEqual(r.added, ['NEW_PARENT']);
 });
+
+test('when truncating, child tables with rows that reference a truncated table are selected too, with their own parents', () => {
+  // POLIZA is truncated; TRANSACCION (has rows) references it and also needs CAT_CUENTA.
+  // PAGO references TRANSACCION and has rows, so it follows. EMPTY_CHILD has no rows: not added.
+  const deps = [fk('TRANSACCION', 'POLIZA'), fk('TRANSACCION', 'CAT_CUENTA'), fk('PAGO', 'TRANSACCION'), fk('EMPTY_CHILD', 'POLIZA'), fk('POLIZA', 'POLIZA')];
+  const available = ['POLIZA', 'TRANSACCION', 'CAT_CUENTA', 'PAGO', 'EMPTY_CHILD'];
+  const occupied = new Set(['POLIZA', 'TRANSACCION', 'PAGO', 'CAT_CUENTA']);
+  const r = tableDataSelection(['POLIZA'], available, deps, { truncateOccupied: occupied });
+  assert.deepEqual(r.names, ['POLIZA', 'CAT_CUENTA', 'TRANSACCION', 'PAGO']);
+  assert.deepEqual(r.addedChildren, ['TRANSACCION', 'PAGO']);
+  assert.deepEqual(r.added, ['CAT_CUENTA', 'TRANSACCION', 'PAGO']);
+  // Without truncation, children are never pulled in.
+  assert.deepEqual(tableDataSelection(['POLIZA'], available, deps).names, ['POLIZA']);
+  // A child that is not available (for example missing from the source) stays a blocker.
+  assert.deepEqual(tableDataSelection(['POLIZA'], ['POLIZA'], deps, { truncateOccupied: occupied }).names, ['POLIZA']);
+});

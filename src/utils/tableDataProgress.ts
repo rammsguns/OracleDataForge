@@ -2,7 +2,10 @@
 export type CopyProgressEvent =
   | { kind: 'table'; name: string }
   | { kind: 'rows'; name: string; rows: number }
-  | { kind: 'deferred'; name: string; rows: number }
+  /** `waitingFor` names the foreign keys and parent tables, when Oracle reported them. */
+  | { kind: 'deferred'; name: string; rows: number; waitingFor?: string[] }
+  /** Parent-blocked rows dropped because their parent table gets no more rows in this copy. */
+  | { kind: 'skipped'; name: string; rows: number; reason: string }
   | { kind: 'retry'; rows: number }
   | { kind: 'committed'; name: string; rows: number }
   | { kind: 'finishing' };
@@ -34,6 +37,8 @@ export interface CopyProgress {
   tables: TableProgress[];
   log: CopyLogEntry[];
   error?: string;
+  /** The user asked to stop; the copy ends at the next safe point. */
+  stopRequested?: boolean;
 }
 
 const MAX_LOG = 3000;
@@ -79,7 +84,10 @@ export function createCopyProgress(input: { sourceSchema: string; targetSchema: 
         break;
       }
       case 'deferred':
-        log(`${e.name}: ${fmt(e.rows)} row(s) wait for parent keys and will be retried.`, 'warn');
+        log(`${e.name}: ${fmt(e.rows)} row(s) wait for parent keys${e.waitingFor?.length ? ` (${e.waitingFor.join('; ')})` : ''} and will be retried.`, 'warn');
+        break;
+      case 'skipped':
+        log(`${e.name}: ${fmt(e.rows)} row(s) skipped — ${e.reason}`, 'warn');
         break;
       case 'retry':
         log(`Retrying ${fmt(e.rows)} row(s) waiting for parent keys…`);
@@ -120,11 +128,16 @@ export function createCopyProgress(input: { sourceSchema: string; targetSchema: 
       progress.copiedRows = progress.tables.reduce((n, t) => n + t.committed, 0);
       progress.state = 'failed';
       progress.error = error;
-      log(`Copy failed after ${seconds(progress.finishedAt - startedAt)}: ${error}`, 'error');
+      log(progress.stopRequested ? `Copy stopped after ${seconds(progress.finishedAt - startedAt)}: ${error}` : `Copy failed after ${seconds(progress.finishedAt - startedAt)}: ${error}`, 'error');
     } else {
       progress.state = 'succeeded';
       log(`Copy finished: ${fmt(progress.copiedRows)} rows in ${progress.tables.filter(t => t.status === 'committed').length} table(s), ${seconds(progress.finishedAt - startedAt)}.`);
     }
   };
-  return { progress, event, log, truncating, truncated, finish };
+  const requestStop = () => {
+    if (progress.state !== 'running' || progress.stopRequested) return;
+    progress.stopRequested = true;
+    log('Stop requested. The table in progress is rolled back; tables already committed keep their rows.', 'warn');
+  };
+  return { progress, event, log, truncating, truncated, finish, requestStop };
 }

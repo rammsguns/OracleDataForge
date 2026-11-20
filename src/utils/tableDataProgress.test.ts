@@ -48,3 +48,15 @@ test('long tables log running counts; a failure keeps only committed rows', () =
   assert.equal(p.progress.copiedRows, 5);
   assert.equal(p.progress.log.at(-1)!.level, 'error');
 });
+
+test('a requested stop is recorded once and the end is logged as stopped', () => {
+  const p = createCopyProgress({ sourceSchema: 'S', targetSchema: 'T', tables: [{ name: 'A', planned: 1 }] });
+  p.requestStop(); p.requestStop();
+  assert.equal(p.progress.stopRequested, true);
+  assert.equal(p.progress.log.filter(l => /Stop requested/.test(l.message)).length, 1);
+  p.finish('Copy stopped by user.');
+  assert.equal(p.progress.state, 'failed');
+  assert.match(p.progress.log.at(-1)!.message, /^Copy stopped after/);
+  p.requestStop();
+  assert.equal(p.progress.log.filter(l => /Stop requested/.test(l.message)).length, 1);
+});

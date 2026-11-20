@@ -1,8 +1,8 @@
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
-import { copyTableRows, countCopyRows, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
-import { limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
+import { copyTableRows, CopyStoppedError, copyFilterError, parseCopyTableFilters, countCopyRows, lobCopyTables, enabledCopyTriggers, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTableRowLimits, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
+import { copyRowLimitFor, limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
 import { createCopyProgress, type CopyProgress } from '../src/utils/tableDataProgress.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
 import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
@@ -5982,6 +5982,40 @@ app.post("/api/connections/:id/objects/copy", requireFullAccess, async (req, res
 const activeDataCopies = new Set<string>();
 /** Progress of the running (or most recent) data copy into each target connection. */
 const dataCopyProgress = new Map<string, CopyProgress>();
+/** Stop handles of running data copies, by target connection id. */
+const dataCopyStops = new Map<string, () => void>();
+/** Checks one table's WHERE filter against the source and returns how many rows it selects. */
+app.post('/api/connections/:id/tables/copy-data/count', requireFullAccess, async (req, res) => {
+  const parsed = readCopyRequest(req.body ?? {}, routeId(req));
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const ends = copyEndpoints(parsed.sourceId, routeId(req));
+  if ('error' in ends) return res.status(ends.status).json({ error: ends.error });
+  const table = req.body?.table, where = req.body?.where;
+  if (typeof table !== 'string' || !table || table.length > 128) return res.status(400).json({ error: 'Choose a table.' });
+  if (typeof where !== 'string') return res.status(400).json({ error: 'Enter a filter.' });
+  const problem = copyFilterError(where);
+  if (problem) return res.status(400).json({ error: problem });
+  let src: oracledb.Connection | undefined;
+  try {
+    src = await getOraConn(ends.source);
+    src.callTimeout = 60000;
+    // The count runs read-only: the filter can only read.
+    await src.execute('SET TRANSACTION READ ONLY');
+    const counts = await countCopyRows(src, [table], { [table]: where });
+    res.json({ count: counts[table] });
+  } catch (e) {
+    const message = errMsg(e);
+    res.status(400).json({ error: /NJS-123/.test(message) ? 'Counting with this filter took longer than 60 seconds. Use indexed columns in the filter.' : message });
+  } finally {
+    if (src) { const c = src; await c.rollback().catch(() => {}).finally(() => c.close().catch(() => {})); }
+  }
+});
+app.post('/api/connections/:id/tables/copy-data/stop', requireFullAccess, (req, res) => {
+  const stop = dataCopyStops.get(routeId(req));
+  if (!stop) return res.status(409).json({ error: 'No data copy is running for this target.' });
+  stop();
+  res.json({ stopping: true });
+});
 app.get('/api/connections/:id/tables/copy-data/progress', requireSchemaMetadataAccess, (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ progress: dataCopyProgress.get(routeId(req)) ?? null });
@@ -6007,7 +6041,15 @@ app.get('/api/connections/:id/tables/copy-data', requireSchemaMetadataAccess, as
       catch (e) { countErrors[item.name] = errMsg(e); }
     }
     const targetOccupied = await nonEmptyCopyTables(conn, plan.items.filter(i => i.existsInTarget).map(i => i.name));
-    res.json({ ...plan, sourceCounts, countErrors, targetOccupied, dependencies: await readTableDependencies(conn, plan.targetSchema) });
+    // Informational only: a failed target count leaves the table without one (emptiness above still gates copying).
+    const targetCounts: Record<string, number> = Object.create(null);
+    conn.callTimeout = 30000;
+    for (const item of plan.items.filter(i => i.existsInTarget)) {
+      try { Object.assign(targetCounts, await countCopyRows(conn, [item.name])); } catch { /* shown as unavailable */ }
+    }
+    conn.callTimeout = 0;
+    const lobTables = (await lobCopyTables(src)).filter(n => plan.items.some(i => i.name === n));
+    res.json({ ...plan, sourceCounts, countErrors, targetOccupied, targetCounts, lobTables, dependencies: await readTableDependencies(conn, plan.targetSchema) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally { await Promise.allSettled([...(conn ? [conn.close()] : []), ...(src ? [src.close()] : [])]); }
 });
@@ -6028,11 +6070,20 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     const limit = parseCopyRowLimit(req.body.rowLimit);
     if ('error' in limit) return res.status(400).json({ error: limit.error });
     const { rowLimit } = limit;
+    const lobLimit = parseCopyRowLimit(req.body.lobRowLimit);
+    if ('error' in lobLimit) return res.status(400).json({ error: 'Row limit for tables with CLOB, NCLOB or JSON columns must be a whole number from 1 to 1,000,000, or omitted.' });
+    const lobRowLimit = lobLimit.rowLimit;
+    const chosen = parseCopyTableRowLimits(req.body.tableRowLimits);
+    if ('error' in chosen) return res.status(400).json({ error: chosen.error });
+    const filtered = parseCopyTableFilters(req.body.tableFilters);
+    if ('error' in filtered) return res.status(400).json({ error: filtered.error });
     const total = parseCopyTotalLimit(req.body.maxTotal);
     if ('error' in total) return res.status(400).json({ error: total.error });
     const { maxTotal } = total;
     if (req.body.truncate !== undefined && typeof req.body.truncate !== 'boolean') return res.status(400).json({ error: 'truncate must be true or false.' });
     const truncate = req.body.truncate === true;
+    if (req.body.disableTriggers !== undefined && typeof req.body.disableTriggers !== 'boolean') return res.status(400).json({ error: 'disableTriggers must be true or false.' });
+    const disableTriggers = req.body.disableTriggers === true;
     if (!Array.isArray(names) || !names.length || names.length > TABLE_COPY_MAX_TABLES || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
       return res.status(400).json({ error: `Select 1–${TABLE_COPY_MAX_TABLES} distinct tables that exist in both schemas. Create missing tables using Copy objects first.` });
     }
@@ -6047,40 +6098,52 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     if (notEmpty.length && !truncate) return res.status(409).json({ error: `Copy only into empty tables. These target tables already contain rows: ${notEmpty.join(', ')}. Empty them, deselect them, or choose to truncate target tables before copying, then re-read tables.` });
     // Without truncation, a parent that already has rows in the target is not copied; its rows
     // serve as the parents. With truncation, every selected table is emptied and copied.
-    const selection = tableDataSelection(names, truncate ? inTarget : inTarget.filter(n => !occupied.has(n)), dependencies);
+    const selection = tableDataSelection(names, truncate ? inTarget : inTarget.filter(n => !occupied.has(n)), dependencies, truncate ? { truncateOccupied: occupied } : {});
     if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
       selection.overLimit ? `Required parent tables exceed the ${TABLE_COPY_MAX_TABLES}-table limit. Use a custom migration.` :
-      `Additional parent tables are required: ${selection.added.join(', ')}. Re-read tables and review the updated selection.` });
+      `Additional tables are required: ${selection.added.join(', ')}${selection.addedChildren.length ? ` (child tables with rows that reference a truncated table: ${selection.addedChildren.join(', ')})` : ''}. Re-read tables and review the updated selection.` });
     src = await getOraConn(source);
     src.callTimeout = 30000;
     await src.execute('SET TRANSACTION READ ONLY');
-    const sourceCounts = await countCopyRows(src, selection.names);
+    // Filters for tables outside this copy are ignored.
+    const tableFilters: Record<string, string> = Object.fromEntries(Object.entries(filtered.tableFilters).filter(([n]) => selection.names.includes(n)));
+    let sourceCounts: Record<string, number>;
+    try { sourceCounts = await countCopyRows(src, selection.names, tableFilters); }
+    catch (e) { return res.status(400).json({ error: errMsg(e) }); }
+    const lobTables = new Set(lobRowLimit ? (await lobCopyTables(src)).filter(n => selection.names.includes(n)) : []);
+    // Rows chosen for tables outside this copy are ignored.
+    const tableRowLimits: Record<string, number> = Object.fromEntries(Object.entries(chosen.tableRowLimits).filter(([n]) => selection.names.includes(n)));
+    const limitFor = (name: string) => copyRowLimitFor(name, rowLimit, lobRowLimit, lobTables, tableRowLimits);
+    const limitNote = [rowLimit ? `at most ${rowLimit.toLocaleString('en-US')} per table` : '', lobTables.size ? `at most ${lobRowLimit!.toLocaleString('en-US')} per table with CLOB, NCLOB or JSON columns (${lobTables.size} table(s))` : '', ...Object.entries(tableRowLimits).map(([n, r]) => `${r.toLocaleString('en-US')} from ${n}`), ...Object.entries(tableFilters).map(([n, w]) => `${n} WHERE ${w}`)].filter(Boolean).join('; ');
     let sourceTotal: number;
-    try { sourceTotal = validateCopyCounts(sourceCounts, rowLimit, maxTotal); }
+    try { sourceTotal = validateCopyCounts(sourceCounts, limitFor, maxTotal); }
     catch (e) { return res.status(400).json({ error: errMsg(e) }); }
     const toTruncate = truncate ? selection.names.filter(n => occupied.has(n)) : [];
     if (toTruncate.length) {
       const blocked = await truncateBlocker(dst, toTruncate, selection.names);
       if (blocked) return res.status(409).json({ error: blocked });
     }
+    const triggers = disableTriggers ? await enabledCopyTriggers(dst, selection.names) : [];
     const filledParents = truncate ? [] : [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && occupied.has(d.parent)).map(d => d.parent!)))];
     if (!acknowledged(req)) return confirmRequired(res, describeOperation({
       level: toTruncate.length ? 'destructive' : 'write', verb: toTruncate.length ? 'TRUNCATE AND COPY TABLE DATA' : 'COPY TABLE DATA', target: plan.targetSchema,
       title: `Copy data into ${plan.targetSchema}?`,
-      body: (toTruncate.length ? `TRUNCATE permanently removes ALL rows from ${toTruncate.length} target table(s) before copying: ${toTruncate.join(', ')}. Truncation cannot be rolled back, even if the copy then fails, and DELETE triggers do not fire. Foreign keys between the selected tables are briefly disabled for the truncation and re-enabled before copying. ` : '') + `Rows to copy: ${sourceTotal.toLocaleString()}${rowLimit ? ` (at most ${rowLimit.toLocaleString()} per table)` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
+      body: (toTruncate.length ? `TRUNCATE permanently removes ALL rows from ${toTruncate.length} target table(s) before copying: ${toTruncate.join(', ')}. Truncation cannot be rolled back, even if the copy then fails, and DELETE triggers do not fire. Foreign keys between the selected tables are briefly disabled for the truncation and re-enabled before copying. ` : '') + `Rows to copy: ${sourceTotal.toLocaleString()}${limitNote ? ` (${limitNote})` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
         `Each table is committed as soon as its rows are inserted, so undo only needs to hold one table at a time. If a table fails, it is rolled back, but tables committed before it keep their rows — empty them before retrying. ` +
-        `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${rowLimit ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
+        `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${limitNote ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
         (filledParents.length ? `Parent tables that already contain rows are not copied; their existing rows are used: ${filledParents.join(', ')}. ` : '') +
-        `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Each source table is read as of the moment its copy starts; pause source writes too if the tables must match one point in time. Target triggers run on attempts, including retries. ${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
+        `ALWAYS identities are temporarily changed to BY DEFAULT, then restored; sequences are synchronized after copying. Pause other target writes during copying. Each source table is read as of the moment its copy starts; pause source writes too if the tables must match one point in time. ${disableTriggers ? (triggers.length ? `These ${triggers.length} enabled target trigger(s) are disabled while copying and enabled again afterwards, so they do not run for copied rows (sequences or audit rows they maintain are not updated): ${triggers.map(t => `${t.name} (${t.table})`).join(', ')}. While disabled they also do not run for other sessions' writes. ` : 'The selected target tables have no enabled triggers. ') : 'Target triggers run on attempts, including retries. '}${selection.warnings.join(' ')} Limit: ${maxTotal.toLocaleString()} rows in total across up to ${TABLE_COPY_MAX_TABLES} tables.`,
       confirmLabel: toTruncate.length ? `Truncate ${toTruncate.length} table(s) and copy` : 'Copy data',
     }));
     if (activeDataCopies.has(target.id)) return res.status(409).json({ error: 'A data copy is already running for this target. Wait for it to finish before starting another.' });
     activeDataCopies.add(target.id);
     locked = true;
     const tracker = createCopyProgress({ sourceSchema: plan.sourceSchema, targetSchema: plan.targetSchema,
-      tables: selection.names.map(name => ({ name, planned: limitedCopyCount(sourceCounts[name] ?? 0, rowLimit) })) });
+      tables: selection.names.map(name => ({ name, planned: limitedCopyCount(sourceCounts[name] ?? 0, limitFor(name)) })) });
     dataCopyProgress.set(target.id, tracker.progress);
-    tracker.log(`Copy started: ${sourceTotal.toLocaleString('en-US')} rows in ${selection.names.length} table(s) from ${plan.sourceSchema} into ${plan.targetSchema}${rowLimit ? ` (at most ${rowLimit.toLocaleString('en-US')} per table)` : ''}.`);
+    const stopper = new AbortController();
+    dataCopyStops.set(target.id, () => { tracker.requestStop(); stopper.abort(); });
+    tracker.log(`Copy started: ${sourceTotal.toLocaleString('en-US')} rows in ${selection.names.length} table(s) from ${plan.sourceSchema} into ${plan.targetSchema}${limitNote ? ` (${limitNote})` : ''}.`);
     // The read-only transaction only gives the preflight counts one snapshot. End it before
     // copying: holding one snapshot for the whole copy makes every later table read as of the
     // copy's start, which fails with ORA-01555 once the source has overwritten that undo.
@@ -6093,16 +6156,19 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     let truncated: string[] = [];
     let outcome: Awaited<ReturnType<typeof copyTableRows>>;
     try {
+      // A stop before truncation truncates nothing; truncation itself is never interrupted.
+      if (stopper.signal.aborted) throw new CopyStoppedError();
       if (toTruncate.length) {
         tracker.truncating(toTruncate);
         truncated = await truncateCopyTables(dst, toTruncate, selection.names);
         tracker.truncated(truncated);
       }
-      outcome = await copyTableRows(src, dst, selection.names, { rowLimit, maxTotal, onProgress: tracker.event });
+      outcome = await copyTableRows(src, dst, selection.names, { rowLimit, lobRowLimit, tableRowLimits, maxTotal, disableTriggers, onProgress: tracker.event, signal: stopper.signal, tableFilters });
     } catch (e) {
       let message = errMsg(e);
       if (/ORA-01555/.test(message)) message += ` The source could not rebuild a consistent read of this table: its undo was overwritten while the table was being read (the source has too little undo retention for this read). Retry with the source quieter, copy this table with a per-table row limit, or ask the DBA to raise UNDO_RETENTION on the source.`;
       if (/NJS-123/.test(message)) message += ` A single database call ran longer than ${TABLE_COPY_CALL_TIMEOUT_MS / 60000} minutes; check for locks on the target tables or copy the slow table with a per-table row limit.`;
+      if (!disableTriggers && /ORA-04088/.test(message)) message += ` A target trigger failed while inserting copied rows. Retry with “Disable target triggers while copying” so triggers do not run for copied rows.`;
       if (truncated.length) message += ` These tables were truncated before the copy started: ${truncated.join(', ')}.`;
       tracker.finish(message);
       throw new Error(message);
@@ -6117,7 +6183,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
         ...(src ? [(async () => { try { await src.rollback(); } finally { await src.close(); } })()] : []),
         ...(dst ? [dst.close()] : []),
       ]);
-    } finally { if (locked) activeDataCopies.delete(target.id); }
+    } finally { if (locked) { activeDataCopies.delete(target.id); dataCopyStops.delete(target.id); } }
   }
 });
 
