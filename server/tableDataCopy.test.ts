@@ -170,13 +170,14 @@ test('row limits apply to count validation and reject invalid values', () => {
   assert.deepEqual(parseCopyRowLimit(undefined), { rowLimit: null });
   assert.deepEqual(parseCopyRowLimit(500), { rowLimit: 500 });
   assert.deepEqual(parseCopyRowLimit(1_000_000), { rowLimit: 1_000_000 });
-  for (const bad of [0, -1, 1.5, '10', 1_000_001]) assert.ok('error' in parseCopyRowLimit(bad));
+  assert.deepEqual(parseCopyRowLimit(50_000_000), { rowLimit: 50_000_000 });
+  for (const bad of [0, -1, 1.5, '10', 50_000_001]) assert.ok('error' in parseCopyRowLimit(bad));
 });
 
-test('the total row limit defaults to 100,000 and is selectable up to 1,000,000', async () => {
+test('the total row limit defaults to 100,000 and is selectable up to 50,000,000', async () => {
   assert.deepEqual(parseCopyTotalLimit(undefined), { maxTotal: 100_000 });
   assert.deepEqual(parseCopyTotalLimit(1_000_000), { maxTotal: 1_000_000 });
-  for (const bad of [0, 2.5, '500', 1_000_001]) assert.ok('error' in parseCopyTotalLimit(bad));
+  for (const bad of [0, 2.5, '500', 50_000_001]) assert.ok('error' in parseCopyTotalLimit(bad));
   assert.equal(validateCopyCounts({ A: 600_000, B: 400_000 }, null, 1_000_000), 1_000_000);
   assert.throws(() => validateCopyCounts({ A: 600_000, B: 400_001 }, null, 1_000_000), /1,000,000-row limit/);
   assert.throws(() => validateCopyCounts({ A: 300 }, null, 200), /200-row limit/);
@@ -447,7 +448,7 @@ class FakeLob extends LobBase {
   override _destroy(_e: unknown, cb: (e?: Error | null) => void) { this.destroyed = true; cb(); }
 }
 
-test('small LOBs are read as text, large LOBs stream into temporary target LOBs, including retries', async () => {
+test('small LOBs are read as text; a large LOB whose row hits a missing parent is kept in a temporary LOB for the retry', async () => {
   const columns = [col('ID'), col('BODY', 'CLOB'), col('NATIONAL', 'NCLOB')];
   const big = '日本語🙂'.repeat(300000);
   const small = new FakeLob('short'), large = new FakeLob(big, oracledb.NCLOB);
@@ -464,9 +465,17 @@ test('small LOBs are read as text, large LOBs stream into temporary target LOBs,
       if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
       assert.match(sql, /^INSERT INTO "DOCS"/);
       assert.deepEqual(binds.slice(0, 2), [{ type: oracledb.STRING, val: '1' }, { type: oracledb.CLOB, val: 'short' }]);
+      if (attempts++ === 0) {
+        // First attempt writes in place: the large value is inserted empty and returned for writing.
+        assert.match(sql, /VALUES \(:1, :2, EMPTY_CLOB\(\)\) RETURNING "NATIONAL" INTO :df\$out0$/);
+        assert.deepEqual(binds[2], { dir: oracledb.BIND_OUT, type: oracledb.NCLOB });
+        assert.equal(temps.length, 0);
+        throw Object.assign(new Error('ORA-02291: parent missing'), { errorNum: 2291 });
+      }
+      // The retry binds the temporary LOB the value was saved into.
+      assert.doesNotMatch(sql, /EMPTY_CLOB/);
       assert.equal(binds[2].val, temps[0]);
       assert.equal(binds[2].type, undefined);
-      if (attempts++ === 0) throw Object.assign(new Error('ORA-02291: parent missing'), { errorNum: 2291 });
       return {};
     },
     createLob: async (type: oracledb.DbType) => { assert.equal(type, oracledb.NCLOB); const lob = new FakeLob('', type); temps.push(lob); return lob; },
@@ -730,10 +739,10 @@ test('rows are fetched and inserted in large batches, and the next batch is fetc
   assert.deepEqual(events, ['fetch', 'fetch', 'insert 5000', 'fetch', 'insert 5000', 'fetch', 'insert 2000']);
 });
 
-test('a batch mixing inline and streamed LOBs inserts the inline rows as one array and streams the rest', async () => {
+test('a batch mixing inline and large LOBs inserts the inline rows as one array and writes the rest in place', async () => {
   const columns = [col('ID'), col('BODY', 'CLOB')];
   const large = new FakeLob('x'.repeat(2_000_000));
-  const temps: FakeLob[] = [];
+  const dests: FakeLob[] = [];
   let arrayRows: unknown[][] = [], single = 0;
   const source = { execute: async (sql: string) => {
     if (sql.includes('user_tab_cols')) return { rows: columns };
@@ -746,19 +755,22 @@ test('a batch mixing inline and streamed LOBs inserts the inline rows as one arr
       if (sql.includes('user_tab_cols')) return { rows: columns };
       if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
       single++;
+      assert.match(sql, /EMPTY_CLOB\(\)\) RETURNING "BODY" INTO/);
       assert.equal(binds[0].val, '2');
-      assert.equal(binds[1].val, temps[0]);
-      return {};
+      const dest = new FakeLob(''); dests.push(dest);
+      return { outBinds: [[dest]] };
     },
-    createLob: async () => { const lob = new FakeLob(''); temps.push(lob); return lob; },
+    createLob: async () => assert.fail('large CLOBs are written in place, not through a temporary LOB'),
     executeMany: async (_sql: string, rows: unknown[][]) => { arrayRows = rows; return {}; },
     commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
   } as unknown as oracledb.Connection;
   assert.equal((await copyTableRows(source, target, ['DOCS'])).totalRows, 3);
   assert.deepEqual(arrayRows, [['1', 'a'], ['3', 'c']]);
   assert.equal(single, 1);
-  assert.equal(temps[0].written.join('').length, 2_000_000);
+  assert.equal(dests[0].written.join('').length, 2_000_000);
+  assert.ok(dests[0].written.length > 1, 'written one chunk per round trip');
   assert.equal(large.destroyed, true);
+  assert.equal(dests[0].destroyed, true);
 });
 
 test('a fetch failure while a batch is being inserted waits for the insert, then rolls back', async () => {
@@ -778,7 +790,7 @@ test('a fetch failure while a batch is being inserted waits for the insert, then
   assert.equal(closed, 1);
 });
 
-test('large LOBs are streamed one row at a time, each inserted before the next is streamed', async () => {
+test('large LOBs are copied one row at a time: each row is inserted, then its value written in place', async () => {
   const columns = [col('ID'), col('BODY', 'CLOB')];
   const lobs = [1, 2, 3].map(n => new FakeLob(String(n).repeat(1_500_000)));
   const events: string[] = [];
@@ -787,25 +799,28 @@ test('large LOBs are streamed one row at a time, each inserted before the next i
     let sent = false;
     return { resultSet: { getRows: async () => sent ? [] : (sent = true, lobs.map((lob, i) => [String(i + 1), null, lob])), close: async () => {} } };
   } } as unknown as oracledb.Connection;
-  const temps: FakeLob[] = [];
+  const dests: FakeLob[] = [];
   const target = {
     execute: async (sql: string, binds: { val: unknown }[]) => {
       if (sql.includes('user_tab_cols')) return { rows: columns };
       if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
       events.push(`insert ${binds[0].val}`);
-      return {};
+      const dest = new FakeLob('');
+      dest._write = (data, _e, cb) => { if (!dest.written.length) events.push(`write ${binds[0].val}`); dest.written.push(data as string); cb(); };
+      dests.push(dest);
+      return { outBinds: [[dest]] };
     },
-    createLob: async () => { const lob = new FakeLob(''); temps.push(lob); events.push(`stream ${temps.length}`); return lob; },
+    createLob: async () => assert.fail('large CLOBs are written in place, not through a temporary LOB'),
     executeMany: async () => assert.fail('streamed rows are inserted one by one'),
     commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
   } as unknown as oracledb.Connection;
   const progress: number[] = [];
   const result = await copyTableRows(source, target, ['DOCS'], { onProgress: e => { if (e.kind === 'rows') progress.push(e.rows); } });
   assert.equal(result.totalRows, 3);
-  assert.deepEqual(events, ['stream 1', 'insert 1', 'stream 2', 'insert 2', 'stream 3', 'insert 3']);
-  assert.deepEqual(progress, [1, 1, 1], 'progress advances with every streamed row');
-  assert.deepEqual(temps.map(t => t.written.join('').length), [1_500_000, 1_500_000, 1_500_000]);
-  assert.ok(lobs.every(lob => lob.destroyed) && temps.every(t => t.destroyed));
+  assert.deepEqual(events, ['insert 1', 'write 1', 'insert 2', 'write 2', 'insert 3', 'write 3']);
+  assert.deepEqual(progress, [1, 1, 1], 'progress advances with every large row');
+  assert.deepEqual(dests.map(t => t.written.join('').length), [1_500_000, 1_500_000, 1_500_000]);
+  assert.ok(lobs.every(lob => lob.destroyed) && dests.every(t => t.destroyed));
 });
 
 test('the CLOB/JSON row limit applies only to tables with those columns, and the smaller limit wins', () => {
@@ -914,10 +929,10 @@ test('rows chosen for a table override the per-table and CLOB/JSON limits for th
   assert.deepEqual(limits, { A: 100, B: 2500, C: 100 });
 });
 
-test('rows chosen per table must be whole numbers from 1 to 1,000,000', () => {
+test('rows chosen per table must be whole numbers from 1 to 50,000,000', () => {
   assert.deepEqual(Object.entries((parseCopyTableRowLimits(undefined) as { tableRowLimits: Record<string, number> }).tableRowLimits), []);
   assert.deepEqual({ ...(parseCopyTableRowLimits({ A: 5, B: 1_000_000 }) as { tableRowLimits: Record<string, number> }).tableRowLimits }, { A: 5, B: 1_000_000 });
-  for (const bad of [[1], 'x', { A: 0 }, { A: 1.5 }, { A: '5' }, { A: 1_000_001 }]) assert.ok('error' in parseCopyTableRowLimits(bad), JSON.stringify(bad));
+  for (const bad of [[1], 'x', { A: 0 }, { A: 1.5 }, { A: '5' }, { A: 50_000_001 }]) assert.ok('error' in parseCopyTableRowLimits(bad), JSON.stringify(bad));
 });
 
 test('WHERE filters accept read-only conditions', () => {
@@ -956,4 +971,32 @@ test('counts and copy reads apply the filter, combined with a row limit', async 
   s.source.execute = (async (sql: string, ...rest: unknown[]) => { if (!sql.includes('user_tab_cols')) queries.push(sql); return (execute as Function)(sql, ...rest); }) as typeof s.source.execute;
   await copyTableRows(s.source, s.target, ['T'], { tableFilters: { T: 'num_anio = 2026' }, tableRowLimits: { T: 5 } });
   assert.equal(queries[0], 'SELECT "ID" FROM "T" WHERE (num_anio = 2026) AND ROWNUM <= :row_limit');
+});
+
+test('large JSON values still bind through a temporary LOB, since JSON() cannot take EMPTY_CLOB()', async () => {
+  const columns = [col('ID'), col('DOC', 'JSON')];
+  const large = new FakeLob(`"${'j'.repeat(1_500_000)}"`);
+  const temps: FakeLob[] = [];
+  let inserted = 0;
+  const source = { execute: async (sql: string) => {
+    if (sql.includes('user_tab_cols')) return { rows: columns };
+    let sent = false;
+    return { resultSet: { getRows: async () => sent ? [] : (sent = true, [['1', null, large]]), close: async () => {} } };
+  } } as unknown as oracledb.Connection;
+  const target = {
+    execute: async (sql: string, binds: { val: unknown }[]) => {
+      if (sql.includes('user_tab_cols')) return { rows: columns };
+      if (sql.includes('nls_session_parameters')) return { rows: [{ VALUE: '.,' }] };
+      inserted++;
+      assert.doesNotMatch(sql, /EMPTY_CLOB|RETURNING/);
+      assert.equal(binds[1].val, temps[0]);
+      return {};
+    },
+    createLob: async () => { const lob = new FakeLob(''); temps.push(lob); return lob; },
+    executeMany: async () => assert.fail('large rows are inserted one by one'),
+    commit: async () => {}, rollback: async () => assert.fail('unexpected rollback'),
+  } as unknown as oracledb.Connection;
+  assert.equal((await copyTableRows(source, target, ['DOCS'])).totalRows, 1);
+  assert.equal(inserted, 1);
+  assert.equal(temps[0].written.join('').length, 1_500_002);
 });

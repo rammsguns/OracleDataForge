@@ -197,7 +197,7 @@ export async function countCopyRows(source: oracledb.Connection, names: string[]
 
 /**
  * Validates the rows that will actually be copied, after any per-table row limit, against the
- * chosen total limit (default 100,000; at most 1,000,000).
+ * chosen total limit (default 100,000; at most TABLE_COPY_MAX_ROWS).
  */
 export function validateCopyCounts(counts: Record<string, number>, rowLimit?: number | null | ((name: string) => number | null), maxTotal = TABLE_COPY_DEFAULT_TOTAL_ROWS) {
   const cap = maxTotal.toLocaleString('en-US');
@@ -223,29 +223,29 @@ export async function lobCopyTables(conn: oracledb.Connection): Promise<string[]
 const wholeRows = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= TABLE_COPY_MAX_ROWS;
 
-/** Accepts no limit (undefined/null) or a whole number of rows from 1 to 1,000,000. */
+/** Accepts no limit (undefined/null) or a whole number of rows from 1 to TABLE_COPY_MAX_ROWS. */
 export function parseCopyRowLimit(value: unknown): { rowLimit: number | null } | { error: string } {
   if (value === undefined || value === null) return { rowLimit: null };
-  if (!wholeRows(value)) return { error: 'Row limit per table must be a whole number from 1 to 1,000,000, or omitted to copy all rows.' };
+  if (!wholeRows(value)) return { error: `Row limit per table must be a whole number from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString('en-US')}, or omitted to copy all rows.` };
   return { rowLimit: value };
 }
 
-/** Rows chosen for individual tables: an object of table name → whole number from 1 to 1,000,000. */
+/** Rows chosen for individual tables: an object of table name → whole number from 1 to TABLE_COPY_MAX_ROWS. */
 export function parseCopyTableRowLimits(value: unknown): { tableRowLimits: Record<string, number> } | { error: string } {
   if (value === undefined || value === null) return { tableRowLimits: Object.create(null) };
   if (typeof value !== 'object' || Array.isArray(value)) return { error: 'tableRowLimits must map table names to row counts.' };
   const limits: Record<string, number> = Object.create(null);
   for (const [name, rows] of Object.entries(value)) {
-    if (!wholeRows(rows)) return { error: `Rows to copy for ${name} must be a whole number from 1 to 1,000,000.` };
+    if (!wholeRows(rows)) return { error: `Rows to copy for ${name} must be a whole number from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString('en-US')}.` };
     limits[name] = rows;
   }
   return { tableRowLimits: limits };
 }
 
-/** The total rows one copy may move: default 100,000, selectable from 1 to 1,000,000. */
+/** The total rows one copy may move: default 100,000, selectable from 1 to TABLE_COPY_MAX_ROWS. */
 export function parseCopyTotalLimit(value: unknown): { maxTotal: number } | { error: string } {
   if (value === undefined || value === null) return { maxTotal: TABLE_COPY_DEFAULT_TOTAL_ROWS };
-  if (!wholeRows(value)) return { error: 'Total row limit must be a whole number from 1 to 1,000,000.' };
+  if (!wholeRows(value)) return { error: `Total row limit must be a whole number from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString('en-US')}.` };
   return { maxTotal: value };
 }
 
@@ -336,6 +336,8 @@ export async function truncateCopyTables(target: oracledb.Connection, tables: st
  * - Rows move in large batches, and the next batch is fetched while the current one is inserted.
  */
 export interface CopyTrigger { name: string; table: string }
+/** Pieces of a table's INSERT, so large CLOB/NCLOB values can be inserted as EMPTY_CLOB() and written in place. */
+interface DirectLobInsert { into: string; values: string[]; columns: string[]; writable: boolean[] }
 /** Enabled triggers, owned by the target schema, on the given tables. */
 export async function enabledCopyTriggers(target: oracledb.Connection, names: string[]): Promise<CopyTrigger[]> {
   const wanted = new Set(names);
@@ -356,7 +358,8 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
   const maxTotal = options.maxTotal ?? TABLE_COPY_DEFAULT_TOTAL_ROWS;
   let total = 0;
   // `rowErrors` holds the Oracle message for each failed row (same order as `rows`), when known.
-  type Pending = { name: string; sql: string; rows: unknown[][]; error: string; bytes: number; types?: oracledb.DbType[]; rowErrors?: string[] };
+  // `direct` builds the insert that writes large CLOB/NCLOB values straight into the new row.
+  type Pending = { name: string; sql: string; rows: unknown[][]; error: string; bytes: number; types?: oracledb.DbType[]; rowErrors?: string[]; direct?: DirectLobInsert };
   let pending: Pending[] = [];
   const committed: Record<string, number> = Object.create(null);
   let uncommitted: Record<string, number> = Object.create(null);
@@ -420,15 +423,40 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     const failed: unknown[][] = [];
     const rowErrors: string[] = [];
     let error = '';
+    const bind = (val: unknown, i: number) => isLob(val) || !batch.types ? { val } : { type: batch.types[i], val };
     for (const row of batch.rows) {
+      // Large CLOB/NCLOB values are written straight into the inserted row's own LOB, one chunk
+      // per round trip. Binding a temporary LOB instead makes the INSERT copy the whole value
+      // server-side in a single call, which for big values outlasts the call timeout (NJS-123).
+      // JSON values (bound through JSON()) still go through a temporary LOB.
+      const direct = batch.direct ? row.flatMap((val, i) => isLob(val) && sourceLobs.has(val) && batch.direct!.writable[i] ? [i] : []) : [];
       // Retries reuse the temporary target LOB streamed on the first attempt.
-      for (let i = 0; i < row.length; i++) if (isLob(row[i]) && sourceLobs.has(row[i] as oracledb.Lob)) row[i] = await streamLob(row[i] as oracledb.Lob);
+      for (let i = 0; i < row.length; i++) if (!direct.includes(i) && isLob(row[i]) && sourceLobs.has(row[i] as oracledb.Lob)) row[i] = await streamLob(row[i] as oracledb.Lob);
       try {
-        await target.execute(batch.sql, row.map((val, i) => isLob(val) || !batch.types ? { val } : { type: batch.types[i], val }) as oracledb.BindParameters, { autoCommit: false });
+        if (direct.length) {
+          const { into, values, columns } = batch.direct!;
+          const sql = `${into} VALUES (${values.map((v, i) => direct.includes(i) ? 'EMPTY_CLOB()' : v).join(', ')}) RETURNING ${direct.map(i => columns[i]).join(', ')} INTO ${direct.map((_, k) => `:df$out${k}`).join(', ')}`;
+          const binds = [...row.flatMap((val, i) => direct.includes(i) ? [] : [bind(val, i)]),
+            ...direct.map(i => ({ dir: oracledb.BIND_OUT, type: (row[i] as oracledb.Lob).type }))];
+          const result = await target.execute(sql, binds as oracledb.BindParameters, { autoCommit: false });
+          const outs = (result.outBinds ?? []) as unknown[];
+          for (let k = 0; k < direct.length; k++) {
+            const dest = (Array.isArray(outs[k]) ? (outs[k] as unknown[])[0] : outs[k]) as oracledb.Lob | undefined;
+            if (!isLob(dest)) throw new Error('the inserted row returned no LOB locator to write into.');
+            const value = row[direct[k]] as oracledb.Lob;
+            sourceLobs.delete(value);
+            row[direct[k]] = null;
+            try { await copyLob(value, dest); } finally { dest.destroy(); }
+          }
+        } else {
+          await target.execute(batch.sql, row.map(bind) as oracledb.BindParameters, { autoCommit: false });
+        }
         note(batch.name, 1);
         release([row]);
       } catch (e) {
         if (oracleErrorNumber(e as Error) !== 2291) throw new Error(`${batch.name}: ${(e as Error).message}`);
+        // Nothing was written; keep the values in temporary target LOBs for the retry.
+        for (const i of direct) if (isLob(row[i]) && sourceLobs.has(row[i] as oracledb.Lob)) row[i] = await streamLob(row[i] as oracledb.Lob);
         failed.push(row);
         error = (e as Error).message;
         rowErrors.push(error);
@@ -573,6 +601,11 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
     sourceLobs.delete(lob);
     const copy: oracledb.Lob = await target.createLob(lob.type as oracledb.DbType);
     tempLobs.add(copy);
+    await copyLob(lob, copy);
+    return copy;
+  };
+  /** Copy a source LOB into a target LOB chunk by chunk, reading the next chunk while writing this one. Destroys the source. */
+  const copyLob = async (lob: oracledb.Lob, copy: oracledb.Lob): Promise<void> => {
     const write = (text: string) => new Promise<void>((resolve, reject) => copy.write(text, e => e ? reject(e) : resolve()));
     const read = (offset: number) => offset <= lob.length ? lob.getData(offset, LOB_CHUNK_CHARS) as Promise<string | null> : Promise.resolve(null);
     let ahead = read(1);
@@ -596,7 +629,6 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       await ahead.catch(() => {});
       lob.destroy();
     }
-    return copy;
   };
   try {
     checkStop();
@@ -683,7 +715,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
       emit({ kind: 'table', name });
       const cols = columns.map(quoteCopyName).join(', ');
       const projection = columns.map(c => jsonColumns.has(c) ? `JSON_SERIALIZE(${quoteCopyName(c)} RETURNING CLOB EXTENDED ERROR ON ERROR) AS ${quoteCopyName(c)}` : timestampColumns.has(c) ? `TO_CHAR(${quoteCopyName(c)}, '${timestampFormat}') AS ${quoteCopyName(c)}` : zonedColumns.has(c) ? `TO_CHAR(${zonedColumns.get(c) ? `CAST(${quoteCopyName(c)} AS TIMESTAMP WITH TIME ZONE)` : quoteCopyName(c)}, '${timestampTzFormat}') AS ${quoteCopyName(c)}` : quoteCopyName(c)).join(', ');
-      const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : zonedColumns.has(c) ? `TO_TIMESTAMP_TZ(:${i + 1}, '${timestampTzFormat}')` : `:${i + 1}`).join(', ');
+      const values = columns.map((c, i) => jsonColumns.has(c) ? `JSON(:${i + 1} EXTENDED)` : timestampColumns.has(c) ? `TO_TIMESTAMP(:${i + 1}, '${timestampFormat}')` : zonedColumns.has(c) ? `TO_TIMESTAMP_TZ(:${i + 1}, '${timestampTzFormat}')` : `:${i + 1}`);
       const identityIndexes = identities.filter(id => id.name === name).map(id => columns.indexOf(id.column));
       // CLOB/NCLOB/JSON values arrive in two columns: values up to INLINE_LOB_CHARS come back as
       // text with the rest of the row, so LOB tables still copy in batches without a round trip
@@ -705,7 +737,8 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
         },
       });
       const cursor = query.resultSet!;
-      const statement = `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values})`;
+      const statement = `INSERT INTO ${quoteCopyName(name)} (${cols}) VALUES (${values.join(', ')})`;
+      const direct: DirectLobInsert | undefined = lobIndexes.length ? { into: `INSERT INTO ${quoteCopyName(name)} (${cols})`, values, columns: columns.map(quoteCopyName), writable: columns.map((c, i) => lobIndexes.includes(i) && !jsonColumns.has(c)) } : undefined;
       const fetchBatch = async () => {
         const rows = await cursor.getRows(batchRows);
         for (const row of rows) {
@@ -735,7 +768,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
             throw new Error(`${name}: source identity values cannot be null; generating replacement IDs would change relationships.`);
           }
           total += rows.length;
-          if (total > maxTotal) throw new Error(`Copy exceeds the ${maxTotal.toLocaleString('en-US')}-row limit. Raise the total row limit (up to 1,000,000) or use a bulk migration tool for larger copies.`);
+          if (total > maxTotal) throw new Error(`Copy exceeds the ${maxTotal.toLocaleString('en-US')}-row limit. Raise the total row limit (up to ${TABLE_COPY_MAX_ROWS.toLocaleString('en-US')}) or use a bulk migration tool for larger copies.`);
           // Guard: NUMBER columns must arrive as text. A JS number here would already be rounded.
           if (rows.some(row => numberIndexes.some(i => typeof row[i] === 'number' && (!Number.isFinite(row[i] as number) || (Number.isInteger(row[i]) && !Number.isSafeInteger(row[i] as number)))))) {
             throw new Error('A numeric value exceeds JavaScript’s safe range. Use a database-native migration to preserve its precision.');
@@ -743,7 +776,7 @@ export async function copyTableRows(source: oracledb.Connection, target: oracled
           if (decimal !== '.') {
             for (const row of rows) for (const i of numberIndexes) if (typeof row[i] === 'string') row[i] = (row[i] as string).replace('.', decimal);
           }
-          const failed = await triage(await insert({ name, sql: statement, rows, error: '', bytes: 0, types }));
+          const failed = await triage(await insert({ name, sql: statement, rows, error: '', bytes: 0, types, direct }));
           if (failed) {
             emit({ kind: 'deferred', name, rows: failed.rows.length, waitingFor: [...new Set(failed.rows.map((_, i) => describeBlocker(failed.rowErrors?.[i] ?? failed.error)).filter((d): d is string => !!d))] });
             pending.push(failed);

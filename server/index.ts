@@ -2,7 +2,7 @@ import { readPerformanceResources, type ResourceReport } from "./performanceReso
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
 import { copyTableRows, CopyStoppedError, copyFilterError, parseCopyTableFilters, countCopyRows, lobCopyTables, enabledCopyTriggers, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTableRowLimits, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
-import { copyRowLimitFor, limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
+import { copyRowLimitFor, limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_ROWS, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
 import { createCopyProgress, type CopyProgress } from '../src/utils/tableDataProgress.ts';
 import { WorksheetSessions } from "./worksheetSessions.ts";
 import { readDbmsOutput, withDbmsOutput, type DbmsOutput } from "./dbmsOutput.ts";
@@ -6071,7 +6071,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     if ('error' in limit) return res.status(400).json({ error: limit.error });
     const { rowLimit } = limit;
     const lobLimit = parseCopyRowLimit(req.body.lobRowLimit);
-    if ('error' in lobLimit) return res.status(400).json({ error: 'Row limit for tables with CLOB, NCLOB or JSON columns must be a whole number from 1 to 1,000,000, or omitted.' });
+    if ('error' in lobLimit) return res.status(400).json({ error: `Row limit for tables with CLOB, NCLOB or JSON columns must be a whole number from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString('en-US')}, or omitted.` });
     const lobRowLimit = lobLimit.rowLimit;
     const chosen = parseCopyTableRowLimits(req.body.tableRowLimits);
     if ('error' in chosen) return res.status(400).json({ error: chosen.error });
