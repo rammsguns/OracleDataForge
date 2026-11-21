@@ -322,7 +322,8 @@ export async function truncateCopyTables(target: oracledb.Connection, tables: st
 /**
  * Copies tables in the given order, which must be dependency order (parents first), and
  * COMMITS EACH TABLE as soon as its rows are inserted, so undo only has to hold one table.
- * Callers must only pass tables that are empty in the target.
+ * Tables are normally empty in the target; a table that keeps its rows gets the copied rows on
+ * top, and a copied row with an existing key stops the copy like any other duplicate.
  *
  * - Rows rejected for a missing parent key (ORA-02291) are kept in memory and retried after
  *   every table, so self-references and cycles resolve once their parents arrive. Rows whose
