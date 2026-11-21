@@ -6,9 +6,6 @@ import { countInRange, parseCountBound, sameRowCount, sortTableNames, tableNameM
 import { useStudio } from '../state/store';
 import { Btn, Spinner } from './ui';
 
-/** Tables with more source rows than this offer a WHERE filter. */
-const FILTER_MIN_ROWS = 100000;
-
 export default function TableDataCopy({ sourceId, targetId }: { sourceId: string; targetId: string }) {
   const s = useStudio();
   const [plan, setPlan] = useState<Awaited<ReturnType<typeof api.tableDataPlan>> | null>(null);
@@ -94,9 +91,15 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     requestAnimationFrame(() => { const at = before.length + insert.length; input?.focus(); input?.setSelectionRange(at, at); });
   };
   const without = <T,>(record: Record<string, T>, name: string) => { const next = { ...record }; delete next[name]; return next; };
+  /** The table's filter was changed or removed by hand: it no longer follows the condition for all tables. */
+  const detachFromAll = (name: string, cleared: boolean) => setAllFilter(prev => prev && {
+    ...prev, applied: prev.applied.filter(n => n !== name), failed: prev.failed.filter(n => n !== name),
+    cleared: cleared ? [...prev.cleared.filter(n => n !== name), name] : prev.cleared.filter(n => n !== name),
+  });
   const clearFilter = (name: string) => {
     setAppliedFilters(prev => without(prev, name)); setFilterText(prev => without(prev, name));
     setFilterErrors(prev => without(prev, name)); setFilterOpen(prev => without(prev, name));
+    detachFromAll(name, true);
   };
   const applyFilter = async (name: string) => {
     const where = (filterText[name] ?? '').trim();
@@ -105,8 +108,76 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     try {
       const { count } = await api.countTableDataFilter(targetId, sourceId, name, where);
       setAppliedFilters(prev => ({ ...prev, [name]: { where, count } }));
+      detachFromAll(name, false);
     } catch (e) { setFilterErrors(prev => ({ ...prev, [name]: (e as Error).message })); }
     finally { setFilterBusy(null); }
+  };
+  // One WHERE condition for every selected table. Applying it checks and counts it on each table
+  // and stores it as that table's filter; a table's own filter is kept instead. Tables without
+  // the columns it names (ORA-00904) are listed and copied without a filter.
+  const [allWhere, setAllWhere] = useState('');
+  const [allFilter, setAllFilter] = useState<{ where: string; applied: string[]; skipped: string[]; failed: string[]; cleared: string[] } | null>(null);
+  const [allProgress, setAllProgress] = useState<{ done: number; total: number } | null>(null);
+  const globalSet = useMemo(() => new Set(allFilter?.applied ?? []), [allFilter]);
+  const ownFilter = (name: string) => !!appliedFilters[name] && !globalSet.has(name);
+  const clearAllFilter = () => {
+    const applied = allFilter?.applied ?? [];
+    const failed = allFilter?.failed ?? [];
+    setAppliedFilters(prev => { const next = { ...prev }; for (const n of applied) delete next[n]; return next; });
+    setFilterText(prev => { const next = { ...prev }; for (const n of [...applied, ...failed]) if (!ownFilter(n)) delete next[n]; return next; });
+    setFilterErrors(prev => { const next = { ...prev }; for (const n of failed) delete next[n]; return next; });
+    setAllFilter(null);
+  };
+  const applyAllFilter = async (tables: string[]) => {
+    const where = allWhere.trim();
+    if (!where) { clearAllFilter(); return; }
+    // Re-applying replaces the previous condition on the tables it was applied to.
+    const targets = tables.filter(name => !ownFilter(name));
+    const applied: string[] = [], skipped: string[] = [], failed: string[] = [];
+    const counts: Record<string, number> = {}, errors: Record<string, string> = {};
+    setFilterBusy('*'); setAllProgress({ done: 0, total: targets.length });
+    let next = 0, done = 0;
+    const worker = async () => {
+      while (next < targets.length) {
+        const name = targets[next++];
+        try { counts[name] = (await api.countTableDataFilter(targetId, sourceId, name, where)).count; applied.push(name); }
+        catch (e) {
+          const message = (e as Error).message;
+          // A syntax problem is the same for every table: no need to ask each one.
+          if (!/ORA-|NJS-|took longer/.test(message)) { next = targets.length; errors['*'] = message; }
+          else if (/ORA-00904/.test(message)) skipped.push(name);
+          else { failed.push(name); errors[name] = message; }
+        }
+        setAllProgress({ done: ++done, total: targets.length });
+      }
+    };
+    try { await Promise.all(Array.from({ length: Math.min(4, targets.length) }, worker)); }
+    finally { setFilterBusy(null); setAllProgress(null); }
+    if (errors['*']) { setError(`WHERE for all tables: ${errors['*']}`); return; }
+    setError('');
+    const previous = allFilter;
+    setAppliedFilters(prev => {
+      const nextFilters = { ...prev };
+      for (const n of previous?.applied ?? []) delete nextFilters[n];
+      for (const n of applied) nextFilters[n] = { where, count: counts[n] };
+      return nextFilters;
+    });
+    setFilterText(prev => {
+      const nextText = { ...prev };
+      for (const n of [...(previous?.applied ?? []), ...(previous?.failed ?? [])]) if (!ownFilter(n)) delete nextText[n];
+      for (const n of [...applied, ...failed]) nextText[n] = where;
+      return nextText;
+    });
+    // A table the condition failed on keeps it as an unapplied filter, which blocks the copy until fixed or cleared.
+    setFilterErrors(prev => {
+      const nextErrors = { ...prev };
+      for (const n of previous?.failed ?? []) delete nextErrors[n];
+      for (const n of failed) nextErrors[n] = errors[n];
+      return nextErrors;
+    });
+    if (failed.length) setFilterOpen(prev => ({ ...prev, ...Object.fromEntries(failed.map(n => [n, true])) }));
+    const order = (list: string[]) => tables.filter(n => list.includes(n));
+    setAllFilter({ where, applied: order(applied), skipped: order(skipped), failed: order(failed), cleared: [] });
   };
   /** Typed but not applied (or changed since): the copy would not use what is shown. */
   const filterPending = (name: string) => (filterText[name] ?? '').trim() !== (appliedFilters[name]?.where ?? '');
@@ -115,7 +186,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const rowsFor = (name: string) => limitedCopyCount(baseCount(name) ?? 0, limitFor(name));
   const read = async () => {
     setBusy(true); setError(''); setResult(null); setPlan(null); setRoots([]); setTableRowsText({});
-    setFilterOpen({}); setFilterText({}); setAppliedFilters({}); setFilterErrors({}); setFilterColumns({});
+    setFilterOpen({}); setFilterText({}); setAppliedFilters({}); setFilterErrors({}); setFilterColumns({}); setAllFilter(null);
     try { setPlan(await api.tableDataPlan(targetId, sourceId)); }
     catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -202,12 +273,17 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const selectionFull = names.length >= Math.min(TABLE_COPY_MAX_TABLES, selectableNames.length);
   const invalidTableRows = names.filter(name => (tableRowsText[name] ?? '').trim() && !tableRowsValid(tableRowsText[name]));
   const unappliedFilters = names.filter(filterPending);
+  // Tables selected after the condition for all tables was applied have not been checked yet.
+  const allUnchecked = allFilter ? names.filter(n => !globalSet.has(n) && !allFilter.skipped.includes(n) && !allFilter.failed.includes(n) && !allFilter.cleared.includes(n) && !ownFilter(n)) : [];
+  const allWherePending = allWhere.trim() !== (allFilter?.where ?? '');
   const copyDisabledReason = busy ? 'An operation is running.'
     : blocked ? 'Choose a different, writable target schema.'
     : !totalLimitValid ? `Enter a total row limit from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString()}.`
     : !rowLimitValid ? `Enter a row limit from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString()}.`
     : !lobRowLimitValid ? `Enter a row limit for CLOB/JSON tables from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString()}.`
     : filterBusy ? 'Checking a filter…'
+    : allWherePending ? 'Apply or clear the WHERE condition for all tables.'
+    : allUnchecked.length ? `Apply the WHERE condition for all tables again; it hasn’t been checked on: ${allUnchecked.join(', ')}.`
     : unappliedFilters.length ? `Apply or clear the filter for: ${unappliedFilters.join(', ')}.`
     : invalidTableRows.length ? `Enter rows to copy from 1 to ${TABLE_COPY_MAX_ROWS.toLocaleString()} (or leave empty) for: ${invalidTableRows.join(', ')}.`
     : !names.length ? 'Select at least one table to copy.'
@@ -217,7 +293,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     : '';
   return <div className="space-y-3 text-[12px]">
     <p className="text-soft">Copy table rows from the source connection’s schema to the target connection’s schema. Create missing tables with Copy objects first.</p>
-    <p className="text-mute">Data is copied only into empty target tables. Tables that already contain rows can’t be selected unless you choose to truncate them first. Duplicate keys or incompatible columns stop the copy. Required parent tables are selected automatically and copied first. Up to {TABLE_COPY_MAX_TABLES.toLocaleString()} tables per copy, with a total row limit you choose (default 100,000, up to 1,000,000) — set a row limit per table to copy a sample of larger tables; Text, numbers, dates, timestamps (including WITH TIME ZONE and WITH LOCAL TIME ZONE), RAW, ROWID, UROWID, VECTOR, JSON, CLOB, and NCLOB columns are supported. Large CLOB, NCLOB and JSON values are streamed in chunks, so they have no size limit. Identity columns retain source IDs; GENERATED ALWAYS is temporarily changed to BY DEFAULT and restored after copying; BLOB and BFILE columns require a custom migration.</p>
+    <p className="text-mute">Data is copied only into empty target tables. Tables that already contain rows can’t be selected unless you choose to truncate them first. Duplicate keys or incompatible columns stop the copy. Required parent tables are selected automatically and copied first. Up to {TABLE_COPY_MAX_TABLES.toLocaleString()} tables per copy, with a total row limit you choose (default 100,000, up to {TABLE_COPY_MAX_ROWS.toLocaleString()}) — set a row limit per table to copy a sample of larger tables; Text, numbers, dates, timestamps (including WITH TIME ZONE and WITH LOCAL TIME ZONE), RAW, ROWID, UROWID, VECTOR, JSON, CLOB, and NCLOB columns are supported. Large CLOB, NCLOB and JSON values are streamed in chunks, so they have no size limit. Identity columns retain source IDs; GENERATED ALWAYS is temporarily changed to BY DEFAULT and restored after copying; BLOB and BFILE columns require a custom migration.</p>
     <p className="text-warn">Each table is committed as soon as its rows are inserted, in a separate session, so undo only holds one table at a time. If a table fails it is rolled back, but tables committed before it keep their rows; empty them before retrying. Worksheet Commit/Rollback does not apply.</p>
     <p className="text-warn">Identity sequences are synchronized after copying. Pause other target writes during copying. If interrupted, identity settings may need repair. Target triggers run on attempts, including retries, unless you disable them below.</p>
     <Btn variant="outline" disabled={busy || !sourceId || !targetId || sourceId === targetId} onClick={() => void read()}>Read tables</Btn>
@@ -238,7 +314,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
           <input type="number" min={1} max={TABLE_COPY_MAX_ROWS} step={1} value={totalLimitText} disabled={busy} aria-label="Total row limit for this copy"
             onChange={e => setTotalLimitText(e.target.value)} className={`w-32 rounded border bg-panel px-2 py-1 font-mono ${totalLimitValid ? 'border-bdr' : 'border-err'}`} />
         </label>
-        {[100000, 250000, 500000, TABLE_COPY_MAX_ROWS].map(n => <Btn key={n} variant="outline" disabled={busy || maxTotal === n} onClick={() => setTotalLimitText(String(n))}>{n >= 1000000 ? `${n / 1000000}M` : `${n / 1000}K`}</Btn>)}
+        {[100000, 500000, 1000000, 10000000, TABLE_COPY_MAX_ROWS].map(n => <Btn key={n} variant="outline" disabled={busy || maxTotal === n} onClick={() => setTotalLimitText(String(n))}>{n >= 1000000 ? `${n / 1000000}M` : `${n / 1000}K`}</Btn>)}
         <span className="text-mute">max {TABLE_COPY_MAX_ROWS.toLocaleString()}</span>
       </div>
       {maxTotal > TABLE_COPY_DEFAULT_TOTAL_ROWS && <p className="text-warn">Large copies can take several minutes; keep this tab open. Each table commits separately, so the largest single table sets how much undo space is needed.</p>}
@@ -276,6 +352,27 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
           <span className="text-mute">rows per table{rowLimit ? ' (the smaller of the two limits applies)' : ''}</span>
         </>}
         {!!lobTables.size && <span className="text-mute">{lobTables.size} source table(s) have CLOB, NCLOB or JSON columns</span>}
+      </div>
+      <div className="space-y-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <label htmlFor="copy-all-where">WHERE for all selected tables</label>
+          <input id="copy-all-where" type="text" value={allWhere} placeholder="num_anio = 2026" maxLength={2000} disabled={busy || !!filterBusy}
+            onChange={e => setAllWhere(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && names.length) { e.preventDefault(); void applyAllFilter(names); } }}
+            className={`flex-1 min-w-48 max-w-xl rounded border bg-panel px-1.5 py-0.5 font-mono ${allWherePending ? 'border-warn' : 'border-bdr'}`} />
+          <Btn variant="outline" disabled={busy || !!filterBusy || !allWhere.trim() || !names.length} onClick={() => void applyAllFilter(names)}
+            title="Check the condition on every selected table and copy only the rows it matches">
+            {allProgress ? `Checking ${allProgress.done}/${allProgress.total}…` : `Apply to ${names.length} table(s)`}</Btn>
+          {(allFilter || allWhere) && <Btn variant="outline" disabled={busy || !!filterBusy} onClick={() => { clearAllFilter(); setAllWhere(''); }}>Clear</Btn>}
+        </div>
+        <p className="text-mute">Copies only the rows matching this condition from each selected table. A table’s own filter is kept instead. Tables that don’t have the columns it names are copied without a filter.</p>
+        {allFilter && <div className="space-y-0.5">
+          <p className="text-soft">WHERE {allFilter.where} — applied to {allFilter.applied.length} table(s){allFilter.applied.length ? `, ${allFilter.applied.reduce((n, t) => n + (appliedFilters[t]?.count ?? 0), 0).toLocaleString()} matching rows` : ''}.</p>
+          {!allFilter.applied.length && !!allFilter.skipped.length && !allFilter.failed.length && <p className="text-err">None of the selected tables has the columns this condition names. Check the column names.</p>}
+          {!!allFilter.skipped.length && <p className="text-warn">No matching columns, copied without a filter: {allFilter.skipped.join(', ')}.</p>}
+          {!!allFilter.cleared.length && <p className="text-mute">Filter removed by hand, copied in full: {allFilter.cleared.join(', ')}.</p>}
+          {!!allFilter.failed.length && <p className="text-err">The condition failed on: {allFilter.failed.join(', ')}. Fix or clear their filters below.</p>}
+          {Object.keys(appliedFilters).some(ownFilter) && <p className="text-mute">Kept their own filter: {names.filter(ownFilter).join(', ')}.</p>}
+        </div>}
       </div>
       {(rowLimit || lobRowLimit || Object.keys(tableRowLimits).length > 0) && <p className="text-warn">Sampled child rows whose parent rows were not sampled are skipped and reported, so foreign keys stay valid.</p>}
       <div className="sticky top-0 z-10 flex items-center gap-3 flex-wrap rounded-md border border-bdr bg-panel p-3 shadow-md">
@@ -343,7 +440,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
             onChange={e => { const text = e.target.value; setTableRowsText(prev => { const next = { ...prev }; if (text) next[table.name] = text; else delete next[table.name]; return next; }); }}
             className={`w-24 rounded border bg-panel px-1.5 py-0.5 font-mono ${!(tableRowsText[table.name] ?? '').trim() || tableRowsValid(tableRowsText[table.name]) ? 'border-bdr' : 'border-err'}`} />}
           <span className={rowsFor(table.name) > maxTotal ? 'text-err' : 'text-mute'}>{plan.sourceCounts[table.name] === undefined ? 'Count unavailable — blocked' : plan.sourceCounts[table.name].toLocaleString() + ' source rows' + (appliedFilters[table.name] ? ` · ${appliedFilters[table.name].count.toLocaleString()} match the filter` : '') + (rowsFor(table.name) < (baseCount(table.name) ?? 0) ? ` → ${rowsFor(table.name).toLocaleString()} copied` : '')}</span>
-          {table.existsInTarget && ((plan.sourceCounts[table.name] ?? 0) > FILTER_MIN_ROWS || appliedFilters[table.name] || filterOpen[table.name]) && <Btn variant="outline"
+          {table.existsInTarget && <Btn variant="outline"
             onClick={() => { if (!filterOpen[table.name]) void loadFilterColumns(table.name); setFilterOpen(prev => ({ ...prev, [table.name]: !prev[table.name] })); }} title="Copy only the rows that match a WHERE condition">
             {appliedFilters[table.name] ? 'WHERE ✓' : 'Filter'}</Btn>}
           {table.existsInTarget && <span className="text-mute">· {plan.targetCounts?.[table.name] === undefined ? 'target count unavailable' : plan.targetCounts[table.name].toLocaleString() + ' target rows'}</span>}
