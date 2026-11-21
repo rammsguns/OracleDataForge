@@ -93,3 +93,28 @@ test('when truncating, child tables with rows that reference a truncated table a
   // A child that is not available (for example missing from the source) stays a blocker.
   assert.deepEqual(tableDataSelection(['POLIZA'], ['POLIZA'], deps, { truncateOccupied: occupied }).names, ['POLIZA']);
 });
+
+test('a table keeping its rows is copied when chosen, in parent-first order', () => {
+  const deps = [fk('ITEMS', 'ORDERS')];
+  const keepRows = new Set(['ORDERS']);
+  assert.deepEqual(tableDataSelection(['ITEMS', 'ORDERS'], ['ITEMS', 'ORDERS'], deps, { keepRows }).names, ['ORDERS', 'ITEMS']);
+  assert.deepEqual(tableDataSelection(['ORDERS'], ['ITEMS', 'ORDERS'], deps, { keepRows }).names, ['ORDERS']);
+});
+
+test('a table keeping its rows is never auto-added: as a parent its existing rows are used', () => {
+  const r = tableDataSelection(['ITEMS'], ['ITEMS', 'ORDERS'], [fk('ITEMS', 'ORDERS')], { keepRows: new Set(['ORDERS']) });
+  assert.deepEqual(r.names, ['ITEMS']);
+  assert.deepEqual(r.added, []);
+});
+
+test('a table keeping its rows is not truncated, nor added as a child of a truncated table', () => {
+  const deps = [fk('ITEMS', 'ORDERS')];
+  const occupied = new Set(['ITEMS', 'ORDERS']);
+  // Truncating ORDERS normally pulls in its filled child ITEMS; a kept ITEMS stays out.
+  assert.deepEqual(tableDataSelection(['ORDERS'], ['ITEMS', 'ORDERS'], deps, { truncateOccupied: occupied }).names, ['ORDERS', 'ITEMS']);
+  const r = tableDataSelection(['ORDERS'], ['ITEMS', 'ORDERS'], deps, { truncateOccupied: occupied, keepRows: new Set(['ITEMS']) });
+  assert.deepEqual(r.names, ['ORDERS']);
+  assert.deepEqual(r.addedChildren, []);
+  // A kept parent with truncation on is still only copied when chosen.
+  assert.deepEqual(tableDataSelection(['ITEMS'], ['ITEMS', 'ORDERS'], deps, { truncateOccupied: occupied, keepRows: new Set(['ORDERS']) }).names, ['ITEMS']);
+});

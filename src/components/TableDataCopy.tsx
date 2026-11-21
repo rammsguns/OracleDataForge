@@ -31,6 +31,8 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const [limitRows, setLimitRows] = useState(false);
   const [truncate, setTruncate] = useState(false);
   const [disableTriggers, setDisableTriggers] = useState(false);
+  // Target tables that already have rows and get the copied rows on top, without truncation. Off by default.
+  const [keepRows, setKeepRows] = useState<Set<string>>(new Set());
   const [rowLimitText, setRowLimitText] = useState('1000');
   const parsedLimit = Number(rowLimitText);
   const rowLimitValid = !limitRows || (Number.isSafeInteger(parsedLimit) && parsedLimit >= 1 && parsedLimit <= TABLE_COPY_MAX_ROWS);
@@ -186,7 +188,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const rowsFor = (name: string) => limitedCopyCount(baseCount(name) ?? 0, limitFor(name));
   const read = async () => {
     setBusy(true); setError(''); setResult(null); setPlan(null); setRoots([]); setTableRowsText({});
-    setFilterOpen({}); setFilterText({}); setAppliedFilters({}); setFilterErrors({}); setFilterColumns({}); setAllFilter(null);
+    setFilterOpen({}); setFilterText({}); setAppliedFilters({}); setFilterErrors({}); setFilterColumns({}); setAllFilter(null); setKeepRows(new Set());
     try { setPlan(await api.tableDataPlan(targetId, sourceId)); }
     catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -196,12 +198,13 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     if (confirmed) setCopying(true);
     try {
       const outcome = await api.copyTableData(targetId, sourceId, names, confirmed, rowLimit, maxTotal, truncate, lobRowLimit, disableTriggers, Object.fromEntries(Object.entries(tableRowLimits).filter(([name]) => nameSet.has(name))),
-        Object.fromEntries(Object.entries(appliedFilters).filter(([name]) => nameSet.has(name)).map(([name, f]) => [name, f.where])));
+        Object.fromEntries(Object.entries(appliedFilters).filter(([name]) => nameSet.has(name)).map(([name, f]) => [name, f.where])),
+        names.filter(name => keptSet.has(name)));
       setResult(outcome); setRoots([]);
       // The copied tables now contain rows, so they can no longer be copied into.
       // Copies only go into empty or truncated tables, so each copied table now holds exactly its copied rows.
       setPlan(prev => prev ? { ...prev, targetOccupied: [...new Set([...prev.targetOccupied.filter(n => !outcome.truncated?.includes(n)), ...outcome.tables.filter(t => t.rows > 0).map(t => t.name)])],
-        targetCounts: { ...prev.targetCounts, ...Object.fromEntries((outcome.truncated ?? []).map(n => [n, 0])), ...Object.fromEntries(outcome.tables.map(t => [t.name, t.rows])) } } : prev);
+        targetCounts: { ...prev.targetCounts, ...Object.fromEntries((outcome.truncated ?? []).map(n => [n, 0])), ...Object.fromEntries(outcome.tables.map(t => [t.name, (outcome.kept?.includes(t.name) ? prev.targetCounts?.[t.name] ?? 0 : 0) + t.rows])) } } : prev);
       if (s.activeConnId === targetId) s.bumpSchema();
       s.toast(outcome.skippedRows ? 'warning' : 'success', `${outcome.totalRows.toLocaleString()} rows copied${outcome.skippedRows ? ` (${outcome.skippedRows.toLocaleString()} skipped)` : ''}`);
     } catch (e) {
@@ -223,12 +226,21 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
   const occupiedSet = useMemo(() => new Set(plan?.targetOccupied ?? []), [plan?.targetOccupied]);
   // Only empty target tables can receive data, unless they are truncated first. Without
   // truncation, a filled parent is not copied: its rows are used.
-  const eligibleNames = useMemo(() => plan?.items.filter(table => table.existsInTarget && (truncate || !occupiedSet.has(table.name))).map(table => table.name) ?? [], [plan?.items, occupiedSet, truncate]);
+  // Only tables that have rows can keep them; the setting means nothing for an empty table.
+  const keptSet = useMemo(() => new Set([...keepRows].filter(n => occupiedSet.has(n))), [keepRows, occupiedSet]);
+  const keepCandidates = useMemo(() => plan?.items.filter(t => t.existsInTarget && occupiedSet.has(t.name)).map(t => t.name) ?? [], [plan?.items, occupiedSet]);
+  const eligibleNames = useMemo(() => plan?.items.filter(table => table.existsInTarget && (truncate || !occupiedSet.has(table.name) || keptSet.has(table.name))).map(table => table.name) ?? [], [plan?.items, occupiedSet, truncate, keptSet]);
   const dependencyIndex = useMemo(() => indexTableDependencies(plan?.dependencies ?? []), [plan?.dependencies]);
-  const selection = useMemo(() => tableDataSelection(roots, eligibleNames, dependencyIndex, truncate ? { truncateOccupied: occupiedSet } : {}), [roots, eligibleNames, dependencyIndex, truncate, occupiedSet]);
+  const selection = useMemo(() => tableDataSelection(roots, eligibleNames, dependencyIndex, { ...(truncate ? { truncateOccupied: occupiedSet } : {}), keepRows: keptSet }), [roots, eligibleNames, dependencyIndex, truncate, occupiedSet, keptSet]);
+  /** Turning "keep rows" off for a filled table deselects it unless truncation can take over. */
+  const setKeep = (tables: string[], on: boolean) => {
+    setKeepRows(prev => { const next = new Set(prev); for (const n of tables) if (on) next.add(n); else next.delete(n); return next; });
+    if (!on && !truncate) setRoots(prev => prev.filter(n => !tables.includes(n)));
+  };
   const names = selection.names;
   const nameSet = useMemo(() => new Set(names), [names]);
-  const truncating = truncate ? names.filter(name => occupiedSet.has(name)) : [];
+  const truncating = truncate ? names.filter(name => occupiedSet.has(name) && !keptSet.has(name)) : [];
+  const keeping = names.filter(name => keptSet.has(name));
   const addedSet = useMemo(() => new Set(selection.added), [selection.added]);
   const addedChildSet = useMemo(() => new Set(selection.addedChildren), [selection.addedChildren]);
   const relevantDependencies = useMemo(() => names.flatMap(name => dependencyIndex.get(name) ?? []), [names, dependencyIndex]);
@@ -293,7 +305,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
     : '';
   return <div className="space-y-3 text-[12px]">
     <p className="text-soft">Copy table rows from the source connection’s schema to the target connection’s schema. Create missing tables with Copy objects first.</p>
-    <p className="text-mute">Data is copied only into empty target tables. Tables that already contain rows can’t be selected unless you choose to truncate them first. Duplicate keys or incompatible columns stop the copy. Required parent tables are selected automatically and copied first. Up to {TABLE_COPY_MAX_TABLES.toLocaleString()} tables per copy, with a total row limit you choose (default 100,000, up to {TABLE_COPY_MAX_ROWS.toLocaleString()}) — set a row limit per table to copy a sample of larger tables; Text, numbers, dates, timestamps (including WITH TIME ZONE and WITH LOCAL TIME ZONE), RAW, ROWID, UROWID, VECTOR, JSON, CLOB, and NCLOB columns are supported. Large CLOB, NCLOB and JSON values are streamed in chunks, so they have no size limit. Identity columns retain source IDs; GENERATED ALWAYS is temporarily changed to BY DEFAULT and restored after copying; BLOB and BFILE columns require a custom migration.</p>
+    <p className="text-mute">Data is copied into empty target tables. Tables that already contain rows can’t be selected unless you choose to truncate them first, or to insert into them keeping their rows. Duplicate keys or incompatible columns stop the copy. Required parent tables are selected automatically and copied first. Up to {TABLE_COPY_MAX_TABLES.toLocaleString()} tables per copy, with a total row limit you choose (default 100,000, up to {TABLE_COPY_MAX_ROWS.toLocaleString()}) — set a row limit per table to copy a sample of larger tables; Text, numbers, dates, timestamps (including WITH TIME ZONE and WITH LOCAL TIME ZONE), RAW, ROWID, UROWID, VECTOR, JSON, CLOB, and NCLOB columns are supported. Large CLOB, NCLOB and JSON values are streamed in chunks, so they have no size limit. Identity columns retain source IDs; GENERATED ALWAYS is temporarily changed to BY DEFAULT and restored after copying; BLOB and BFILE columns require a custom migration.</p>
     <p className="text-warn">Each table is committed as soon as its rows are inserted, in a separate session, so undo only holds one table at a time. If a table fails it is rolled back, but tables committed before it keep their rows; empty them before retrying. Worksheet Commit/Rollback does not apply.</p>
     <p className="text-warn">Identity sequences are synchronized after copying. Pause other target writes during copying. If interrupted, identity settings may need repair. Target triggers run on attempts, including retries, unless you disable them below.</p>
     <Btn variant="outline" disabled={busy || !sourceId || !targetId || sourceId === targetId} onClick={() => void read()}>Read tables</Btn>
@@ -320,13 +332,20 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
       {maxTotal > TABLE_COPY_DEFAULT_TOTAL_ROWS && <p className="text-warn">Large copies can take several minutes; keep this tab open. Each table commits separately, so the largest single table sets how much undo space is needed.</p>}
       <div className="space-y-1">
         <label className="flex items-center gap-2">
-          <input type="checkbox" checked={truncate} disabled={busy} onChange={e => { setTruncate(e.target.checked); if (!e.target.checked) setRoots(prev => prev.filter(n => !occupiedSet.has(n))); }} />
+          <input type="checkbox" checked={truncate} disabled={busy} onChange={e => { setTruncate(e.target.checked); if (!e.target.checked) setRoots(prev => prev.filter(n => !occupiedSet.has(n) || keptSet.has(n))); }} />
           Truncate target tables before copying
         </label>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={disableTriggers} disabled={busy} onChange={e => setDisableTriggers(e.target.checked)} />
           Disable target triggers while copying
         </label>
+        {!!keepCandidates.length && <label className="flex items-center gap-2">
+          <input type="checkbox" checked={keepCandidates.every(n => keptSet.has(n))} disabled={busy}
+            ref={el => { if (el) el.indeterminate = keptSet.size > 0 && !keepCandidates.every(n => keptSet.has(n)); }}
+            onChange={e => setKeep(keepCandidates, e.target.checked)} />
+          Insert into target tables that already have rows, keeping their rows (all {keepCandidates.length} table(s); or choose per table below)
+        </label>}
+        {!!keptSet.size && <p className="text-warn">Copied rows are added on top of the existing rows{truncate ? ', and these tables are not truncated' : ''}. A copied row whose key already exists in the target stops the copy and rolls back that table, so use a WHERE filter to copy only new rows. Kept tables are copied only when you select them; as parents, their existing rows are used.</p>}
         {disableTriggers && <p className="text-warn">Enabled triggers on the selected target tables are disabled before the first row is inserted and enabled again when the copy ends, even if it fails. They don’t run for copied rows, so sequences, audit or log rows they maintain aren’t updated, and they also don’t run for other sessions’ writes while disabled.</p>}
         {truncate && <p className="text-err">TRUNCATE permanently removes all rows from every selected target table that has data, including automatically selected parents. It cannot be rolled back, even if the copy fails, and DELETE triggers do not fire. Child tables outside the selection that reference them block truncation.</p>}
       </div>
@@ -376,7 +395,7 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
       </div>
       {(rowLimit || lobRowLimit || Object.keys(tableRowLimits).length > 0) && <p className="text-warn">Sampled child rows whose parent rows were not sampled are skipped and reported, so foreign keys stay valid.</p>}
       <div className="sticky top-0 z-10 flex items-center gap-3 flex-wrap rounded-md border border-bdr bg-panel p-3 shadow-md">
-        <Btn variant="primary" disabled={!!copyDisabledReason} title={copyDisabledReason || 'Review and confirm the data copy'} onClick={() => void copy()}>{truncating.length ? `Truncate ${truncating.length} and copy (${names.length} tables)` : `Copy data (${names.length} tables)`}</Btn>
+        <Btn variant="primary" disabled={!!copyDisabledReason} title={copyDisabledReason || 'Review and confirm the data copy'} onClick={() => void copy()}>{truncating.length ? `Truncate ${truncating.length} and copy (${names.length} tables${keeping.length ? `, ${keeping.length} keeping rows` : ''})` : `Copy data (${names.length} tables${keeping.length ? `, ${keeping.length} keeping rows` : ''})`}</Btn>
         <p role="status" className={`flex-1 min-w-48 ${copyDisabledReason ? 'text-warn' : 'text-soft'}`}>
           {copyDisabledReason || 'Ready to copy. You will review a confirmation before any rows are sent.'}
         </p>
@@ -445,7 +464,10 @@ export default function TableDataCopy({ sourceId, targetId }: { sourceId: string
             {appliedFilters[table.name] ? 'WHERE ✓' : 'Filter'}</Btn>}
           {table.existsInTarget && <span className="text-mute">· {plan.targetCounts?.[table.name] === undefined ? 'target count unavailable' : plan.targetCounts[table.name].toLocaleString() + ' target rows'}</span>}
           {lobTables.has(table.name) && <span className="text-mute" title="Has CLOB, NCLOB or JSON columns">LOB</span>}
-          {rowsFor(table.name) > maxTotal && <span className="text-err">Exceeds the {capLabel}-row total limit — set a row limit per table or raise the total</span>}{!table.existsInTarget && <span className="text-mute">Missing in target</span>}{occupiedSet.has(table.name) && (truncate ? <span className="text-err">{nameSet.has(table.name) ? 'Target has rows — will be truncated' : 'Target has rows — truncated if selected'}</span> : <span className="text-warn">Target not empty — can’t copy</span>)}
+          {rowsFor(table.name) > maxTotal && <span className="text-err">Exceeds the {capLabel}-row total limit — set a row limit per table or raise the total</span>}{!table.existsInTarget && <span className="text-mute">Missing in target</span>}{occupiedSet.has(table.name) && table.existsInTarget && <label className="flex items-center gap-1" title="Insert the copied rows into this table without truncating it; its existing rows stay">
+            <input type="checkbox" checked={keptSet.has(table.name)} onChange={e => setKeep([table.name], e.target.checked)} aria-label={`Keep existing rows in ${table.name} and insert into it`} />
+            Keep rows &amp; insert</label>}
+          {occupiedSet.has(table.name) && (keptSet.has(table.name) ? <span className="text-warn">{nameSet.has(table.name) ? 'Target has rows — copied rows are added' : 'Target has rows — added to if selected'}</span> : truncate ? <span className="text-err">{nameSet.has(table.name) ? 'Target has rows — will be truncated' : 'Target has rows — truncated if selected'}</span> : <span className="text-warn">Target not empty — can’t copy</span>)}
           {addedSet.has(table.name) && <span className="text-warn">{addedChildSet.has(table.name) ? 'Auto-selected: child of a truncated table — truncated and copied too' : 'Auto-selected: required parent'}</span>}
           {filterOpen[table.name] && <div className="basis-full pl-6 space-y-1">
             <div className="flex gap-2 items-center flex-wrap">

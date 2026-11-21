@@ -51,20 +51,26 @@ export function indexTableDependencies(dependencies: TableDependency[]): TableDe
  * tables are truncated first, the child tables with rows that reference a truncated table.
  * Truncating a parent would otherwise orphan those children's rows, so they are truncated and
  * copied too (with their own parents, and so on until nothing more is needed).
+ *
+ * `keepRows` are tables that already have rows and receive the copied rows on top of them
+ * (no truncation). They are copied only when chosen as roots: never added as someone's parent
+ * (their existing rows serve as parents) and never truncated as a child.
  */
-export function tableDataSelection(roots: string[], available: string[], dependencies: TableDependency[] | TableDependencyIndex, options: { truncateOccupied?: ReadonlySet<string> } = {}) {
-  const allowed = new Set(available);
+export function tableDataSelection(roots: string[], available: string[], dependencies: TableDependency[] | TableDependencyIndex, options: { truncateOccupied?: ReadonlySet<string>; keepRows?: ReadonlySet<string> } = {}) {
+  const keep = options.keepRows ?? new Set<string>();
+  const allowed = new Set(available.filter(n => !keep.has(n)));
+  const keptRoots = new Set(roots.filter(n => keep.has(n) && available.includes(n)));
   const index = dependencies instanceof Map ? dependencies : indexTableDependencies(dependencies);
-  const occupied = options.truncateOccupied;
-  if (!occupied?.size) return parentClosure(roots, allowed, index);
+  const occupied = options.truncateOccupied && new Set([...options.truncateOccupied].filter(n => !keep.has(n)));
+  if (!occupied?.size) return parentClosure(roots, allowed, index, keptRoots);
   const childrenOf = new Map<string, string[]>();
   for (const fks of index.values()) for (const fk of fks) {
     if (fk.local && fk.parent && fk.parent !== fk.table) childrenOf.set(fk.parent, [...(childrenOf.get(fk.parent) ?? []), fk.table]);
   }
-  const seeds = roots.filter(n => allowed.has(n));
+  const seeds = roots.filter(n => allowed.has(n) || keptRoots.has(n));
   const children = new Set<string>();
   for (;;) {
-    const result = parentClosure(seeds, allowed, index);
+    const result = parentClosure(seeds, allowed, index, keptRoots);
     const more = [...new Set(result.names.filter(t => occupied.has(t)).flatMap(t => childrenOf.get(t) ?? []))]
       .filter(c => allowed.has(c) && occupied.has(c) && !seeds.includes(c));
     if (!more.length || result.overLimit) {
@@ -74,7 +80,9 @@ export function tableDataSelection(roots: string[], available: string[], depende
   }
 }
 
-function parentClosure(roots: string[], allowed: Set<string>, dependencies: TableDependencyIndex) {
+function parentClosure(roots: string[], available: Set<string>, dependencies: TableDependencyIndex, keptRoots: ReadonlySet<string> = new Set()) {
+  // Kept tables count only when chosen themselves; then they still go before their children.
+  const allowed = keptRoots.size ? new Set([...available, ...keptRoots]) : available;
   const selected = new Set(roots.filter(n => allowed.has(n)));
   const dependenciesByTable = dependencies;
   const order: string[] = [];

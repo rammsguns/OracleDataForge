@@ -6084,6 +6084,9 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     const truncate = req.body.truncate === true;
     if (req.body.disableTriggers !== undefined && typeof req.body.disableTriggers !== 'boolean') return res.status(400).json({ error: 'disableTriggers must be true or false.' });
     const disableTriggers = req.body.disableTriggers === true;
+    // Tables that already have rows and receive the copied rows on top of them (never truncated).
+    const keepRowsInput = req.body.keepRows ?? [];
+    if (!Array.isArray(keepRowsInput) || keepRowsInput.length > TABLE_COPY_MAX_TABLES || keepRowsInput.some((n: unknown) => typeof n !== 'string' || !n || n.length > 128)) return res.status(400).json({ error: 'keepRows must be a list of table names.' });
     if (!Array.isArray(names) || !names.length || names.length > TABLE_COPY_MAX_TABLES || new Set(names).size !== names.length || names.some(n => typeof n !== 'string' || !plan.items.some(i => i.name === n && i.existsInTarget))) {
       return res.status(400).json({ error: `Select 1–${TABLE_COPY_MAX_TABLES} distinct tables that exist in both schemas. Create missing tables using Copy objects first.` });
     }
@@ -6094,11 +6097,15 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     // must never mix with, or be mistaken for, rows that were already there.
     const inTarget = plan.items.filter(i => i.existsInTarget).map(i => i.name);
     const occupied = new Set(await nonEmptyCopyTables(dst, inTarget));
-    const notEmpty = names.filter((n: string) => occupied.has(n));
-    if (notEmpty.length && !truncate) return res.status(409).json({ error: `Copy only into empty tables. These target tables already contain rows: ${notEmpty.join(', ')}. Empty them, deselect them, or choose to truncate target tables before copying, then re-read tables.` });
+    // Only tables that really have rows are "kept"; an empty one is just copied into.
+    const keepRows = new Set((keepRowsInput as string[]).filter(n => occupied.has(n)));
+    const notEmpty = names.filter((n: string) => occupied.has(n) && !keepRows.has(n));
+    if (notEmpty.length && !truncate) return res.status(409).json({ error: `These target tables already contain rows: ${notEmpty.join(', ')}. Choose to insert into them keeping their rows, choose to truncate target tables before copying, empty them, or deselect them, then re-read tables.` });
     // Without truncation, a parent that already has rows in the target is not copied; its rows
-    // serve as the parents. With truncation, every selected table is emptied and copied.
-    const selection = tableDataSelection(names, truncate ? inTarget : inTarget.filter(n => !occupied.has(n)), dependencies, truncate ? { truncateOccupied: occupied } : {});
+    // serve as the parents. With truncation, every selected table is emptied and copied, except
+    // kept tables, which are copied only when selected and are never truncated.
+    const selection = tableDataSelection(names, truncate ? inTarget : inTarget.filter(n => !occupied.has(n) || keepRows.has(n)), dependencies, { ...(truncate ? { truncateOccupied: occupied } : {}), keepRows });
+    const kept = selection.names.filter(n => keepRows.has(n));
     if (selection.overLimit || selection.added.length) return res.status(409).json({ error:
       selection.overLimit ? `Required parent tables exceed the ${TABLE_COPY_MAX_TABLES}-table limit. Use a custom migration.` :
       `Additional tables are required: ${selection.added.join(', ')}${selection.addedChildren.length ? ` (child tables with rows that reference a truncated table: ${selection.addedChildren.join(', ')})` : ''}. Re-read tables and review the updated selection.` });
@@ -6118,17 +6125,21 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     let sourceTotal: number;
     try { sourceTotal = validateCopyCounts(sourceCounts, limitFor, maxTotal); }
     catch (e) { return res.status(400).json({ error: errMsg(e) }); }
-    const toTruncate = truncate ? selection.names.filter(n => occupied.has(n)) : [];
+    const toTruncate = truncate ? selection.names.filter(n => occupied.has(n) && !keepRows.has(n)) : [];
+    // A kept table keeps its rows, so for truncation it counts as outside the selection: its rows
+    // referencing a truncated parent would be orphaned.
+    const truncateScope = selection.names.filter(n => !keepRows.has(n));
     if (toTruncate.length) {
-      const blocked = await truncateBlocker(dst, toTruncate, selection.names);
-      if (blocked) return res.status(409).json({ error: blocked });
+      const blocked = await truncateBlocker(dst, toTruncate, truncateScope);
+      if (blocked) return res.status(409).json({ error: kept.length ? `${blocked} Tables set to keep their rows count as not selected here: ${kept.join(', ')}.` : blocked });
     }
     const triggers = disableTriggers ? await enabledCopyTriggers(dst, selection.names) : [];
-    const filledParents = truncate ? [] : [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && occupied.has(d.parent)).map(d => d.parent!)))];
+    const filledParents = [...new Set(selection.names.flatMap(n => dependencies.filter(d => d.table === n && d.local && d.parent && d.parent !== n && occupied.has(d.parent) && !toTruncate.includes(d.parent) && !selection.names.includes(d.parent)).map(d => d.parent!)))];
     if (!acknowledged(req)) return confirmRequired(res, describeOperation({
       level: toTruncate.length ? 'destructive' : 'write', verb: toTruncate.length ? 'TRUNCATE AND COPY TABLE DATA' : 'COPY TABLE DATA', target: plan.targetSchema,
       title: `Copy data into ${plan.targetSchema}?`,
-      body: (toTruncate.length ? `TRUNCATE permanently removes ALL rows from ${toTruncate.length} target table(s) before copying: ${toTruncate.join(', ')}. Truncation cannot be rolled back, even if the copy then fails, and DELETE triggers do not fire. Foreign keys between the selected tables are briefly disabled for the truncation and re-enabled before copying. ` : '') + `Rows to copy: ${sourceTotal.toLocaleString()}${limitNote ? ` (${limitNote})` : ''} from ${plan.sourceSchema} into ${selection.names.length} empty table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
+      body: (toTruncate.length ? `TRUNCATE permanently removes ALL rows from ${toTruncate.length} target table(s) before copying: ${toTruncate.join(', ')}. Truncation cannot be rolled back, even if the copy then fails, and DELETE triggers do not fire. Foreign keys between the selected tables are briefly disabled for the truncation and re-enabled before copying. ` : '') + `Rows to copy: ${sourceTotal.toLocaleString()}${limitNote ? ` (${limitNote})` : ''} from ${plan.sourceSchema} into ${selection.names.length} table(s) on ${target.name}, parents first: ${selection.names.join(' → ')}. ` +
+        (kept.length ? `These ${kept.length} table(s) already have rows and keep them; copied rows are added on top, so a copied row with an existing key stops the copy (use a WHERE filter to copy only new rows): ${kept.join(', ')}. ` : '') +
         `Each table is committed as soon as its rows are inserted, so undo only needs to hold one table at a time. If a table fails, it is rolled back, but tables committed before it keep their rows — empty them before retrying. ` +
         `Rows waiting for parent keys are retried after each table; rows whose parent keys never appear${limitNote ? ' (for example, outside the sample)' : ''} are skipped and reported. Foreign keys remain enabled; duplicate keys or other errors stop the copy. ` +
         (filledParents.length ? `Parent tables that already contain rows are not copied; their existing rows are used: ${filledParents.join(', ')}. ` : '') +
@@ -6160,7 +6171,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
       if (stopper.signal.aborted) throw new CopyStoppedError();
       if (toTruncate.length) {
         tracker.truncating(toTruncate);
-        truncated = await truncateCopyTables(dst, toTruncate, selection.names);
+        truncated = await truncateCopyTables(dst, toTruncate, truncateScope);
         tracker.truncated(truncated);
       }
       outcome = await copyTableRows(src, dst, selection.names, { rowLimit, lobRowLimit, tableRowLimits, maxTotal, disableTriggers, onProgress: tracker.event, signal: stopper.signal, tableFilters });
@@ -6168,6 +6179,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
       let message = errMsg(e);
       if (/ORA-01555/.test(message)) message += ` The source could not rebuild a consistent read of this table: its undo was overwritten while the table was being read (the source has too little undo retention for this read). Retry with the source quieter, copy this table with a per-table row limit, or ask the DBA to raise UNDO_RETENTION on the source.`;
       if (/NJS-123/.test(message)) message += ` A single database call ran longer than ${TABLE_COPY_CALL_TIMEOUT_MS / 60000} minutes; check for locks on the target tables or copy the slow table with a per-table row limit.`;
+      if (kept.length && /ORA-00001/.test(message)) message += ` A copied row has the same key as a row already in the target. Tables keeping their rows (${kept.join(', ')}) only accept new keys; filter the source with WHERE to copy only rows that aren’t in the target yet.`;
       if (!disableTriggers && /ORA-04088/.test(message)) message += ` A target trigger failed while inserting copied rows. Retry with “Disable target triggers while copying” so triggers do not run for copied rows.`;
       if (truncated.length) message += ` These tables were truncated before the copy started: ${truncated.join(', ')}.`;
       tracker.finish(message);
@@ -6175,7 +6187,7 @@ app.post('/api/connections/:id/tables/copy-data', requireFullAccess, async (req,
     }
     for (const warning of outcome.warnings ?? []) tracker.log(warning, 'warn');
     tracker.finish();
-    res.json({ ...outcome, ...(truncated.length ? { truncated } : {}) });
+    res.json({ ...outcome, ...(truncated.length ? { truncated } : {}), ...(kept.length ? { kept } : {}) });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
     try {

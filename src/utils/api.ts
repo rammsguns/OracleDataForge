@@ -1034,8 +1034,8 @@ export const api = {
       `/api/connections/${targetId}/objects/copy?source=${encodeURIComponent(sourceId)}&kind=${encodeURIComponent(kind)}`
     ),
   /** Copies into empty target tables (or truncates them first); each table commits as soon as it is loaded. */
-  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false, lobRowLimit: number | null = null, disableTriggers = false, tableRowLimits: Record<string, number> = {}, tableFilters: Record<string, string> = {}) =>
-    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate, lobRowLimit, disableTriggers, tableRowLimits, tableFilters }),
+  copyTableData: (targetId: string, sourceId: string, names: string[], confirm = false, rowLimit: number | null = null, maxTotal?: number, truncate = false, lobRowLimit: number | null = null, disableTriggers = false, tableRowLimits: Record<string, number> = {}, tableFilters: Record<string, string> = {}, keepRows: string[] = []) =>
+    request<{ tables: { name: string; rows: number; skipped?: number }[]; totalRows: number; skippedRows?: number; truncated?: string[]; kept?: string[]; warnings?: string[] }>(`/api/connections/${targetId}/tables/copy-data`, { sourceId, names, confirm, rowLimit, maxTotal, truncate, lobRowLimit, disableTriggers, tableRowLimits, tableFilters, keepRows }),
   /** Checks a WHERE filter for one source table and returns how many rows it selects. */
   countTableDataFilter: (targetId: string, sourceId: string, table: string, where: string) =>
     request<{ count: number }>(`/api/connections/${targetId}/tables/copy-data/count`, { sourceId, table, where }),
