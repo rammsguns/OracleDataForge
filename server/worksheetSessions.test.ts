@@ -39,16 +39,57 @@ test('failed statements preserve the session and previous uncommitted work', asy
   assert.equal(await sessions.use(id, 'a', 'db', async conn => conn.pending), 4);
   assert.equal(c.closed, false);
 });
-test('rejects concurrent work and disconnects while a statement is running', async () => {
+test('rejects concurrent work on a session while a statement is running', async () => {
   const sessions = new WorksheetSessions<FakeConnection>();
   const id = await sessions.create('a', 'db', async () => new FakeConnection());
   let release!: () => void;
   const running = sessions.use(id, 'a', 'db', () => new Promise<void>(resolve => { release = resolve; }));
   await assert.rejects(sessions.use(id, 'a', 'db', async () => {}), /busy/);
-  await assert.rejects(sessions.closeDatabase('db'), /executing/);
   await sessions.expire(Date.now() + 31 * 60_000);
   release(); await running;
   await sessions.use(id, 'a', 'db', async () => {});
+});
+class CancellableConnection extends FakeConnection {
+  cancel?: () => void;
+  breaks = 0;
+  async break() { this.breaks++; this.cancel?.(); }
+}
+test('disconnect cancels a running statement, then rolls back and closes the session', async () => {
+  const sessions = new WorksheetSessions<CancellableConnection>();
+  const c = new CancellableConnection(); c.pending = 2;
+  const id = await sessions.create('a', 'db', async () => c);
+  const running = sessions.use(id, 'a', 'db', conn => new Promise<void>((_, reject) => {
+    conn.cancel = () => reject(new Error('ORA-01013: user requested cancel of current operation'));
+  }));
+  assert.equal(await sessions.closeDatabase('db'), true);
+  await assert.rejects(running, /ORA-01013/);
+  assert.equal(c.breaks, 1);
+  assert.equal(c.pending, 0);
+  assert.equal(c.closed, true);
+  await assert.rejects(sessions.use(id, 'a', 'db', async () => {}), /unavailable or expired/);
+});
+test('a statement that ignores the cancel is reported and released once it stops', async () => {
+  const sessions = new WorksheetSessions<CancellableConnection>(20);
+  const c = new CancellableConnection();
+  const id = await sessions.create('a', 'db', async () => c);
+  let release!: () => void;
+  const running = sessions.use(id, 'a', 'db', () => new Promise<void>(resolve => { release = resolve; }));
+  await assert.rejects(sessions.closeDatabase('db'), /outcome is unknown/);
+  assert.equal(c.closed, false);
+  release(); await running;
+  await new Promise(r => setImmediate(r));
+  assert.equal(c.closed, true);
+});
+test('a session still opening when the database disconnects is closed, not leaked', async () => {
+  const sessions = new WorksheetSessions<FakeConnection>();
+  const c = new FakeConnection();
+  let open!: () => void;
+  const creating = sessions.create('a', 'db', () => new Promise<FakeConnection>(resolve => { open = () => resolve(c); }));
+  const closing = sessions.closeDatabase('db');
+  open();
+  assert.equal(await closing, true);
+  await assert.rejects(creating, /closed while the worksheet session was opening/);
+  assert.equal(c.closed, true);
 });
 test('expiration and disconnect roll back without committing', async () => {
   const sessions = new WorksheetSessions<FakeConnection>();
