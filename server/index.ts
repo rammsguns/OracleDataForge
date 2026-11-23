@@ -1,4 +1,5 @@
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
+import { readDbaInsights } from "./dbaInsights.ts";
 import express from "express";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
 import { copyTableRows, CopyStoppedError, copyFilterError, parseCopyTableFilters, countCopyRows, lobCopyTables, enabledCopyTriggers, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTableRowLimits, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
@@ -6451,6 +6452,22 @@ app.get("/api/connections/:id/dba", requireFullAccess, async (req, res) => {
   if (c.engine !== "oracle") return res.status(400).json({ error: "The DBA Performance Advisor is Oracle-only." });
   try {
     res.json(await oraDba(c));
+  } catch (e) {
+    res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
+  }
+});
+
+app.get("/api/connections/:id/dba/insights", requireFullAccess, async (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection (backend may have restarted — recreate it)" });
+  if (c.engine !== "oracle") return res.status(400).json({ error: "The DBA Performance Advisor is Oracle-only." });
+  try {
+    const conn = await getOraConn(c);
+    try {
+      res.json(await readDbaInsights((sql) => oraRows(conn, sql)));
+    } finally {
+      await conn.close();
+    }
   } catch (e) {
     res.status(500).json({ error: withNetworkHint(errMsg(e), c.host) });
   }

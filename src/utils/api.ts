@@ -257,6 +257,39 @@ export interface DbaReport {
   advice: DbaAdvice[];
 }
 
+export type InsightSeverity = "good" | "warning" | "serious" | "critical";
+export type InsightArea = "sql" | "plsql" | "views" | "jobs" | "sessions" | "objects";
+export interface InsightSlowSql {
+  sqlId: string; schema: string; kind: "SELECT" | "DML" | "PL/SQL" | "OTHER"; executions: number; elapsedS: number;
+  perExecMs: number; cpuPerExecMs: number; getsPerExec: number; readsPerExec: number; rowsPerExec: number;
+  planHash: number; lastActive: string; module: string; sqlText: string; fullScans: { owner: string; table: string; rows: number }[];
+}
+export interface InsightProgram { owner: string; name: string; type: string; statements: number; executions: number; elapsedS: number; cpuS: number; bufferGets: number; topSqlId: string; topLine: number | null; lastActive: string; }
+export interface InsightView { owner: string; name: string; statements: number; executions: number; elapsedS: number; perExecMs: number; bufferGets: number; }
+export interface InsightMview { owner: string; name: string; staleness: string; compileState: string; lastRefresh: string; refreshType: string; }
+export interface InsightJob { owner: string; name: string; runs: number; failures: number; avgS: number; maxS: number; lastStart: string; lastStatus: string; lastError: string; }
+export interface InsightRunningJob { owner: string; name: string; sid: number | null; elapsedS: number; cpuS: number; }
+export interface InsightSession { sid: number; serial: number; user: string; sqlId: string; seconds: number; event: string; waitClass: string; blockingSid: number | null; module: string; }
+export interface InsightLongOp { sid: number; user: string; operation: string; target: string; pct: number; elapsedS: number; remainingS: number; sqlId: string; }
+export interface InsightInvalidObject { owner: string; name: string; type: string; lastDdl: string; }
+export interface InsightStaleTable { owner: string; table: string; rows: number | null; lastAnalyzed: string; reason: "stale" | "never analyzed"; }
+export interface InsightFinding { severity: InsightSeverity; area: InsightArea; title: string; detail: string; }
+export interface DbaInsights {
+  sampledAt: string;
+  visible: Record<InsightArea, boolean>;
+  slowSql: InsightSlowSql[];
+  programs: InsightProgram[];
+  views: InsightView[];
+  mviews: InsightMview[];
+  jobs: InsightJob[];
+  runningJobs: InsightRunningJob[];
+  activeSessions: InsightSession[];
+  longOps: InsightLongOp[];
+  invalidObjects: InsightInvalidObject[];
+  staleStats: InsightStaleTable[];
+  findings: InsightFinding[];
+}
+
 export interface PerfReport {
   resources?: {
     sampledAt: string;
@@ -1009,6 +1042,7 @@ export const api = {
   dbaStorage: (id: string, change: StorageChange, typedName: string, confirm = false) => request<{ ok: boolean; auditId: string }>(`/api/connections/${id}/dba-storage`, { ...change, typedName, confirm }),
   dbaAudit: (id: string) => request<{ entries: { id: string; timestamp: string; actor: string; action: string; target: string; outcome: string; sql?: string; error?: string }[] }>(`/api/connections/${id}/dba-audit`, undefined, undefined, undefined, "no-store"),
   dba: (id: string) => request<DbaReport>(`/api/connections/${id}/dba`, undefined, undefined, undefined, "no-store"),
+  dbaInsights: (id: string) => request<DbaInsights>(`/api/connections/${id}/dba/insights`, undefined, undefined, undefined, "no-store"),
   perf: (id: string) => request<PerfReport>(`/api/connections/${id}/perf`, undefined, undefined, undefined, "no-store"),
   deps: (id: string, name: string) => request<DepsReport>(`/api/connections/${id}/deps?name=${encodeURIComponent(name)}`),
   erd: (id: string) => request<ErdResult>(`/api/connections/${id}/erd`),
