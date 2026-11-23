@@ -866,7 +866,7 @@ export default function Sidebar() {
                 </button>
                 {treeOpen && <div className="flex items-center gap-1 pl-10 pr-2 py-1 border-t border-bdrsoft/70 bg-panel2/35">
                   <span className={`text-[10px] font-semibold uppercase tracking-wide ${offline ? "text-mute" : c.status === "error" ? "text-err" : "text-ok"}`}>
-                    {offline ? "Offline" : c.status}
+                    {busy ? "Connecting…" : offline ? "Offline" : c.status}
                   </span>
                   <span className="text-[10px] text-mute uppercase">Oracle</span>
                   <span className="ml-auto flex items-center gap-0.5 shrink-0">
@@ -885,7 +885,7 @@ export default function Sidebar() {
                         doReconnect();
                       }}
                     >
-                      <PlugZap size={12} />
+                      <PlugZap size={12} className={busy ? "animate-pulse text-accenthi" : ""} />
                     </button>
                   )}
                   {c.live && !offline && (
@@ -978,7 +978,8 @@ export default function Sidebar() {
         ) : activeConn?.status === "error" ? (
           <div className="mx-2.5 my-1.5 border border-err/30 bg-err/8 rounded-lg px-2.5 py-2 text-[11.5px] text-soft">
             <span className="text-err font-semibold">Connection failed</span> — can't browse{" "}
-            <span className="font-mono">{browsed}</span>. Check host/port and retry.
+            <span className="font-mono">{browsed}</span>.
+            {activeConn.lastError ? <div className="mt-1 font-mono text-[11px] break-words select-text">{activeConn.lastError}</div> : <> Check host/port and retry.</>}
           </div>
         ) : liveState?.status === "loading" ? (
           <div className="px-3 py-3">
