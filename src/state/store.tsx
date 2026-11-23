@@ -570,8 +570,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setGroupRefresh((g) => ({ labels, seq: g.seq + 1 }));
   }, []);
 
-  const setConnStatus = useCallback((id: string, status: Connection["status"]) => {
-    setConnections((prev) => (prev.some((c) => c.id === id && c.status !== status) ? prev.map((c) => (c.id === id ? { ...c, status } : c)) : prev));
+  const setConnStatus = useCallback((id: string, status: Connection["status"], lastError?: string) => {
+    setConnections((prev) =>
+      prev.some((c) => c.id === id && (c.status !== status || c.lastError !== lastError))
+        ? prev.map((c) => (c.id === id ? { ...c, status, lastError } : c))
+        : prev
+    );
   }, []);
 
   const pushHistory = useCallback((statement: string, durationMs: number, rows: number, ok: boolean) => {
@@ -927,11 +931,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       const conn = connectionsRef.current.find((c) => c.id === id);
       if (!conn?.live) return;
+      toast("info", `Connecting to "${conn.name}"…`);
       try {
         const r = await api.reconnect(id);
         setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         if (!r.ok) {
-          setConnStatus(id, "error");
+          setConnStatus(id, "error", r.error);
           toast("error", `${conn.name}: ${r.error}`);
           return;
         }
@@ -940,7 +945,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         setSchemaBump((b) => b + 1); // invalidate the catalog; Explorer loads it on request
         toast("success", `"${conn.name}" connected — ${r.version} (${r.ms} ms)`);
       } catch (e) {
-        setConnStatus(id, "error");
+        setConnStatus(id, "error", (e as Error).message);
         toast("error", `Could not reconnect "${conn.name}": ${(e as Error).message}`);
       }
     },

@@ -14,6 +14,8 @@ export interface Connection {
   port: number;
   user: string;
   status: "connected" | "idle" | "error";
+  /** why the last connect attempt failed (only while status is "error") */
+  lastError?: string;
   color: string;
   /** true = real database reached through the local backend (passwords stay server-side) */
   live?: boolean;
