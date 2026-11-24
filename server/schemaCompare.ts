@@ -29,7 +29,7 @@ export async function compareCatalog(conn: oracledb.Connection, schema: string):
 const metadataTypes: Record<string, string> = {
   TABLE: "TABLE", VIEW: "VIEW", "MATERIALIZED VIEW": "MATERIALIZED_VIEW", INDEX: "INDEX", SEQUENCE: "SEQUENCE",
   PROCEDURE: "PROCEDURE", FUNCTION: "FUNCTION", PACKAGE: "PACKAGE_SPEC", "PACKAGE BODY": "PACKAGE_BODY",
-  TYPE: "TYPE_SPEC", "TYPE BODY": "TYPE_BODY", TRIGGER: "TRIGGER", SYNONYM: "SYNONYM", "DATABASE LINK": "DB_LINK",
+  TYPE: "TYPE_SPEC", "TYPE BODY": "TYPE_BODY", TRIGGER: "TRIGGER", SYNONYM: "SYNONYM",
   CLUSTER: "CLUSTER", DIMENSION: "DIMENSION", "JAVA SOURCE": "JAVA_SOURCE", "JAVA CLASS": "JAVA_CLASS",
 };
 const replaceable = new Set(["VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE BODY", "TRIGGER", "SYNONYM", "JAVA SOURCE"]);
@@ -222,7 +222,9 @@ export function diffCompareData(source: CellRow[], target: CellRow[], columns: D
 }
 export async function compareTableData(source: oracledb.Connection, target: oracledb.Connection, from: string, to: string, name: string, limit: number): Promise<DataDifference> {
   const describe = async (conn: oracledb.Connection, owner: string) => compareRows(conn,
-    `SELECT column_name, data_type, virtual_column, identity_column FROM all_tab_cols WHERE owner = :owner AND table_name = :name AND hidden_column = 'NO' ORDER BY column_id`, { owner, name });
+    `SELECT column_name, data_type, data_type_owner, data_length, char_length, char_used,
+      data_precision, data_scale, nullable, virtual_column, identity_column
+     FROM all_tab_cols WHERE owner = :owner AND table_name = :name AND hidden_column = 'NO' ORDER BY column_id`, { owner, name });
   const a = await describe(source, from), b = await describe(target, to);
   if (JSON.stringify(a) !== JSON.stringify(b)) return emptyData("skipped", "Column layouts differ; deploy schema changes before comparing data.");
   const columns = a.map(r => ({ name: String(r.COLUMN_NAME), type: String(r.DATA_TYPE) }));

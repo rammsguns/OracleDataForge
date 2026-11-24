@@ -26,8 +26,8 @@ test("schema compare filters types, submits selected objects and previews target
     objects: [{ ...proc, key: compareObjectKey(proc), status: "sourceOnly" as const, sourceDdl: "CREATE PROCEDURE SAVE_ITEM AS BEGIN NULL; END;\n/", targetDdl: "", script: 'CREATE PROCEDURE "PROD".SAVE_ITEM AS BEGIN NULL; END;\n/' }],
   }));
   const state = { connections: [
-    { id: "dev", name: "Development", user: "DEV", engine: "oracle", live: true },
-    { id: "prod", name: "Production", user: "PROD", engine: "oracle", live: true },
+    { id: "dev", name: "Development", user: "DEV", engine: "oracle", live: true, status: "connected" },
+    { id: "prod", name: "Production", user: "PROD", engine: "oracle", live: true, status: "connected" },
   ] } as unknown as ReturnType<typeof useStudio>;
   const host = browser.document.createElement("div"); browser.document.body.append(host);
   const root = createRoot(host as unknown as HTMLElement);
@@ -116,8 +116,8 @@ test("connection picker sorts and filters without changing selection, and suppor
 test("changing source through the enhanced picker invalidates the old object inventory", async t => {
   const catalog = t.mock.method(api, "compareCatalog", async () => ({ schema: "APP", objects: [{ name: "T", type: "TABLE" }], types: ["TABLE"] }));
   const state = { connections: [
-    { id: "dev", name: "Development", user: "DEV", engine: "oracle", live: true },
-    { id: "prod", name: "Production", user: "PROD", engine: "oracle", live: true },
+    { id: "dev", name: "Development", user: "DEV", engine: "oracle", live: true, status: "connected" },
+    { id: "prod", name: "Production", user: "PROD", engine: "oracle", live: true, status: "connected" },
   ] } as unknown as ReturnType<typeof useStudio>;
   const host = browser.document.createElement("div"); browser.document.body.append(host);
   const root = createRoot(host as unknown as HTMLElement);
@@ -129,7 +129,7 @@ test("changing source through the enhanced picker invalidates the old object inv
   await act(async () => (host.querySelector('[aria-label="source connection"]') as unknown as HTMLButtonElement).click());
   // Opening and filtering options leaves the reviewed inventory intact.
   const statusFilter = host.querySelector('[aria-label="source connection status filter"]')!;
-  await act(async () => { (statusFilter as unknown as HTMLSelectElement).value = "idle"; statusFilter.dispatchEvent(new browser.Event("change", { bubbles: true })); });
+  await act(async () => { (statusFilter as unknown as HTMLSelectElement).value = "connected"; statusFilter.dispatchEvent(new browser.Event("change", { bubbles: true })); });
   assert.ok(host.querySelector('[aria-label="Select TABLE T"]'));
   await act(async () => (host.querySelector('[data-connection-option="prod"]') as unknown as HTMLButtonElement).click());
   assert.equal(host.querySelector('[aria-label="Select TABLE T"]'), null);
@@ -140,15 +140,17 @@ test("changing source through the enhanced picker invalidates the old object inv
 });
 
 test("source and target Connect actions track pending state, errors and retry without clearing selections", async t => {
-  t.mock.method(api, "compareCatalog", async () => ({ schema: "APP", objects: [{ name: "T", type: "TABLE" }], types: ["TABLE"] }));
+  const catalog = t.mock.method(api, "compareCatalog", async () => ({ schema: "APP", objects: [{ name: "T", type: "TABLE" }], types: ["TABLE"] }));
   const calls: string[] = [];
   let finish = () => {};
+  let disconnectTarget = () => {};
   let fail = false;
   function ConnectedCompare() {
     const [connections, setConnections] = useState<Connection[]>([
       { id: "dev", name: "Development", user: "DEV", host: "dev", port: 1521, engine: "oracle", live: true, status: "idle", color: "" },
       { id: "prod", name: "Production", user: "PROD", host: "prod", port: 1521, engine: "oracle", live: true, status: "error", lastError: "Previous connection failed", color: "" },
     ]);
+    disconnectTarget = () => setConnections(current => current.map(c => c.id === "prod" ? { ...c, status: "idle" } : c));
     const state = { connections, reconnectConn: async (id: string) => {
       calls.push(id);
       await new Promise<void>(resolve => { finish = resolve; });
@@ -162,18 +164,19 @@ test("source and target Connect actions track pending state, errors and retry wi
   await act(async () => root.render(<ConnectedCompare />));
   const connectButton = (side: string) => host.querySelector(`button[aria-label="Connect ${side} connection"]`);
   const load = [...host.querySelectorAll("button")].find(b => b.textContent === "Load objects")!;
+  assert.equal(load.disabled, true);
   await act(async () => load.click());
+  assert.equal(catalog.mock.calls.length, 0);
   const source = connectButton("source")!;
   await act(async () => { (source as unknown as HTMLButtonElement).click(); (source as unknown as HTMLButtonElement).click(); });
   assert.deepEqual(calls, ["dev"]);
   assert.match(source.textContent!, /Connecting/);
   assert.equal(source.hasAttribute("disabled"), true);
   assert.equal(connectButton("target")!.hasAttribute("disabled"), true);
-  assert.equal([...host.querySelectorAll("button")].find(b => b.textContent?.trim() === "Compare selected")!.hasAttribute("disabled"), true);
   await act(async () => finish());
   assert.equal(connectButton("source"), null);
   assert.match(host.querySelector('[aria-label="source connection"]')!.textContent!, /Development.*DEV.*Connected/);
-  assert.ok(host.querySelector('[aria-label="Select TABLE T"]'));
+  assert.equal(load.disabled, true);
 
   fail = true;
   await act(async () => (connectButton("target") as unknown as HTMLButtonElement).click());
@@ -187,5 +190,16 @@ test("source and target Connect actions track pending state, errors and retry wi
   assert.deepEqual(calls, ["dev", "prod", "prod"]);
   assert.match(host.querySelector('[aria-label="target connection"]')!.textContent!, /Production.*PROD.*Connected/);
   assert.ok(!host.textContent!.includes("ORA-01017"));
+  assert.equal(load.disabled, false);
+  await act(async () => load.click());
+  assert.equal(catalog.mock.calls.length, 2);
+  await act(async () => disconnectTarget());
+  const compare = [...host.querySelectorAll("button")].find(b => b.textContent?.trim() === "Compare selected")!;
+  assert.equal(load.disabled, true); assert.equal(compare.disabled, true);
+  await act(async () => (connectButton("target") as unknown as HTMLButtonElement).click());
+  assert.equal(compare.disabled, true);
+  await act(async () => finish());
+  assert.deepEqual(calls, ["dev", "prod", "prod", "prod"]);
+  assert.equal(compare.disabled, false);
   assert.ok(host.querySelector('[aria-label="Select TABLE T"]'));
 });

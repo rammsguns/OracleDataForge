@@ -22,6 +22,7 @@ export default function SchemaCompare() {
   const connections = s.connections.filter(c => c.engine === "oracle" && c.live);
   const [sourceId, setSourceId] = useState(connections[0]?.id ?? "");
   const [targetId, setTargetId] = useState(connections[1]?.id ?? connections[0]?.id ?? "");
+  const connectionsReady = [sourceId, targetId].every(id => connections.some(c => c.id === id && c.status === "connected"));
   const [sourceSchema, setSourceSchema] = useState("");
   const [targetSchema, setTargetSchema] = useState("");
   const [catalogs, setCatalogs] = useState<[CompareCatalog, CompareCatalog] | null>(null);
@@ -64,6 +65,7 @@ export default function SchemaCompare() {
   };
   const load = async () => {
     if (connectingRef.current) return;
+    if (!connectionsReady) { setError("Connect both the source and target before loading objects."); return; }
     setBusy("loading"); setError(""); setResult(null); setCatalogs(null);
     try {
       const list = await Promise.all([api.compareCatalog(sourceId, sourceSchema), api.compareCatalog(targetId, targetSchema)]);
@@ -76,6 +78,7 @@ export default function SchemaCompare() {
   };
   const compare = async () => {
     if (!catalogs || connectingRef.current) return;
+    if (!connectionsReady) { setError("Connect both the source and target before comparing objects."); return; }
     setBusy("comparing"); setError("");
     try {
       const r = await api.schemaCompare(targetId, { sourceId,
@@ -118,8 +121,9 @@ export default function SchemaCompare() {
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeStorage} onChange={e => { setIncludeStorage(e.target.checked); setResult(null); }} />Compare storage and tablespaces</label>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={compareData} onChange={e => { setCompareData(e.target.checked); setResult(null); }} />Compare table data</label>
         {compareData && <label>Maximum rows per table per side <input aria-label="Data row limit" className={`${inputCls} w-24 ml-2`} type="number" min={1} max={10000} value={rowLimit} onChange={e => { setRowLimit(Number(e.target.value)); setResult(null); }} /></label>}
-        <Btn variant="outline" disabled={!sourceId || !targetId} onClick={() => void load()}>Load objects</Btn>
+        <Btn variant="outline" disabled={!connectionsReady} onClick={() => void load()}>Load objects</Btn>
       </div>
+      {!connectionsReady && <p className="text-mute">Connect both the source and target to load or compare objects.</p>}
       {compareData && <p className="text-mute">Rows match by primary key. Each database is read at its own consistent snapshot. Tables over the limit or with unsupported columns are reported as incomplete or skipped.</p>}
       <p className="text-mute">Blank schema uses the connection user. Other schemas require dictionary and DBMS_METADATA access. All visible object types are listed; unsupported metadata is reported per object.</p>
     </fieldset>
@@ -134,7 +138,7 @@ export default function SchemaCompare() {
         <Btn onClick={() => setPicked(new Set([...picked, ...visible.map(compareObjectKey)]))}>Select visible</Btn>
         <Btn onClick={() => setPicked(new Set([...picked].filter(k => !visible.some(o => compareObjectKey(o) === k))))}>Clear visible</Btn>
         <span className="text-mute ml-auto">{chosen.length} selected · 500 maximum per comparison</span>
-        <Btn variant="primary" disabled={!!busy || connectingId !== null || !chosen.length || chosen.length > 500 || (compareData && (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000))} onClick={() => void compare()}><GitCompareArrows size={14} />Compare selected</Btn>
+        <Btn variant="primary" disabled={!!busy || connectingId !== null || !connectionsReady || !chosen.length || chosen.length > 500 || (compareData && (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000))} onClick={() => void compare()}><GitCompareArrows size={14} />Compare selected</Btn>
       </div>
       <div className="max-h-[45vh] overflow-auto border border-bdr rounded"><table className="w-full text-left"><thead className="sticky top-0 bg-panel2 text-mute"><tr><th className="p-2">Select</th><th>Object</th><th>Type</th><th>Source</th><th>Target</th></tr></thead><tbody>{visible.map(o => {
         const key = compareObjectKey(o);

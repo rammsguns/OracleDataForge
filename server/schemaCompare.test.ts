@@ -111,6 +111,33 @@ test("tables without primary keys and tables with LOBs are explicitly skipped", 
     assert.equal(result.status, "skipped"); assert.equal(result.script, "");
   }
 });
+test("database links never reach the metadata exporter or exported definitions", async () => {
+  let calls = 0;
+  const conn = fakeConnection(() => { calls++; throw new Error("Database-link metadata must not be read"); });
+  const objects = [{ name: "REMOTE_DB", type: "DATABASE LINK" }];
+  const cat = { schema: "DEV", objects, types: ["DATABASE LINK"] };
+  const [result] = await compareSchemaObjects(conn, conn, { ...input, objects }, cat, cat);
+  assert.equal(calls, 0);
+  assert.equal(result.status, "error");
+  assert.match(result.warning!, /not supported/);
+  assert.equal(result.sourceDdl, ""); assert.equal(result.targetDdl, ""); assert.equal(result.script, "");
+});
+test("data comparison rejects different lengths, precision, scale, semantics and nullability before reading rows", async () => {
+  for (const field of ["DATA_LENGTH", "CHAR_LENGTH", "CHAR_USED", "DATA_PRECISION", "DATA_SCALE", "NULLABLE"]) {
+    const source = fakeConnection(sql => {
+      assert.ok(sql.includes("all_tab_cols"));
+      assert.match(sql, new RegExp("\\b" + field + "\\b", "i"));
+      return { rows: [{ COLUMN_NAME: "X", DATA_TYPE: "NUMBER", [field]: "source" }] };
+    });
+    const target = fakeConnection(sql => {
+      assert.ok(sql.includes("all_tab_cols"));
+      return { rows: [{ COLUMN_NAME: "X", DATA_TYPE: "NUMBER", [field]: "target" }] };
+    });
+    const result = await compareTableData(source, target, "DEV", "PROD", "T", 2);
+    assert.equal(result.status, "skipped"); assert.match(result.message, /Column layouts differ/);
+    assert.equal(result.script, "");
+  }
+});
 test("mixed-case schema qualifiers are remapped without changing literal contents", async () => {
   const src = fakeConnection(() => ({ outBinds: { output: `CREATE PROCEDURE "Dev App"."P" AS BEGIN "Dev App".RUN; dbms_output.put_line('Dev App'); END;` } }));
   const dst = fakeConnection(() => ({ outBinds: { output: "other definition" } }));
