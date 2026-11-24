@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { RefreshCcw, Search, Users, X } from "lucide-react";
 import { useStudio } from "../state/store";
+import { useTabActive } from "../state/tabActivity";
 import { api, type OracleSession, type OracleSessionsReport } from "../utils/api";
 import { sessionClient } from "../utils/sessionClient";
 import { matchesSessionColumnFilters, matchesSessionThresholds, sampleSessionRates, formatSessionValue, sessionThresholds, type SessionThresholds, sessionGridColumns as gridColumns, type SessionGridColumnKey as GridColumnKey } from "../utils/sessionGrid";
@@ -34,6 +35,7 @@ const detailFields: [keyof OracleSession, string][] = [
 ];
 
 export default function Sessions() {
+  const active = useTabActive();
   const s = useStudio();
   const conn = s.connections.find(c => c.id === s.activeConnId);
   const [report, setReport] = useState<OracleSessionsReport | null>(null);
@@ -71,14 +73,14 @@ export default function Sessions() {
     return () => { cancelled = true; };
   }, [conn?.id, conn?.status, revision]);
   useEffect(() => {
-    if (!conn || conn.status !== "connected" || killing || refreshSeconds < 1) return;
+    if (!active || !conn || conn.status !== "connected" || killing || refreshSeconds < 1) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible" && !loading) setRevision(value => value + 1);
     }, refreshSeconds * 1_000);
     const onVisible = () => { if (document.visibilityState === "visible" && !loading) setRevision(value => value + 1); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
-  }, [conn?.id, conn?.status, killing, loading, refreshSeconds]);
+  }, [conn?.id, conn?.status, killing, loading, refreshSeconds, active]);
 
   const rows = useMemo(() => {
     const search = filter.trim().toLowerCase();

@@ -21,7 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { useStudio } from "../state/store";
-import type { TabKind } from "../types";
+import type { Tab, TabKind } from "../types";
 import SqlWorksheet from "./SqlWorksheet";
 import AssistPanel from "./AssistPanel";
 import { useHarnessEnabled } from "../utils/useHarnessEnabled";
@@ -32,6 +32,7 @@ import ErDiagram from "./ErDiagram";
 import QueryHistory from "./QueryHistory";
 import PerformanceMonitor from "./PerformanceMonitor";
 import MigrationAssistant from "./MigrationAssistant";
+import SchemaCompare from "./SchemaCompare";
 import DbaAdvisor from "./DbaAdvisor";
 import DbaManager from "./DbaManager";
 import DependencyExplorer from "./DependencyExplorer";
@@ -42,6 +43,7 @@ import JobRunLog from "./JobRunLog";
 import UserAdmin from "./UserAdmin";
 import PlsqlRepository from "./PlsqlRepository";
 import Sessions from "./Sessions";
+import RetainedTool from "./RetainedTool";
 import { EmptyState } from "./ui";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
@@ -54,6 +56,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   history: <Clock3 size={12} />,
   perf: <Activity size={12} />,
   migration: <GitCompareArrows size={12} />,
+  compare: <GitCompareArrows size={12} />,
   dba: <Gauge size={12} />,
   dbamanager: <Hammer size={12} />,
   sessions: <Users size={12} />,
@@ -75,10 +78,33 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
+  { kind: "compare", title: "Schema Compare", label: "Schema Compare" },
   { kind: "joblog", title: "Job Run Log", label: "Job Runs" },
   { kind: "admin", title: "Admin", label: "Admin" },
   { kind: "repository", title: "PL/SQL Repository", label: "Repository" },
 ];
+
+const TOOL_KINDS = new Set<TabKind>([...LAUNCHERS.map(tool => tool.kind), "run", "compile"]);
+function ToolContent({ tab }: { tab: Tab }) {
+  switch (tab.kind) {
+    case "run": return <RoutineRunner routine={tab.payload!} />;
+    case "erd": return <ErDiagram />;
+    case "history": return <QueryHistory />;
+    case "perf": return <PerformanceMonitor />;
+    case "migration": return <MigrationAssistant />;
+    case "compare": return <SchemaCompare />;
+    case "dba": return <DbaAdvisor />;
+    case "dbamanager": return <DbaManager />;
+    case "sessions": return <Sessions />;
+    case "deps": return <DependencyExplorer initialObject={tab.payload} />;
+    case "versions": return <VersionHistory />;
+    case "compile": return <CompileInvalid payload={tab.payload ?? "schema"} />;
+    case "joblog": return <JobRunLog initialJob={tab.payload} />;
+    case "admin": return <UserAdmin />;
+    case "repository": return <PlsqlRepository />;
+    default: return null;
+  }
+}
 
 export default function Workspace() {
   const harnessEnabled = useHarnessEnabled();
@@ -110,7 +136,7 @@ export default function Workspace() {
           <summary className="cursor-pointer rounded border border-bdr px-3 py-1 text-[12px]">Tools</summary>
           <div className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[65vh] overflow-auto rounded-lg border border-bdr bg-panel p-2 shadow-2xl">
             {[
-              { label: "Development", kinds: ["history", "versions", "repository", "migration", "deps", "erd"] },
+              { label: "Development", kinds: ["history", "versions", "repository", "compare", "migration", "deps", "erd"] },
               { label: "Database administration", kinds: ["perf", "dba", "dbamanager", "sessions", "joblog", "admin"] },
             ].map((group) => <div key={group.label}>
               <div className="px-2 py-2 text-[10px] uppercase text-mute">{group.label}</div>
@@ -165,31 +191,17 @@ export default function Workspace() {
             <ObjectEditor object={tab.payload!} tabId={tab.id} />
           </div>
         ))}
-        {/* The Migration tab is kept alive the same way: a compare over hundreds of tables, its
-            selection, apply report and a running copy are too costly to rebuild on every visit.
-            Closing the tab is what clears it. */}
-        {canView("migration") && s.tabs.filter((tab) => tab.kind === "migration").map((tab) => (
-          <div key={tab.id} className="h-full min-h-0" hidden={tab.id !== active.id}>
-            <MigrationAssistant />
-          </div>
+        {/* Tool state lives as long as its tab. Identity/role changes discard cached
+            tool contents, and authorization is always checked against the live store. */}
+        {s.tabs.filter(tab => TOOL_KINDS.has(tab.kind) && canView(tab.kind)).map(tab => (
+          <RetainedTool key={`${JSON.stringify(s.session)}:${s.accessRole}:${tab.id}`} active={tab.id === active.id} connectionScoped={!["compare", "migration", "dbamanager", "history", "admin", "repository"].includes(tab.kind)}>
+            <ToolContent tab={tab} />
+          </RetainedTool>
         ))}
         {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>
         {active.kind === "worksheet" && <SqlWorksheet key={active.id} />}
         {active.kind === "data" && <DataBrowser table={active.payload!} />}
-        {active.kind === "run" && <RoutineRunner key={active.id} routine={active.payload!} />}
         {active.kind === "tabledesign" && <TableDesigner key={active.id} table={active.payload!} tabId={active.id} />}
-        {active.kind === "erd" && <ErDiagram />}
-        {active.kind === "history" && <QueryHistory />}
-        {active.kind === "perf" && <PerformanceMonitor />}
-        {active.kind === "dba" && <DbaAdvisor />}
-        {active.kind === "dbamanager" && <DbaManager />}
-        {active.kind === "sessions" && <Sessions />}
-        {active.kind === "deps" && <DependencyExplorer key={active.id} initialObject={active.payload} />}
-        {active.kind === "versions" && <VersionHistory key={active.id} />}
-        {active.kind === "compile" && <CompileInvalid key={active.id} payload={active.payload ?? "schema"} />}
-        {active.kind === "joblog" && <JobRunLog key={active.id} initialJob={active.payload} />}
-        {active.kind === "admin" && <UserAdmin />}
-        {active.kind === "repository" && <PlsqlRepository />}
         </>}
       </div>
     </div>

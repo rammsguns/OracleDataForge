@@ -59,6 +59,8 @@ import {
   type CopyKind,
 } from "./objectCopy.ts";
 import oracledb from "oracledb";
+import { compareCatalog, compareSchema, compareSchemaObjects } from "./schemaCompare.ts";
+import type { SchemaCompareRequest } from "../src/utils/schemaCompare.ts";
 
 oracledb.fetchAsString = [oracledb.CLOB];
 // Thin mode sends this as V$SESSION.PROGRAM for every pool and standalone session.
@@ -5848,6 +5850,55 @@ function copyEndpoints(sourceId: string, targetId: string): { source: LiveConnec
 }
 
 /** What a copy would do, without doing any of it: GET ?source=<id>&kind=tables */
+app.get("/api/connections/:id/compare/catalog", requireSchemaMetadataAccess, async (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection." });
+  let conn: oracledb.Connection | undefined;
+  try {
+    const schema = compareSchema(req.query.schema, c.user);
+    conn = await getOraConn(c);
+    res.json(await compareCatalog(conn, schema));
+  } catch (e) { res.status(400).json({ error: errMsg(e) }); }
+  finally { await conn?.close().catch(() => {}); }
+});
+
+// Comparison only reads dictionary/table data and builds text; it never applies deployment SQL.
+app.post("/api/connections/:id/compare", requireSchemaMetadataAccess, async (req, res) => {
+  const ends = copyEndpoints(String(req.body?.sourceId ?? ""), routeId(req));
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  const body = req.body ?? {};
+  if (!Array.isArray(body.objects) || body.objects.length < 1 || body.objects.length > 500 ||
+      body.objects.some((o: unknown) => !o || typeof o !== "object" || typeof (o as { name?: unknown }).name !== "string" || typeof (o as { type?: unknown }).type !== "string")) {
+    return res.status(400).json({ error: "Select between 1 and 500 objects." });
+  }
+  const rowLimit = Number(body.rowLimit ?? 1000);
+  if (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000) return res.status(400).json({ error: "Row limit must be between 1 and 10,000." });
+  let source: oracledb.Connection | undefined, target: oracledb.Connection | undefined;
+  try {
+    const input: SchemaCompareRequest = {
+      sourceId: ends.source.id, sourceSchema: compareSchema(body.sourceSchema, ends.source.user),
+      targetSchema: compareSchema(body.targetSchema, ends.target.user), objects: body.objects,
+      compareData: body.compareData === true, includeStorage: body.includeStorage === true, rowLimit,
+    };
+    source = await getOraConn(ends.source);
+    target = await getOraConn(ends.target);
+    source.callTimeout = 60000; target.callTimeout = 60000;
+    if (input.compareData) {
+      await source.execute("SET TRANSACTION READ ONLY");
+      await target.execute("SET TRANSACTION READ ONLY");
+    }
+    const src = await compareCatalog(source, input.sourceSchema);
+    const dst = await compareCatalog(target, input.targetSchema);
+    const objects = await compareSchemaObjects(source, target, input, src, dst);
+    res.json({ sourceSchema: input.sourceSchema, targetSchema: input.targetSchema,
+      sourceName: ends.source.name, targetName: ends.target.name, comparedAt: new Date().toISOString(), objects });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
+  finally {
+    await source?.rollback().catch(() => {}); await target?.rollback().catch(() => {});
+    await source?.close().catch(() => {}); await target?.close().catch(() => {});
+  }
+});
+
 app.get("/api/connections/:id/objects/copy", requireSchemaMetadataAccess, async (req, res) => {
   const parsed = readCopyRequest(req.query as Record<string, unknown>, routeId(req));
   if ("error" in parsed) return res.status(400).json({ error: parsed.error });

@@ -5,11 +5,13 @@ import DbaAuditHistory from "./DbaAuditHistory";
 import { storageDestinations } from "../utils/storageDestinations";
 import { Database, RefreshCcw } from "lucide-react";
 import { useStudio } from "../state/store";
+import { useTabActive } from "../state/tabActivity";
 import { api, ConfirmRequiredError, type DbaManagementReport } from "../utils/api";
 import { memoryParameters, memorySql, storageChangeSql } from "../utils/dbaSql";
 import { Btn, EmptyState, Field, inputCls, Spinner } from "./ui";
 
 export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
+  const active = useTabActive();
   const s = useStudio();
   const conn = s.connections.find(c => c.id === s.activeConnId);
   const connected = conn?.live && conn.engine === "oracle" && conn.status === "connected";
@@ -46,11 +48,11 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
   useEffect(() => { setPath(""); setName(""); setPreview(""); setTypedName(""); setLastAudit(""); setEditing(false); }, [conn?.id]);
   useEffect(() => { setReport(null); }, [conn?.id, page]);
   useEffect(() => {
-    if (!editing) return;
+    if (!active || !editing) return;
     const onEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setEditing(false); };
     window.addEventListener("keydown", onEscape);
     return () => window.removeEventListener("keydown", onEscape);
-  }, [editing]);
+  }, [editing, active]);
   useEffect(() => {
     let cancelled = false;
     setError("");
@@ -62,14 +64,14 @@ export default function DbaStorage({ page }: { page: "Storage" | "Memory" }) {
     return () => { cancelled = true; };
   }, [conn?.id, connected, revision, page]);
   useEffect(() => {
-    if (!connected || page !== "Storage") return;
+    if (!active || !connected || page !== "Storage") return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") refresh(n => n + 1);
     }, 30_000);
     const onVisible = () => { if (document.visibilityState === "visible") refresh(n => n + 1); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
-  }, [connected, page, conn?.id]);
+  }, [connected, page, conn?.id, active]);
   // A preview always corresponds to the current form values.
   useEffect(() => { setPreview(""); setFormError(""); setTypedName(""); }, [page, action, name, path, mb, temporary, createBigfile, parameter, scope, autoextend, nextMb, nextBytes, maxMb, deleteFiles]);
 
