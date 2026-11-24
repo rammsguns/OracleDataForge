@@ -446,10 +446,10 @@ export function retargetSchema(
    * unescaped, retargeted by the same rules, and escaped again, so a quote inside the job's
    * own code survives the round trip.
    */
-  opts: { literals?: boolean } = {}
+  opts: { literals?: boolean; exactCase?: boolean } = {}
 ): string {
-  const src = from.trim().toUpperCase();
-  const dst = to.trim().toUpperCase();
+  const src = opts.exactCase ? from : from.trim().toUpperCase();
+  const dst = opts.exactCase ? to : to.trim().toUpperCase();
   if (!src || !dst || src === dst) return ddl;
 
   let out = "";
@@ -471,10 +471,10 @@ export function retargetSchema(
     // "HR". — a quoted identifier is a schema only when a dot and a name follow it
     if (ch === '"') {
       const end = skipQuoted(ddl, i + 1, '"');
-      const word = ddl.slice(i + 1, end - 1);
+      const word = ddl.slice(i + 1, end - 1).replace(/""/g, '"');
       const after = qualifierTail(ddl, end);
       if (after !== null && word === src) {
-        out += `"${dst}".`;
+        out += `"${dst.replace(/"/g, '""')}".`;
         i = after;
         continue;
       }
@@ -489,7 +489,7 @@ export function retargetSchema(
       const word = ddl.slice(i, j);
       const after = qualifierTail(ddl, j);
       if (after !== null && word.toUpperCase() === src) {
-        out += `${dst}.`;
+        out += opts.exactCase ? `"${dst.replace(/"/g, '""')}".` : `${dst}.`;
         i = after;
         continue;
       }

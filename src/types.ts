@@ -98,6 +98,7 @@ export type TabKind =
   | "history"
   | "perf"
   | "migration"
+  | "compare"
   | "dba"
   | "dbamanager"
   | "sessions"

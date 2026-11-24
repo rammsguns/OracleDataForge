@@ -32,6 +32,7 @@ import ErDiagram from "./ErDiagram";
 import QueryHistory from "./QueryHistory";
 import PerformanceMonitor from "./PerformanceMonitor";
 import MigrationAssistant from "./MigrationAssistant";
+import SchemaCompare from "./SchemaCompare";
 import DbaAdvisor from "./DbaAdvisor";
 import DbaManager from "./DbaManager";
 import DependencyExplorer from "./DependencyExplorer";
@@ -55,6 +56,7 @@ const TAB_ICON: Record<TabKind, React.ReactNode> = {
   history: <Clock3 size={12} />,
   perf: <Activity size={12} />,
   migration: <GitCompareArrows size={12} />,
+  compare: <GitCompareArrows size={12} />,
   dba: <Gauge size={12} />,
   dbamanager: <Hammer size={12} />,
   sessions: <Users size={12} />,
@@ -76,6 +78,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
   { kind: "deps", title: "Dependencies", label: "Dependencies" },
   { kind: "versions", title: "Version History", label: "Versions" },
   { kind: "migration", title: "Migration", label: "Migration" },
+  { kind: "compare", title: "Schema Compare", label: "Schema Compare" },
   { kind: "joblog", title: "Job Run Log", label: "Job Runs" },
   { kind: "admin", title: "Admin", label: "Admin" },
   { kind: "repository", title: "PL/SQL Repository", label: "Repository" },
@@ -89,6 +92,7 @@ function ToolContent({ tab }: { tab: Tab }) {
     case "history": return <QueryHistory />;
     case "perf": return <PerformanceMonitor />;
     case "migration": return <MigrationAssistant />;
+    case "compare": return <SchemaCompare />;
     case "dba": return <DbaAdvisor />;
     case "dbamanager": return <DbaManager />;
     case "sessions": return <Sessions />;
@@ -132,7 +136,7 @@ export default function Workspace() {
           <summary className="cursor-pointer rounded border border-bdr px-3 py-1 text-[12px]">Tools</summary>
           <div className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[65vh] overflow-auto rounded-lg border border-bdr bg-panel p-2 shadow-2xl">
             {[
-              { label: "Development", kinds: ["history", "versions", "repository", "migration", "deps", "erd"] },
+              { label: "Development", kinds: ["history", "versions", "repository", "compare", "migration", "deps", "erd"] },
               { label: "Database administration", kinds: ["perf", "dba", "dbamanager", "sessions", "joblog", "admin"] },
             ].map((group) => <div key={group.label}>
               <div className="px-2 py-2 text-[10px] uppercase text-mute">{group.label}</div>
@@ -190,7 +194,7 @@ export default function Workspace() {
         {/* Tool state lives as long as its tab. Identity/role changes discard cached
             tool contents, and authorization is always checked against the live store. */}
         {s.tabs.filter(tab => TOOL_KINDS.has(tab.kind) && canView(tab.kind)).map(tab => (
-          <RetainedTool key={`${JSON.stringify(s.session)}:${s.accessRole}:${tab.id}`} active={tab.id === active.id} connectionScoped={!["migration", "dbamanager", "history", "admin", "repository"].includes(tab.kind)}>
+          <RetainedTool key={`${JSON.stringify(s.session)}:${s.accessRole}:${tab.id}`} active={tab.id === active.id} connectionScoped={!["compare", "migration", "dbamanager", "history", "admin", "repository"].includes(tab.kind)}>
             <ToolContent tab={tab} />
           </RetainedTool>
         ))}
