@@ -143,7 +143,7 @@ function JobRuns({ connId, schema, initialJob }: { connId: string; schema: strin
       {!loading && !filtered.length && <EmptyState icon={<CalendarClock />} title="No matching job runs" hint="Try changing the view or clearing filters. Only recorded runs and currently running scheduler jobs are included." />}
       {!!filtered.length && <div className="overflow-x-auto">
         {view === "performance" ? <table className="w-full min-w-[950px] text-left text-[12px]">
-          <thead className="bg-panel text-[10.5px] uppercase text-mute"><tr>{["Job / step", "Runs", "Succeeded", "Failed / stopped", "Success", "Avg duration", "P95 duration", "Max duration", "Avg CPU", "Avg start delay", ""].map((label, i) => <th key={i} className="px-3 py-2">{label}</th>)}</tr></thead>
+          <thead className="bg-panel text-[10.5px] uppercase text-mute"><tr>{["Job / step", "Runs", "Succeeded", "Not succeeded", "Success", "Avg duration", "P95 duration", "Max duration", "Avg CPU", "Avg start delay", ""].map((label, i) => <th key={i} className="px-3 py-2">{label}</th>)}</tr></thead>
           <tbody>{performance.map(job => <tr key={JSON.stringify([job.job, job.step])} className="border-b border-bdrsoft hover:bg-panel2">
             <td className="px-3 py-2 font-mono">{job.job}{job.step && <div className="text-mute text-[10px]">{job.step}</div>}</td>
             {[job.count, job.succeeded, job.failed, `${Math.round(job.succeeded / job.count * 100)}%`, durationText(job.average), durationText(job.p95), durationText(job.max), durationText(job.cpu), durationText(job.delay)].map((value, i) => <td key={i} className="px-3 py-2 whitespace-nowrap tabular-nums text-soft">{value}</td>)}
@@ -164,7 +164,7 @@ function JobRuns({ connId, schema, initialJob }: { connId: string; schema: strin
           </tr>)}</tbody>
         </table>}
       </div>}
-      {view === "performance" && <p className="px-3 py-2 text-[11px] text-mute">Completed runs only. P95 uses the nearest-rank duration; CPU may be unavailable in Oracle. Failed includes failed, stopped, and broken runs. Start delay is time between requested and actual start.</p>}
+      {view === "performance" && <p className="px-3 py-2 text-[11px] text-mute">Completed runs only. P95 uses the nearest-rank duration; CPU may be unavailable in Oracle. Not succeeded includes every recorded outcome other than SUCCEEDED. Start delay is time between requested and actual start.</p>}
     </div>
     {selected && <Modal title={`${selected.job} — ${selected.live ? "running snapshot" : "run details"}`} onClose={closeDetails} width={850}>
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">{[

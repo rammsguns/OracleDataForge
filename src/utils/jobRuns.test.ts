@@ -65,3 +65,15 @@ test("duration formatting preserves unknown, zero, fractional and multi-day valu
   assert.equal(durationText(90061.5), "1d 1h 1m 1.5s");
   assert.equal(durationText(59.999), "1m");
 });
+
+test("performance accounts for every recorded non-success outcome and excludes running snapshots", () => {
+  const [stats] = jobPerformance([
+    run(), run({ status: "FAILED" }), run({ status: "STOPPED" }),
+    run({ status: "CHAIN_STALLED" }), run({ status: "UNKNOWN_OUTCOME" }),
+    run({ live: true, status: "RUNNING" }),
+  ]);
+  assert.equal(stats.count, 5);
+  assert.equal(stats.succeeded, 1);
+  assert.equal(stats.failed, 4);
+  assert.equal(stats.succeeded + stats.failed, stats.count);
+});

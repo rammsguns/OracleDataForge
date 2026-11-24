@@ -106,7 +106,7 @@ export function jobPerformance(runs: JobRun[]) {
     const avg = (values: number[]) => values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
     return { job: group[0].job, step: group[0].step, count: group.length,
       succeeded: group.filter(run => run.status === "SUCCEEDED").length,
-      failed: group.filter(run => run.status === "FAILED" || run.status === "STOPPED" || run.status === "BROKEN").length,
+      failed: group.filter(run => run.status !== "SUCCEEDED").length,
       average: avg(durations), p95: durations[Math.ceil(durations.length * .95) - 1] ?? null,
       max: durations.at(-1) ?? null, cpu: avg(cpus), delay: avg(delays) };
   }).sort((a, b) => (b.max ?? -Infinity) - (a.max ?? -Infinity) || a.job.localeCompare(b.job));
