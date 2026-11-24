@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, CalendarClock, FileText, RefreshCw, Search } from "lucide-react";
 import { useStudio } from "../state/store";
+import { useTabActive } from "../state/tabActivity";
 import { api, type JobRunOutput } from "../utils/api";
 import { durationText, filterJobRuns, jobPerformance, JOB_HISTORY_SQL, parseJobRuns, RUNNING_JOBS_SQL, type JobRun } from "../utils/jobRuns";
 import { Badge, Btn, EmptyState, Modal, Spinner, inputCls } from "./ui";
@@ -19,6 +20,7 @@ export default function JobRunLog({ initialJob }: { initialJob?: string }) {
 }
 
 function JobRuns({ connId, schema, initialJob }: { connId: string; schema: string; initialJob?: string }) {
+  const active = useTabActive();
   const { captureConnectionStatus, reportConnectionError } = useStudio();
   const [history, setHistory] = useState<JobRun[]>([]);
   const [running, setRunning] = useState<JobRun[]>([]);
@@ -74,10 +76,10 @@ function JobRuns({ connId, schema, initialJob }: { connId: string; schema: strin
   }, [connId, captureConnectionStatus, reportConnectionError]);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    if (!refreshSeconds) return;
+    if (!active || !refreshSeconds) return;
     const timer = window.setInterval(() => { if (!document.hidden) void load(); }, refreshSeconds * 1000);
     return () => window.clearInterval(timer);
-  }, [refreshSeconds, load]);
+  }, [refreshSeconds, load, active]);
 
   const all = useMemo(() => [...running, ...history], [running, history]);
   const filtered = useMemo(() => filterJobRuns(view === "performance" ? history : all, { search, status, hours, view, sort, slowSeconds }, updated ?? Date.now()), [all, history, search, status, hours, view, sort, slowSeconds, updated]);

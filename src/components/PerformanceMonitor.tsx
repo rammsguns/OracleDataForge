@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, AlertTriangle, CircleCheck, CircleX, HardDrive, Info, RefreshCcw, Timer, Users } from "lucide-react";
 import { useStudio } from "../state/store";
+import { useTabActive } from "../state/tabActivity";
 import { api, type PerfReport } from "../utils/api";
 import { Badge, Btn, EmptyState, Spinner } from "./ui";
 
@@ -66,6 +67,7 @@ function Sparkline({ points }: { points: number[] }) {
 /* ------------- live (real) dashboard ------------- */
 
 function LivePerf({ connId, connName }: { connId: string; connName: string }) {
+  const active = useTabActive();
   const s = useStudio();
   const [report, setReport] = useState<PerfReport | null>(null);
   const [loading, setLoading] = useState(false);
@@ -82,11 +84,12 @@ function LivePerf({ connId, connName }: { connId: string; connName: string }) {
   }, [connId]);
   useEffect(() => { load(); return () => { requestId.current++; }; }, [load]);
   useEffect(() => {
+    if (!active) return;
     const timer = window.setInterval(() => { if (document.visibilityState === "visible") load(); }, 30_000);
     const onVisible = () => { if (document.visibilityState === "visible") load(); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
-  }, [load]);
+  }, [load, active]);
 
   if (loading && !report) return <div className="h-full flex items-center justify-center"><Spinner label="Reading live performance data…" /></div>;
   if (error)

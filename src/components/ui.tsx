@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useRef } from "react";
+import { useTabActive } from "../state/tabActivity";
 import { Loader2, X } from "lucide-react";
 import type { MenuItem } from "../types";
 
@@ -97,18 +98,20 @@ export function EmptyState({ icon, title, hint, action }: { icon: ReactNode; tit
 }
 
 export function Modal({ title, onClose, children, width = 560 }: { title: string; onClose: () => void; children: ReactNode; width?: number }) {
+  const active = useTabActive();
   const ref = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
-  // mount-only: re-running this on renders would re-focus the dialog and steal
-  // focus from inputs mid-typing (onClose changes identity on every parent render)
+  // Focus on open or tab return; unrelated renders must not steal
+  // focus mid-typing (onClose changes identity on every parent render).
   useEffect(() => {
+    if (!active) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCloseRef.current();
     window.addEventListener("keydown", onKey);
     const initialFocus = ref.current?.querySelector<HTMLElement>("[data-dialog-autofocus]");
     (initialFocus ?? ref.current)?.focus();
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [active]);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-[2px] df-fade" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div
@@ -146,8 +149,10 @@ export const inputCls =
   "w-full h-8 px-2.5 rounded-md bg-panel2 border border-bdr text-[12.5px] text-ink placeholder:text-mute focus:border-accent focus:outline-none transition-colors";
 
 export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: MenuItem[]; onClose: () => void }) {
+  const active = useTabActive();
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    if (!active) return;
     const close = () => onClose();
     const key = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("mousedown", close);
@@ -156,7 +161,7 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
       window.removeEventListener("mousedown", close);
       window.removeEventListener("keydown", key);
     };
-  }, [onClose]);
+  }, [onClose, active]);
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   const left = Math.min(x, vw - 210);

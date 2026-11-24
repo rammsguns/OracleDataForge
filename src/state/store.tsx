@@ -1115,3 +1115,8 @@ export function useStudio(): Store {
   if (!s) throw new Error("useStudio outside provider");
   return s;
 }
+
+/** A retained tool keeps its last visible context while another tab is active. */
+export function StudioSnapshot({ value, children }: { value: Store; children: ReactNode }) {
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+}

@@ -22,6 +22,7 @@ import {
   Users,
 } from "lucide-react";
 import { useStudio } from "../state/store";
+import { useTabActive } from "../state/tabActivity";
 import { api, type DbaInsights, type DbaReport, type InsightArea, type InsightFinding, type InsightSeverity } from "../utils/api";
 import { AREA_LABEL, bySeverity, fmtCount, healthLabel, healthScore } from "../utils/dbaAdvisor";
 import { AREA_PANEL, Panel } from "./DbaAdvisorInsights";
@@ -303,6 +304,7 @@ function Overview({ report, insights, findings, onOpen }: { report: DbaReport; i
 }
 
 export default function DbaAdvisor() {
+  const active = useTabActive();
   const s = useStudio();
   const conn = s.connections.find((c) => c.id === s.activeConnId);
   const isOracleLive = !!conn?.live && conn.engine === "oracle";
@@ -335,12 +337,12 @@ export default function DbaAdvisor() {
     return () => { requestId.current++; };
   }, [load]);
   useEffect(() => {
-    if (!isOracleLive || !auto) return;
+    if (!active || !isOracleLive || !auto) return;
     const timer = window.setInterval(() => { if (document.visibilityState === "visible") load(); }, 60_000);
     const onVisible = () => { if (document.visibilityState === "visible") load(); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
-  }, [isOracleLive, auto, load]);
+  }, [isOracleLive, auto, load, active]);
 
   const findings = useMemo<Finding[]>(() => {
     const instance = (report?.advice ?? []).filter((a) => a.severity !== "good");
