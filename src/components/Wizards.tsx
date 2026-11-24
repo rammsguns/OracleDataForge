@@ -228,7 +228,8 @@ export function ConnectionWizard() {
         host: wallet ? service?.host ?? "" : host.trim(),
         port: wallet ? service?.port ?? 0 : port,
         user: user.trim() || "—",
-        status: "connected",
+        // Saving registers credentials; it does not open a database session.
+        status: "idle",
         color: "#f4b13e",
         live: true,
         database: database.trim(),

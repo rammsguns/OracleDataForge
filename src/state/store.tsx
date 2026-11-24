@@ -19,6 +19,7 @@ import type {
   Toast,
 } from "../types";
 import { api, type ExplainResult, type SessionInfo, type RowChangeRequest, type RowChangeResult } from "../utils/api";
+import { isConnectionFailure } from "../utils/connectionStatus";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { discardDataPreview } from "../utils/dataBrowserCache";
@@ -50,6 +51,7 @@ interface Store {
   connections: Connection[];
   addConnection: (c: Connection) => void;
   updateConnection: (c: Connection) => void;
+  reportConnectionError: (id: string, message: string) => void;
   removeConnection: (id: string) => void;
   /** close the pooled sessions of a live connection (it stays saved) */
   disconnectConn: (id: string) => Promise<void>;
@@ -578,6 +580,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  const reportConnectionError = useCallback((id: string, message: string) => {
+    if (isConnectionFailure(message)) setConnStatus(id, "error", message);
+  }, [setConnStatus]);
+
   const pushHistory = useCallback((statement: string, durationMs: number, rows: number, ok: boolean) => {
     const entry: HistoryEntry = {
       // timestamp + counter keeps ids unique across reloads (persisted ids could otherwise collide)
@@ -698,9 +704,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           scriptOutput = combinedOutput.slice(0, 1000);
           outputTruncated = previousTruncated || !!res.dbmsOutputTruncated || combinedOutput.length > 1000;
           setResult({ ...res, statement, dbmsOutput: scriptOutput, dbmsOutputTruncated: outputTruncated });
-          // the statement reached the database, so a session is open again —
-          // running a query is the one implicit way a connection gets connected
-          setConnStatus(conn.id, "connected");
+          if (!res.error) setConnStatus(conn.id, "connected");
+          else reportConnectionError(conn.id, res.error.message);
           pushHistory(statement, res.durationMs, res.rowsReturned, !res.error);
           if (res.error) toast("error", `${res.error.code}: execution failed`);
           else {
@@ -723,6 +728,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           }
         })
         .catch((err: Error) => {
+          reportConnectionError(conn.id, err.message);
           setResult({
             columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
             error: { message: err.message, line: 1, code: "BACKEND" },
@@ -735,7 +741,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           if (continueScript && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated, wsId);
         });
     },
-    [accessRole, toast, pushHistory, setConnStatus, setResultFor]
+    [accessRole, toast, pushHistory, setConnStatus, reportConnectionError, setResultFor]
   );
 
   const runSql = useCallback(
@@ -815,16 +821,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       .explain(conn.id, statement)
       .then((res) => {
         setPlan(res);
-        // running EXPLAIN opens a session, same as running a query
-        setConnStatus(conn.id, "connected");
+        if (!res.error) setConnStatus(conn.id, "connected");
+        else reportConnectionError(conn.id, res.error.message);
         if (res.error) toast("error", `${res.error.code}: could not build plan`);
       })
       .catch((err: Error) => {
+        reportConnectionError(conn.id, err.message);
         setPlan({ engine: "oracle", plan: null, totalCost: 0, error: { message: err.message, code: "BACKEND", line: 1 } });
         toast("error", "Backend unreachable — is the API server running?");
       })
       .finally(() => setPlanLoading(false));
-  }, [toast, setConnStatus, setPlanFor]);
+  }, [toast, setConnStatus, reportConnectionError, setPlanFor]);
 
   const openSqlWorksheet = useCallback((nextSql: string, title: string) => {
     if (!["Administrator", "Developer", "Viewer"].includes(accessRole)) {
@@ -977,6 +984,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       connections,
       addConnection,
       updateConnection,
+      reportConnectionError,
       removeConnection,
       disconnectConn,
       disconnectAll,
@@ -1042,7 +1050,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, reportConnectionError, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

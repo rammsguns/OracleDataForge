@@ -303,6 +303,7 @@ export default function Sidebar() {
         }))
       )
       .catch((e: Error) => {
+        s.reportConnectionError(c.id, e.message);
         setLiveSchemas((m) => {
           const previous = m[c.id];
           return { ...m, [c.id]: previous?.status === "ready"
@@ -342,6 +343,7 @@ export default function Sidebar() {
       const bad = g.invalid?.length ?? 0;
       if (!quiet) s.toast("success", `${label} refreshed — ${g.items.length} object(s)${bad ? `, ${bad} invalid` : ""}`);
     } catch (e) {
+      s.reportConnectionError(connId, (e as Error).message);
       if (!quiet) s.toast("error", `Could not refresh ${label} — ${(e as Error).message}`);
     }
   };
@@ -429,7 +431,10 @@ export default function Sidebar() {
           } };
         });
       }).catch((e: Error) => {
-        if (!cancelled) s.toast("warning", `Could not refresh schema — ${e.message}. Use Refresh to retry.`);
+        if (!cancelled) {
+          s.reportConnectionError(id, e.message);
+          s.toast("warning", `Could not refresh schema — ${e.message}. Use Refresh to retry.`);
+        }
       });
     }
     return () => { cancelled = true; };
