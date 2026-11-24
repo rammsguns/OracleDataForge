@@ -367,6 +367,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const setPlanFor = useCallback((id: string, value: ExplainResult | null) => setPlans((p) => ({ ...p, [id]: value })), []);
   const setPlanVisible = useCallback((value: boolean) => setPlanVisibles((p) => ({ ...p, [worksheetIdRef.current]: value })), []);
   const [planLoading, setPlanLoading] = useState(false);
+  const explainRequest = useRef<{ connId: string } | null>(null);
   const [schemaBump, setSchemaBump] = useState(0);
   const [groupRefresh, setGroupRefresh] = useState<{ labels: string[]; seq: number }>({ labels: [], seq: 0 });
   const [history, setHistory] = useState<HistoryEntry[]>(loadStoredHistory);
@@ -575,7 +576,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const connectionStatusRequests = useRef(new ConnectionStatusRequests());
   const captureConnectionStatus = useCallback((id: string) => connectionStatusRequests.current.capture(id), []);
-  const invalidateConnectionStatus = useCallback((id: string) => connectionStatusRequests.current.invalidate(id), []);
+  const invalidateConnectionStatus = useCallback((id: string) => {
+    connectionStatusRequests.current.invalidate(id);
+    if (explainRequest.current?.connId === id) {
+      explainRequest.current = null;
+      setPlanLoading(false);
+    }
+  }, []);
 
   const setConnStatus = useCallback((id: string, status: Connection["status"], lastError?: string) => {
     setConnections((prev) =>
@@ -723,14 +730,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         return api.query(conn.id, statement, true, transactionId);
       })()
         .then((res) => {
+          if (!isCurrent()) return;
           const combinedOutput = [...previousOutput, ...(res.dbmsOutput ?? [])];
           scriptOutput = combinedOutput.slice(0, 1000);
           outputTruncated = previousTruncated || !!res.dbmsOutputTruncated || combinedOutput.length > 1000;
           setResult({ ...res, statement, dbmsOutput: scriptOutput, dbmsOutputTruncated: outputTruncated });
-          if (isCurrent()) {
-            if (!res.error) setConnStatus(conn.id, "connected");
-            else reportConnectionError(conn.id, res.error.message);
-          }
+          if (!res.error) setConnStatus(conn.id, "connected");
+          else reportConnectionError(conn.id, res.error.message);
           pushHistory(statement, res.durationMs, res.rowsReturned, !res.error);
           if (res.error) toast("error", `${res.error.code}: execution failed`);
           else {
@@ -753,7 +759,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           }
         })
         .catch((err: Error) => {
-          if (isCurrent()) reportConnectionError(conn.id, err.message);
+          if (!isCurrent()) return;
+          reportConnectionError(conn.id, err.message);
           setResult({
             columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
             error: { message: err.message, line: 1, code: "BACKEND" },
@@ -841,24 +848,31 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setPlan({ engine: "oracle", plan: null, totalCost: 0, error: { message: "Nothing to explain — the worksheet is empty.", code: "DF-0001", line: 1 } });
       return;
     }
-    const isCurrent = captureConnectionStatus(conn.id);
+    const isConnectionCurrent = captureConnectionStatus(conn.id);
+    const request = { connId: conn.id };
+    explainRequest.current = request;
+    const isCurrent = () => isConnectionCurrent() && explainRequest.current === request;
     setPlanLoading(true);
     api
       .explain(conn.id, statement)
       .then((res) => {
+        if (!isCurrent()) return;
         setPlan(res);
-        if (isCurrent()) {
-          if (!res.error) setConnStatus(conn.id, "connected");
-          else reportConnectionError(conn.id, res.error.message);
-        }
+        if (!res.error) setConnStatus(conn.id, "connected");
+        else reportConnectionError(conn.id, res.error.message);
         if (res.error) toast("error", `${res.error.code}: could not build plan`);
       })
       .catch((err: Error) => {
-        if (isCurrent()) reportConnectionError(conn.id, err.message);
+        if (!isCurrent()) return;
+        reportConnectionError(conn.id, err.message);
         setPlan({ engine: "oracle", plan: null, totalCost: 0, error: { message: err.message, code: "BACKEND", line: 1 } });
         toast("error", "Backend unreachable — is the API server running?");
       })
-      .finally(() => setPlanLoading(false));
+      .finally(() => {
+        if (!isCurrent()) return;
+        explainRequest.current = null;
+        setPlanLoading(false);
+      });
   }, [toast, setConnStatus, reportConnectionError, captureConnectionStatus, setPlanFor]);
 
   const openSqlWorksheet = useCallback((nextSql: string, title: string) => {
