@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isConnectionFailure } from "./connectionStatus";
+import { ConnectionStatusRequests, isConnectionFailure } from "./connectionStatus";
 
 test("recognizes connection establishment, authentication and lost-session failures", () => {
   for (const message of [
@@ -22,4 +22,32 @@ test("SQL, privilege and transaction errors do not mean the connection failed", 
     "TRANSACTION-EXPIRED: start a new worksheet session",
     "Write confirmation required", "403 Forbidden",
   ]) assert.equal(isConnectionFailure(message), false, message);
+});
+
+
+test("a late query response cannot mark a deliberately disconnected connection connected", async () => {
+  const requests = new ConnectionStatusRequests();
+  let status = "connected";
+  let resolveQuery!: () => void;
+  const query = new Promise<void>(resolve => { resolveQuery = resolve; });
+  const isCurrent = requests.capture("a");
+  const response = query.then(() => { if (isCurrent()) status = "connected"; });
+  requests.invalidate("a");
+  status = "idle";
+  resolveQuery();
+  await response;
+  assert.equal(status, "idle");
+});
+
+test("old failures cannot overwrite a reconnected session and other connections remain current", () => {
+  const requests = new ConnectionStatusRequests();
+  const oldSession = requests.capture("a");
+  const otherConnection = requests.capture("b");
+  requests.invalidate("a");
+  const reconnectedSession = requests.capture("a");
+  assert.equal(oldSession(), false);
+  assert.equal(otherConnection(), true);
+  assert.equal(reconnectedSession(), true);
+  requests.invalidate("a");
+  assert.equal(reconnectedSession(), false);
 });

@@ -283,9 +283,11 @@ export default function Sidebar() {
         ? { ...previous, refreshing: true }
         : { status: "loading" } };
     });
+    const isCurrent = s.captureConnectionStatus(c.id);
     api
       .schema(c.id)
-      .then((r) =>
+      .then((r) => {
+        if (!isCurrent()) return;
         setLiveSchemas((m) => ({
           ...m,
           [c.id]: {
@@ -300,9 +302,10 @@ export default function Sidebar() {
             },
             rowCounts: Object.fromEntries(r.tables.map((t) => [t.name, t.rowCount])),
           },
-        }))
-      )
+        }));
+      })
       .catch((e: Error) => {
+        if (!isCurrent()) return;
         s.reportConnectionError(c.id, e.message);
         setLiveSchemas((m) => {
           const previous = m[c.id];
@@ -321,8 +324,10 @@ export default function Sidebar() {
    * including how far each other group had been expanded.
    */
   const refreshGroupAsync = async (connId: string, label: string, quiet = false) => {
+    const isCurrent = s.captureConnectionStatus(connId);
     try {
       const g = await api.schemaGroup(connId, label);
+      if (!isCurrent()) return;
       setLiveSchemas((m) => {
         const cur = m[connId];
         if (cur?.status !== "ready") return m; // the tree was dropped while we were reading
@@ -343,6 +348,7 @@ export default function Sidebar() {
       const bad = g.invalid?.length ?? 0;
       if (!quiet) s.toast("success", `${label} refreshed — ${g.items.length} object(s)${bad ? `, ${bad} invalid` : ""}`);
     } catch (e) {
+      if (!isCurrent()) return;
       s.reportConnectionError(connId, (e as Error).message);
       if (!quiet) s.toast("error", `Could not refresh ${label} — ${(e as Error).message}`);
     }
@@ -413,8 +419,9 @@ export default function Sidebar() {
     setLiveSchemas(current => Object.fromEntries(Object.entries(current).filter(([id]) => connected.has(id))));
     let cancelled = false;
     for (const [id] of loaded) {
+      const isCurrent = s.captureConnectionStatus(id);
       void api.schema(id).then(r => {
-        if (cancelled) return;
+        if (cancelled || !isCurrent()) return;
         setLiveSchemas(current => {
           if (current[id]?.status !== "ready") return current;
           return { ...current, [id]: {
@@ -431,7 +438,7 @@ export default function Sidebar() {
           } };
         });
       }).catch((e: Error) => {
-        if (!cancelled) {
+        if (!cancelled && isCurrent()) {
           s.reportConnectionError(id, e.message);
           s.toast("warning", `Could not refresh schema — ${e.message}. Use Refresh to retry.`);
         }
