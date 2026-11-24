@@ -12,14 +12,15 @@ const filters: RunFilters = { search: "", status: "all", hours: 0, slowSeconds: 
 const now = Date.parse("2026-11-23T11:00:00-06:00");
 
 test("scheduler mapping handles reordered columns, absent CPU, timestamps and zero durations", () => {
-  const result: LiveQueryResult = { columns: ["JOB_NAME", "DURATION_SECONDS", "CPU_SECONDS", "LOG_ID", "STARTED_AT", "STATUS"],
-    rows: [["DAILY_LOAD", 0, null, 12, "2026-11-23T10:00:00.000-06:00", "RUNNING"]], error: null, durationMs: 1, rowsReturned: 1 };
+  const result: LiveQueryResult = { columns: ["JOB_NAME", "DURATION_SECONDS", "CPU_SECONDS", "LOG_ID", "STARTED_AT", "STATUS", "ADDITIONAL_INFO"],
+    rows: [["DAILY_LOAD", 0, null, 12, "2026-11-23T10:00:00.000-06:00", "RUNNING", "Unicode details: résumé ✓"]], error: null, durationMs: 1, rowsReturned: 1 };
   const [mapped] = parseJobRuns(result, true);
   assert.equal(mapped.id, 12);
   assert.equal(mapped.live, true);
   assert.equal(mapped.duration, 0);
   assert.equal(mapped.cpu, null);
   assert.equal(mapped.started, result.rows[0][4]);
+  assert.equal(mapped.info, "Unicode details: résumé ✓");
   assert.throws(() => parseJobRuns({ ...result, error: { code: "ORA-00942", line: 1, message: "View access denied" } }), /View access denied/);
 });
 

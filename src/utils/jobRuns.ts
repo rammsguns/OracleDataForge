@@ -1,6 +1,7 @@
 import type { LiveQueryResult } from "./api";
 
 // Convert Oracle intervals on the server: driver interval serialization varies by version.
+// SUBSTR followed by CAST also normalizes CLOB/VARCHAR2 details to a bounded text preview.
 const seconds = (column: string) => `(EXTRACT(DAY FROM ${column}) * 86400 + EXTRACT(HOUR FROM ${column}) * 3600 + EXTRACT(MINUTE FROM ${column}) * 60 + EXTRACT(SECOND FROM ${column}))`;
 const timestamp = (column: string) => `TO_CHAR(${column}, 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM')`;
 export const JOB_HISTORY_SQL = `SELECT * FROM (
@@ -9,7 +10,8 @@ export const JOB_HISTORY_SQL = `SELECT * FROM (
     ${timestamp("req_start_date")} AS requested_at,
     ${seconds("run_duration")} AS duration_seconds, ${seconds("cpu_used")} AS cpu_seconds,
     ${seconds("(actual_start_date - req_start_date)")} AS delay_seconds,
-    instance_id, session_id, error# AS error_code, additional_info
+    instance_id, session_id, error# AS error_code,
+    CAST(SUBSTR(additional_info, 1, 1000) AS VARCHAR2(4000)) AS additional_info
   FROM user_scheduler_job_run_details ORDER BY log_id DESC
 ) WHERE ROWNUM <= 500`;
 export const RUNNING_JOBS_SQL = `SELECT * FROM (
