@@ -19,6 +19,7 @@ import type {
   Toast,
 } from "../types";
 import { api, type ExplainResult, type SessionInfo, type RowChangeRequest, type RowChangeResult } from "../utils/api";
+import { ConnectionStatusRequests, isConnectionFailure } from "../utils/connectionStatus";
 import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { discardDataPreview } from "../utils/dataBrowserCache";
@@ -50,6 +51,8 @@ interface Store {
   connections: Connection[];
   addConnection: (c: Connection) => void;
   updateConnection: (c: Connection) => void;
+  reportConnectionError: (id: string, message: string) => void;
+  captureConnectionStatus: (id: string) => () => boolean;
   removeConnection: (id: string) => void;
   /** close the pooled sessions of a live connection (it stays saved) */
   disconnectConn: (id: string) => Promise<void>;
@@ -364,6 +367,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const setPlanFor = useCallback((id: string, value: ExplainResult | null) => setPlans((p) => ({ ...p, [id]: value })), []);
   const setPlanVisible = useCallback((value: boolean) => setPlanVisibles((p) => ({ ...p, [worksheetIdRef.current]: value })), []);
   const [planLoading, setPlanLoading] = useState(false);
+  const explainRequest = useRef<{ connId: string } | null>(null);
   const [schemaBump, setSchemaBump] = useState(0);
   const [groupRefresh, setGroupRefresh] = useState<{ labels: string[]; seq: number }>({ labels: [], seq: 0 });
   const [history, setHistory] = useState<HistoryEntry[]>(loadStoredHistory);
@@ -570,6 +574,16 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setGroupRefresh((g) => ({ labels, seq: g.seq + 1 }));
   }, []);
 
+  const connectionStatusRequests = useRef(new ConnectionStatusRequests());
+  const captureConnectionStatus = useCallback((id: string) => connectionStatusRequests.current.capture(id), []);
+  const invalidateConnectionStatus = useCallback((id: string) => {
+    connectionStatusRequests.current.invalidate(id);
+    if (explainRequest.current?.connId === id) {
+      explainRequest.current = null;
+      setPlanLoading(false);
+    }
+  }, []);
+
   const setConnStatus = useCallback((id: string, status: Connection["status"], lastError?: string) => {
     setConnections((prev) =>
       prev.some((c) => c.id === id && (c.status !== status || c.lastError !== lastError))
@@ -577,6 +591,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         : prev
     );
   }, []);
+
+  const reportConnectionError = useCallback((id: string, message: string) => {
+    if (isConnectionFailure(message)) setConnStatus(id, "error", message);
+  }, [setConnStatus]);
 
   const pushHistory = useCallback((statement: string, durationMs: number, rows: number, ok: boolean) => {
     const entry: HistoryEntry = {
@@ -597,11 +615,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const isAutoCommit = useCallback((id: string) => autoCommitEnabledRef.current[id] === true, []);
   const changeTableRow = useCallback(async (id: string, request: RowChangeRequest, confirmed = false) => {
     if (worksheetBusy.current) throw new Error('Wait for the current transaction operation to finish.');
+    const isCurrent = captureConnectionStatus(id);
     worksheetBusy.current = true; setTransactionBusy(true);
     try {
       let token = transactionsRef.current[id];
       if (!token && !autoCommitEnabledRef.current[id]) {
         const session = await api.startWorksheetSession(id);
+        if (!isCurrent()) throw new Error('Connection changed while opening the worksheet session.');
         token = session.transactionId;
         transactionsRef.current = { ...transactionsRef.current, [id]: token };
         setTransactions(current => ({ ...current, [id]: session.transactionId }));
@@ -609,17 +629,23 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       }
       // Refuse older API processes that ignore transaction tokens before sending a write.
       if (token) await api.tableRows(id, request.table, token);
+      if (!isCurrent()) throw new Error('Connection changed before the table update.');
       return await api.changeTableRow(id, request, confirmed, token);
+    } catch (error) {
+      if (isCurrent()) reportConnectionError(id, (error as Error).message);
+      throw error;
     } finally { worksheetBusy.current = false; setTransactionBusy(false); }
-  }, [setConnStatus]);
+  }, [setConnStatus, captureConnectionStatus, reportConnectionError]);
 
   const finishTransaction = useCallback(async (action: 'COMMIT' | 'ROLLBACK', close = false, id = activeConnRef.current?.id) => {
     if (!id || worksheetBusy.current) return;
     const token = transactionsRef.current[id];
     if (!token) { toast('info', 'No worksheet transaction has started yet.'); return; }
+    const isCurrent = captureConnectionStatus(id);
     worksheetBusy.current = true; setTransactionBusy(true);
     try {
       const res = await api.query(id, action, true, token, close);
+      if (!isCurrent()) return;
       if (res.error) {
         if (close && res.error.code === 'TRANSACTION-EXPIRED') {
           setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
@@ -633,9 +659,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       }
       toast('success', `${action === 'COMMIT' ? 'Committed' : 'Rolled back'} worksheet transaction${close ? ' · Auto-commit on' : ''}`);
       setSchemaBump(b => b + 1);
-    } catch (e) { toast('error', (e as Error).message); }
+    } catch (e) {
+      if (isCurrent()) reportConnectionError(id, (e as Error).message);
+      toast('error', (e as Error).message);
+    }
     finally { worksheetBusy.current = false; setTransactionBusy(false); }
-  }, [toast]);
+  }, [toast, captureConnectionStatus, reportConnectionError]);
 
   const toggleAutoCommit = useCallback(async () => {
     const conn = activeConnRef.current;
@@ -649,16 +678,21 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       toast('info', 'Auto-commit on for this worksheet connection.');
       return;
     }
+    const isCurrent = captureConnectionStatus(conn.id);
     worksheetBusy.current = true; setTransactionBusy(true);
     try {
       const res = await api.startWorksheetSession(conn.id);
+      if (!isCurrent()) return;
       setTransactions(current => ({ ...current, [conn.id]: res.transactionId }));
       setAutoCommitEnabled(current => ({ ...current, [conn.id]: false }));
       setConnStatus(conn.id, 'connected');
       toast('info', 'Auto-commit off for this worksheet connection. Use Commit or Rollback.');
-    } catch (e) { toast('error', (e as Error).message); }
+    } catch (e) {
+      if (isCurrent()) reportConnectionError(conn.id, (e as Error).message);
+      toast('error', (e as Error).message);
+    }
     finally { worksheetBusy.current = false; setTransactionBusy(false); }
-  }, [toast, finishTransaction, setConnStatus]);
+  }, [toast, finishTransaction, setConnStatus, captureConnectionStatus, reportConnectionError]);
 
   const reallyRun = useCallback(
     (statement: string, conn = activeConnRef.current, transactionId = transactionsRef.current[conn?.id ?? ''], remaining: string[] = [], previousOutput: string[] = [], previousTruncated = false, wsId = worksheetIdRef.current) => {
@@ -677,6 +711,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("warning", "No connection selected");
         return;
       }
+      const isCurrent = captureConnectionStatus(conn.id);
       worksheetBusy.current = true;
       setRunning(true);
       setPlanVisibles((p) => ({ ...p, [wsId]: false }));
@@ -686,6 +721,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       (async () => {
         if (!transactionId && !autoCommitEnabledRef.current[conn.id] && !conn.readOnly && ['Administrator', 'Developer'].includes(accessRole)) {
           const session = await api.startWorksheetSession(conn.id);
+          if (!isCurrent()) throw new Error('Connection changed while opening the worksheet session.');
           transactionId = session.transactionId;
           transactionsRef.current = { ...transactionsRef.current, [conn.id]: transactionId };
           setTransactions(current => ({ ...current, [conn.id]: session.transactionId }));
@@ -694,17 +730,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         return api.query(conn.id, statement, true, transactionId);
       })()
         .then((res) => {
+          if (!isCurrent()) return;
           const combinedOutput = [...previousOutput, ...(res.dbmsOutput ?? [])];
           scriptOutput = combinedOutput.slice(0, 1000);
           outputTruncated = previousTruncated || !!res.dbmsOutputTruncated || combinedOutput.length > 1000;
           setResult({ ...res, statement, dbmsOutput: scriptOutput, dbmsOutputTruncated: outputTruncated });
-          // the statement reached the database, so a session is open again —
-          // running a query is the one implicit way a connection gets connected
-          setConnStatus(conn.id, "connected");
+          if (!res.error) setConnStatus(conn.id, "connected");
+          else reportConnectionError(conn.id, res.error.message);
           pushHistory(statement, res.durationMs, res.rowsReturned, !res.error);
           if (res.error) toast("error", `${res.error.code}: execution failed`);
           else {
-            continueScript = true;
+            continueScript = isCurrent();
             toast(
               "success",
               `${res.rowsReturned} row(s) in ${res.durationMs} ms${res.truncated ? " (showing first 1,000)" : ""}`
@@ -723,6 +759,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
           }
         })
         .catch((err: Error) => {
+          if (!isCurrent()) return;
+          reportConnectionError(conn.id, err.message);
           setResult({
             columns: [], rows: [], durationMs: 0, rowsReturned: 0, statement,
             error: { message: err.message, line: 1, code: "BACKEND" },
@@ -732,10 +770,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         .finally(() => {
           worksheetBusy.current = false;
           setRunning(false);
-          if (continueScript && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated, wsId);
+          if (continueScript && isCurrent() && remaining.length) reallyRun(remaining[0], conn, transactionId, remaining.slice(1), scriptOutput, outputTruncated, wsId);
         });
     },
-    [accessRole, toast, pushHistory, setConnStatus, setResultFor]
+    [accessRole, toast, pushHistory, setConnStatus, reportConnectionError, captureConnectionStatus, setResultFor]
   );
 
   const runSql = useCallback(
@@ -810,21 +848,32 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setPlan({ engine: "oracle", plan: null, totalCost: 0, error: { message: "Nothing to explain — the worksheet is empty.", code: "DF-0001", line: 1 } });
       return;
     }
+    const isConnectionCurrent = captureConnectionStatus(conn.id);
+    const request = { connId: conn.id };
+    explainRequest.current = request;
+    const isCurrent = () => isConnectionCurrent() && explainRequest.current === request;
     setPlanLoading(true);
     api
       .explain(conn.id, statement)
       .then((res) => {
+        if (!isCurrent()) return;
         setPlan(res);
-        // running EXPLAIN opens a session, same as running a query
-        setConnStatus(conn.id, "connected");
+        if (!res.error) setConnStatus(conn.id, "connected");
+        else reportConnectionError(conn.id, res.error.message);
         if (res.error) toast("error", `${res.error.code}: could not build plan`);
       })
       .catch((err: Error) => {
+        if (!isCurrent()) return;
+        reportConnectionError(conn.id, err.message);
         setPlan({ engine: "oracle", plan: null, totalCost: 0, error: { message: err.message, code: "BACKEND", line: 1 } });
         toast("error", "Backend unreachable — is the API server running?");
       })
-      .finally(() => setPlanLoading(false));
-  }, [toast, setConnStatus, setPlanFor]);
+      .finally(() => {
+        if (!isCurrent()) return;
+        explainRequest.current = null;
+        setPlanLoading(false);
+      });
+  }, [toast, setConnStatus, reportConnectionError, captureConnectionStatus, setPlanFor]);
 
   const openSqlWorksheet = useCallback((nextSql: string, title: string) => {
     if (!["Administrator", "Developer", "Viewer"].includes(accessRole)) {
@@ -859,16 +908,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
 
   const updateConnection = useCallback(
     (c: Connection) => {
+      invalidateConnectionStatus(c.id);
       // the backend recycled the pools on PUT, so the connection is closed again
       setConnections((prev) => prev.map((x) => (x.id === c.id ? { ...c, status: "idle" } : x)));
       setSchemaBump((b) => b + 1); // cached schemas may point at the old target
       toast("success", `Connection "${c.name}" updated — connect again to browse it`);
     },
-    [toast]
+    [toast, invalidateConnectionStatus]
   );
 
   const removeConnection = useCallback(
     (id: string) => {
+      invalidateConnectionStatus(id);
       setConnections((prev) => {
         const conn = prev.find((c) => c.id === id);
         if (conn?.live) api.remove(id).catch(() => {}); // backend forgets the credentials too
@@ -878,7 +929,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       });
       toast("info", "Connection removed");
     },
-    [toast]
+    [toast, invalidateConnectionStatus]
   );
 
   // "idle" is what the sidebar reads as disconnected: the pool is closed and the
@@ -887,8 +938,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       const conn = connectionsRef.current.find((c) => c.id === id);
       if (!conn?.live) return;
+      invalidateConnectionStatus(id);
+      const isCurrent = captureConnectionStatus(id);
       try {
         const r = await api.disconnect(id);
+        if (!isCurrent()) return;
         setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         setConnStatus(id, "idle");
         setSchemaBump((b) => b + 1); // drop the cached catalog of the closed session
@@ -897,7 +951,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         toast("error", `Could not disconnect "${conn.name}": ${(e as Error).message}`);
       }
     },
-    [setConnStatus, toast]
+    [setConnStatus, toast, invalidateConnectionStatus, captureConnectionStatus]
   );
 
   // One pass over every open connection, with a single summary toast: disconnecting
@@ -910,8 +964,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     }
     const failures = await Promise.all(
       open.map(async (c) => {
+        invalidateConnectionStatus(c.id);
+        const isCurrent = captureConnectionStatus(c.id);
         try {
           await api.disconnect(c.id);
+          if (!isCurrent()) return null;
           setTransactions(current => { const next = { ...current }; delete next[c.id]; return next; });
           setConnStatus(c.id, "idle");
           return null;
@@ -925,15 +982,18 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     const closed = open.length - failed.length;
     if (failed.length) toast("error", `Disconnected ${closed} of ${open.length} — ${failed.join("; ")}`);
     else toast("info", `Disconnected ${closed} connection${closed === 1 ? "" : "s"}`);
-  }, [setConnStatus, toast]);
+  }, [setConnStatus, toast, invalidateConnectionStatus, captureConnectionStatus]);
 
   const reconnectConn = useCallback(
     async (id: string) => {
       const conn = connectionsRef.current.find((c) => c.id === id);
       if (!conn?.live) return;
+      invalidateConnectionStatus(id);
+      const isCurrent = captureConnectionStatus(id);
       toast("info", `Connecting to "${conn.name}"…`);
       try {
         const r = await api.reconnect(id);
+        if (!isCurrent()) return;
         setTransactions(current => { const next = { ...current }; delete next[id]; return next; });
         if (!r.ok) {
           setConnStatus(id, "error", r.error);
@@ -945,11 +1005,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         setSchemaBump((b) => b + 1); // invalidate the catalog; Explorer loads it on request
         toast("success", `"${conn.name}" connected — ${r.version} (${r.ms} ms)`);
       } catch (e) {
-        setConnStatus(id, "error", (e as Error).message);
+        if (isCurrent()) setConnStatus(id, "error", (e as Error).message);
         toast("error", `Could not reconnect "${conn.name}": ${(e as Error).message}`);
       }
     },
-    [setConnStatus, toast]
+    [setConnStatus, toast, invalidateConnectionStatus, captureConnectionStatus]
   );
 
   const toggleFavorite = useCallback((id: string) => {
@@ -977,6 +1037,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       connections,
       addConnection,
       updateConnection,
+      reportConnectionError,
+      captureConnectionStatus,
       removeConnection,
       disconnectConn,
       disconnectAll,
@@ -1042,7 +1104,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, reportConnectionError, captureConnectionStatus, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
