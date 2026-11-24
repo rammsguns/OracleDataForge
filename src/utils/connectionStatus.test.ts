@@ -9,6 +9,8 @@ test("recognizes connection establishment, authentication and lost-session failu
     "ORA-01017: invalid username/password; logon denied",
     "ORA-12514: listener does not currently know of service",
     "ORA-03113: end-of-file on communication channel",
+    "ORA-00600: internal error code",
+    "ORA-07445: exception encountered: core dump",
     "connect ECONNREFUSED", "connect ETIMEDOUT", "Failed to fetch",
   ]) assert.equal(isConnectionFailure(message), true, message);
 });
