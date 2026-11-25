@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type oracledb from "oracledb";
 import { compareCatalog, compareDataLiteral, compareSchema, compareSchemaObjects, compareTableData, diffCompareData, remapSxml } from "./schemaCompare.ts";
-import { compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareRequest, type SchemaCompareResult } from "../src/utils/schemaCompare.ts";
+import { targetNamespaceCollision, compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareRequest, type SchemaCompareResult } from "../src/utils/schemaCompare.ts";
 
 test("schema names preserve quoted case and reject SQL fragments", () => {
   assert.equal(compareSchema("dev", "OTHER"), "DEV");
@@ -159,4 +159,38 @@ test("script exports only selected objects, gates drops and data, and keeps DDL 
   assert.ok(full.indexOf("DROP TABLE OLD;") < full.indexOf("UPDATE T SET"));
   assert.match(full, /CURRENT_SCHEMA = "PROD"/);
   assert.ok(!deploymentScript(result, new Set(), true, true).includes("CREATE OR REPLACE PROCEDURE"));
+});
+
+
+test('comparison blocks shared-namespace collisions without reading or exposing DDL', async () => {
+  const view = {name: 'V', type: 'VIEW'};
+  const sourceCatalog = {schema: 'DEV', objects: [view], types: ['VIEW']};
+  const targetCatalog = {schema: 'PROD', objects: [{name: 'V', type: 'TABLE'}], types: ['TABLE']};
+  const conn = fakeConnection(() => {throw new Error('Metadata must not be read for a collision');});
+  const [result] = await compareSchemaObjects(conn, conn, {...input, objects: [view]}, sourceCatalog, targetCatalog);
+  assert.equal(result.status, 'error'); assert.equal(result.script, '');
+  assert.match(result.warning!, /VIEW V conflicts with existing TABLE V/);
+});
+
+test('Oracle namespace collision checks allow package bodies and separate index/trigger namespaces', () => {
+  const target = {schema: 'PROD', objects: [{name: 'P', type: 'PACKAGE'}, {name: 'T', type: 'INDEX'}, {name: 'X', type: 'TRIGGER'}], types: []};
+  assert.equal(targetNamespaceCollision({name: 'P', type: 'PACKAGE BODY'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'T', type: 'TABLE'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'X', type: 'TABLE'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'P', type: 'TABLE'}, target)?.type, 'PACKAGE');
+});
+
+
+test('creation tablespaces affect deployment DDL while source definitions and existing target objects stay unchanged', async () => {
+  const table = {name: 'T', type: 'TABLE'};
+  const ddl = 'CREATE TABLE "DEV"."T" (ID NUMBER PRIMARY KEY);';
+  const src = fakeConnection(() => ({outBinds: {output: ddl}}));
+  const dst = fakeConnection(() => ({outBinds: {output: ddl.replace('DEV', 'PROD')}}));
+  const catalog = {schema: 'DEV', objects: [table], types: ['TABLE']};
+  const req = {...input, objects: [table], tableTablespace: 'DATA_T', indexTablespace: 'INDEX_T'};
+  const [missing] = await compareSchemaObjects(src, dst, req, catalog, {...catalog, schema: 'PROD', objects: []});
+  assert.equal(missing.sourceDdl, ddl);
+  assert.match(missing.script, /USING INDEX TABLESPACE "INDEX_T"\) TABLESPACE "DATA_T"/);
+  const [existing] = await compareSchemaObjects(src, dst, req, catalog, {...catalog, schema: 'PROD'});
+  assert.equal(existing.status, 'same'); assert.equal(existing.script, '');
 });

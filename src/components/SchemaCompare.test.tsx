@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { Window } from "happy-dom";
 import { act, useState } from "react";
+import type { PackageInstallRequest } from "../utils/packageInstall";
 import type { SchemaCompareRequest } from "../utils/schemaCompare";
 import type { Connection } from "../types";
 
@@ -13,10 +14,45 @@ Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true, con
 const { createRoot } = await import("react-dom/client");
 const { StudioSnapshot, useStudio } = await import("../state/store");
 const { default: SchemaCompare } = await import("./SchemaCompare");
+const { default: PackageInstall } = await import("./PackageInstall");
 const { default: ConnectionPicker } = await import("./ConnectionPicker");
 const { api } = await import("../utils/api");
 const { compareObjectKey } = await import("../utils/schemaCompare");
 after(async () => { await browser.happyDOM.close(); });
+
+test("package install requires explicit seed selection and invalidates preview when options change", async t => {
+  const pkg = { name: 'MAIL_PKG', type: 'PACKAGE' };
+  const call = t.mock.method(api, 'packageInstall', async (_targetId: string, _input: PackageInstallRequest) => ({
+    sourceName: 'DEV', targetName: 'PROD', sourceSchema: 'DEV', targetSchema: 'PROD', comparedAt: '2026-11-24', roots: ['MAIL_PKG'],
+    objects: [], dependencies: [], suggestions: [{ table: 'MAIL_BLACK_LIST', recommended: true, reasons: ['Read by package'], evidence: ['PACKAGE BODY MAIL_PKG:12 FROM MAIL_BLACK_LIST'] }],
+    warnings: ['Review dynamic SQL'], exports: [], script: 'CREATE PACKAGE MAIL_PKG;\nINSERT INTO MAIL_BLACK_LIST VALUES (1);',
+  }));
+  const host = browser.document.createElement('div'); browser.document.body.append(host);
+  const root = createRoot(host as unknown as HTMLElement);
+  t.after(async () => { await act(async () => root.unmount()); host.remove(); });
+  await act(async () => root.render(<PackageInstall sourceId="dev" targetId="prod" catalogs={[{ schema: 'DEV', objects: [pkg], types: ['PACKAGE'] }, { schema: 'PROD', objects: [], types: [] }]} tablespaces={{tableTablespace: "PKG_DATA", indexTablespace: "PKG_IDX"}} />));
+  const click = async (label: string) => {
+    const button = [...host.querySelectorAll('button')].find(b => b.textContent?.trim() === label);
+    assert.ok(button, label); await act(async () => button.click());
+  };
+  await act(async () => (host.querySelector('[aria-label="Install package MAIL_PKG"]') as unknown as HTMLInputElement).click());
+  await click('Analyze package dependencies (1)');
+  assert.deepEqual(call.mock.calls[0].arguments[1].packages, ['MAIL_PKG']);
+  assert.equal(call.mock.calls[0].arguments[1].tableTablespace, 'PKG_DATA');
+  assert.equal(call.mock.calls[0].arguments[1].seedTables, undefined);
+  const seed = host.querySelector('[aria-label="Export inserts MAIL_BLACK_LIST"]') as unknown as HTMLInputElement;
+  assert.equal(seed.checked, false);
+  assert.match(host.textContent!, /MAIL_PKG:12 FROM MAIL_BLACK_LIST/);
+  await act(async () => seed.click());
+  await click('Generate package install script');
+  assert.deepEqual(call.mock.calls[1].arguments[1].seedTables, ['MAIL_BLACK_LIST']);
+  assert.equal(call.mock.calls[1].arguments[1].indexTablespace, 'PKG_IDX');
+  assert.equal(call.mock.calls[1].arguments[0], 'prod');
+  assert.ok(host.querySelector('[aria-label="Package install script"]'));
+  await act(async () => seed.click());
+  assert.equal(host.querySelector('[aria-label="Package install script"]'), null);
+  assert.ok(![...host.querySelectorAll('button')].some(b => b.textContent?.includes('Download package-install.sql')));
+});
 
 test("schema compare filters types, submits selected objects and previews target deployment SQL", async t => {
   const table = { name: "ITEMS", type: "TABLE" }, proc = { name: "SAVE_ITEM", type: "PROCEDURE" };
@@ -202,4 +238,55 @@ test("source and target Connect actions track pending state, errors and retry wi
   assert.deepEqual(calls, ["dev", "prod", "prod", "prod"]);
   assert.equal(compare.disabled, false);
   assert.ok(host.querySelector('[aria-label="Select TABLE T"]'));
+});
+
+
+test('Object comparison expands a package selection into deployable tables, views, sequences and indexes', async t => {
+  const pkg = { name: 'PKG_MATERIALIDAD', type: 'PACKAGE' };
+  const objects = [
+    { name: 'SEQ_MATERIALIDAD', type: 'SEQUENCE' },
+    { name: 'MATERIALIDAD', type: 'TABLE' },
+    { name: 'IX_MATERIALIDAD', type: 'INDEX' },
+    { name: 'VW_MATERIALIDAD', type: 'VIEW' },
+    pkg, { ...pkg, type: 'PACKAGE BODY' },
+  ];
+  t.mock.method(api, 'compareCatalog', async () => ({ schema: 'APP', objects, types: objects.map(o => o.type) }));
+  const compare = t.mock.method(api, 'schemaCompare', async (_target: string, _input: SchemaCompareRequest) => ({
+    sourceSchema: 'DEV', targetSchema: 'PROD', sourceName: 'DEV', targetName: 'PROD', comparedAt: '2026-11-24',
+    objects: objects.map(o => ({ ...o, key: compareObjectKey(o), status: 'sourceOnly' as const, sourceDdl: '', targetDdl: '', script: 'CREATE ' + o.type + ' "PROD"."' + o.name + '";' })),
+  }));
+  const state = { connections: [
+    { id: 'dev', name: 'DEV', user: 'DEV', engine: 'oracle', live: true, status: 'connected' },
+    { id: 'prod', name: 'PROD', user: 'PROD', engine: 'oracle', live: true, status: 'connected' },
+  ] } as unknown as ReturnType<typeof useStudio>;
+  const host = browser.document.createElement('div'); browser.document.body.append(host);
+  const root = createRoot(host as unknown as HTMLElement);
+  t.after(async () => { await act(async () => root.unmount()); host.remove(); });
+  await act(async () => root.render(<StudioSnapshot value={state}><SchemaCompare /></StudioSnapshot>));
+  const click = async (text: string) => {
+    const button = [...host.querySelectorAll('button')].find(b => b.textContent?.trim() === text);
+    assert.ok(button, text); await act(async () => button.click());
+  };
+  const setText = async (label: string, value: string) => {
+    const input = host.querySelector('input[aria-label="' + label + '"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(browser.HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+      input.dispatchEvent(new browser.Event('input', {bubbles: true}));
+    });
+  };
+  await setText('Table tablespace', 'DEPLOY_DATA');
+  await setText('Index tablespace', 'DEPLOY_INDEX');
+  await click('Load objects');
+  await click('Clear visible');
+  await act(async () => (host.querySelector('input[aria-label="Select PACKAGE PKG_MATERIALIDAD"]') as unknown as HTMLInputElement).click());
+  await click('Compare selected');
+  assert.deepEqual(compare.mock.calls[0].arguments[1].objects, [pkg]);
+  assert.equal(compare.mock.calls[0].arguments[1].includePackageDependencies, true);
+  assert.equal(compare.mock.calls[0].arguments[1].tableTablespace, 'DEPLOY_DATA');
+  assert.equal(compare.mock.calls[0].arguments[1].indexTablespace, 'DEPLOY_INDEX');
+  await click('Generate script (6)');
+  const sql = host.querySelector('[aria-label="Deployment script"]')!.textContent!;
+  for (const o of objects) assert.ok(sql.includes('CREATE ' + o.type + ' "PROD"."' + o.name + '";'), o.name);
+  await setText('Table tablespace', 'OTHER_DATA');
+  assert.equal(host.querySelector('[aria-label="Deployment script"]'), null);
 });

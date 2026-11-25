@@ -1,6 +1,7 @@
+import { applyCreationTablespaces } from './deploymentTablespaces.ts';
 import oracledb from "oracledb";
 import { retargetSchema } from "./objectCopy.ts";
-import { compareObjectKey, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type DataDifference, type SchemaCompareRequest, type SchemaDifference } from "../src/utils/schemaCompare.ts";
+import { targetNamespaceCollision, compareObjectKey, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type DataDifference, type SchemaCompareRequest, type SchemaDifference } from "../src/utils/schemaCompare.ts";
 
 type Row = Record<string, unknown>;
 export async function compareRows(conn: oracledb.Connection, sql: string, binds: oracledb.BindParameters = {}): Promise<Row[]> {
@@ -123,6 +124,8 @@ export async function compareSchemaObjects(source: oracledb.Connection, target: 
     try {
       if (!src.has(key) && !dst.has(key)) throw new Error("Object is no longer visible. Reload the object list.");
       if (src.has(key)) {
+        const collision = targetNamespaceCollision(o, targetCatalog);
+        if (collision) throw new Error('Target namespace collision: ' + o.type + ' ' + o.name + ' conflicts with existing ' + collision.type + ' ' + collision.name + '. Resolve the target object before deployment.');
         item.sourceDdl = await readCompareDdl(source, o, req.sourceSchema, req.includeStorage);
         if (!item.sourceDdl.trim()) throw new Error("Source metadata is not accessible. Check DBMS_METADATA privileges.");
       }
@@ -136,7 +139,7 @@ export async function compareSchemaObjects(source: oracledb.Connection, target: 
         if (/^(TABLE|VIEW|MATERIALIZED VIEW|INDEX|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|PACKAGE BODY|TYPE|TYPE BODY|TRIGGER|SYNONYM|CLUSTER|DIMENSION)$/.test(o.type)) {
           item.script = `DROP ${o.type} ${qi(req.targetSchema)}.${qi(o.name)};`;
         } else item.warning = "Generate the removal script manually for this object type.";
-      } else if (!dst.has(key)) { item.status = "sourceOnly"; item.script = desired; }
+      } else if (!dst.has(key)) { item.status = "sourceOnly"; item.script = applyCreationTablespaces(desired, o.type, req); }
       else if (normalizeCompareDdl(desired) !== normalizeCompareDdl(item.targetDdl)) {
         item.status = "changed";
         if (replaceable.has(o.type)) item.script = desired;
