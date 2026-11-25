@@ -103,7 +103,7 @@ export function applyCreationTablespaces(ddl: string, objectType: string, option
     for (let i = 0; i < ts.length; i++) if (ts[i].word === 'USING' && ts[i + 1]?.word === 'INDEX') {
       const depth = ts[i].depth;
       let stop = i + 2;
-      while (stop < ts.length && ts[stop].depth >= depth && !(ts[stop].depth === depth && ([',', ')'].includes(ts[stop].text) || ['ENABLE', 'DISABLE', 'DEFERRABLE', 'INITIALLY', 'RELY', 'NORELY', 'REFRESH', 'BUILD', 'FOR', 'USING'].includes(ts[stop].word ?? '')))) stop++;
+      while (stop < ts.length && ts[stop].depth >= depth && !(ts[stop].depth === depth && (ts[stop].text === ',' || ['ENABLE', 'DISABLE', 'DEFERRABLE', 'INITIALLY', 'RELY', 'NORELY', 'REFRESH', 'BUILD', 'FOR', 'USING'].includes(ts[stop].word ?? '')))) stop++;
       indexRanges.push({from: i, to: stop});
       const next = ts[i + 2];
       if (next?.text === '(') {

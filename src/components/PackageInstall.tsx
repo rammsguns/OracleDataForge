@@ -72,6 +72,7 @@ export default function PackageInstall({ sourceId, targetId, catalogs, tablespac
       </fieldset>
       <details><summary className="cursor-pointer text-warn">Review prerequisites and limitations ({plan.warnings.length})</summary><ul className="list-disc pl-5 space-y-1">{plan.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul></details>
       {preview && <>
+        {plan.objects.some(o => o.status === "error") && <p role="alert" className="text-err font-semibold">Script incomplete: {plan.objects.filter(o => o.status === "error").length} dependency definition(s) could not be read. Resolve the metadata errors and regenerate before deployment.</p>}
         {plan.commitsSeedData && <p className="text-warn font-semibold">This script explicitly commits seed data to finalize identity sequences and restore ALWAYS identity modes. It preserves the original IDs. Review the script and use a maintenance window.</p>}
         {plan.identityRecoveryScript && <Btn variant="outline" onClick={() => {
           const url = URL.createObjectURL(new Blob([plan.identityRecoveryScript!], {type: 'text/plain'})); const a = document.createElement('a'); a.href = url; a.download = 'package-install-identity-recovery.sql'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);

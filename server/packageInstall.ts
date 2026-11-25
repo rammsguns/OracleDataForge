@@ -440,7 +440,7 @@ export async function buildPackageInstall(source: oracledb.Connection, target: o
     ...(tablespaces.tableTablespace || tablespaces.indexTablespace ? [`-- Creation tablespaces: table/MV = ${tablespaces.tableTablespace || "default"}; indexes = ${tablespaces.indexTablespace || "default"}. Existing objects are not relocated.`] : []),
     ...warnings.map(w => `-- REVIEW: ${cleanComment(w)}`),
     "SET DEFINE OFF", "SET SQLBLANKLINES ON", "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK", `ALTER SESSION SET CURRENT_SCHEMA = ${qi(input.targetSchema)};`];
-  if (exports.some(e => e.error)) lines.push("-- INCOMPLETE EXPORT: resolve failed tables before deployment.", "BEGIN RAISE_APPLICATION_ERROR(-20002, 'Seed export incomplete; review the export log and regenerate.'); END;\n/");
+  if (exports.some(e => e.error) || objects.some(o => o.status === 'error')) lines.push("-- INCOMPLETE DEPLOYMENT: resolve dependency metadata and seed export errors before deployment.", "BEGIN RAISE_APPLICATION_ERROR(-20002, 'Deployment plan incomplete; resolve metadata and export errors and regenerate.'); END;\n/");
   // Safe column widening precedes object compilation; identity preparation follows creation DDL.
   for (const e of exports) if (e.schemaSql?.length) lines.push(`-- Widen existing target columns for seed ${cleanComment(e.table)}.`, ...e.schemaSql);
   for (const o of install) if (o.script) lines.push(`-- ${cleanComment(o.type)} ${cleanComment(o.name)}`, o.script);

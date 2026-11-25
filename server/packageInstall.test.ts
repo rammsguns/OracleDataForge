@@ -98,7 +98,7 @@ test('full package plan installs dependencies before INSERTs and blocks deployme
   const log = t.mock.method(console, 'error', () => {});
   const failed = await buildPackageInstall(conn(true, true), conn(false), { ...input, seedTables: ['STATUS_CATALOG'] }, 'Development', 'Production');
   assert.equal(failed.exports[0].details?.columns[0].type, 'XMLTYPE');
-  assert.ok(failed.script.indexOf('Seed export incomplete') < failed.script.indexOf('CREATE TABLE'));
+  assert.ok(failed.script.indexOf('Deployment plan incomplete') < failed.script.indexOf('CREATE TABLE'));
   assert.equal(JSON.parse(log.mock.calls[0].arguments[0]).event, 'seed-export-failed');
   assert.equal(plan.objects.length, 3);
   assert.equal(plan.exports[0].rows, 1);
@@ -316,4 +316,25 @@ test('package installer blocks conflicting target object types during both analy
     throw new Error('Unexpected metadata extraction after collision: ' + sql);
   });
   for (const seedTables of [undefined, []]) await assert.rejects(() => buildPackageInstall(conn(true), conn(false), {...input, seedTables}, 'DEV', 'PROD'), /Target namespace collision: VIEW V conflicts with existing TABLE V/);
+});
+
+
+test('dependency DDL errors block the entire install before creation even when no seed exports were selected', async () => {
+  const conn = (source: boolean) => connection((sql, binds) => {
+    if (sql.includes('all_users')) return {rows: [{USERNAME: source ? 'DEV' : 'PROD'}]};
+    if (sql.includes('all_objects')) return {rows: source ? [{OBJECT_NAME: 'P', OBJECT_TYPE: 'PACKAGE'}, {OBJECT_NAME: 'T', OBJECT_TYPE: 'TABLE'}] : []};
+    if (sql.includes('all_dependencies')) return {rows: [{NAME: 'P', TYPE: 'PACKAGE', REFERENCED_OWNER: 'DEV', REFERENCED_NAME: 'T', REFERENCED_TYPE: 'TABLE'}]};
+    if (sql.includes('all_constraints') || sql.includes('all_indexes') || sql.includes('all_source')) return {rows: []};
+    if (sql.includes('DBMS_METADATA.OPEN')) {
+      if (binds.kind === 'TABLE') throw new Error('ORA-31603: required table metadata unavailable');
+      return {outBinds: {output: 'CREATE OR REPLACE PACKAGE "DEV"."P" AS END;\n/'}};
+    }
+    throw new Error('Unexpected statement: ' + sql);
+  });
+  const plan = await buildPackageInstall(conn(true), conn(false), {...input, seedTables: []}, 'DEV', 'PROD');
+  assert.equal(plan.objects.find(o => o.name === 'T')?.status, 'error');
+  assert.equal(plan.exports.length, 0);
+  assert.match(plan.script, /RAISE_APPLICATION_ERROR\(-20002, 'Deployment plan incomplete/);
+  assert.ok(plan.script.indexOf('Deployment plan incomplete') < plan.script.indexOf('CREATE OR REPLACE PACKAGE'));
+  assert.match(plan.warnings.join(' '), /ORA-31603/);
 });

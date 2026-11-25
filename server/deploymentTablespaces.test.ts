@@ -20,12 +20,12 @@ test('places heap tables and implicitly created primary/unique indexes independe
 
 test('maps explicit table, LOB, partition and constraint-index tablespaces while preserving literals', () => {
   const ddl = `CREATE TABLE T (ID NUMBER, TXT VARCHAR2(100) DEFAULT q'[TABLESPACE "KEEP"]', BODY CLOB,
-    CONSTRAINT PK PRIMARY KEY (ID) USING INDEX PCTFREE 10 TABLESPACE OLD_INDEX ENABLE)
+    CONSTRAINT PK PRIMARY KEY (ID) USING INDEX PCTFREE 10 STORAGE(INITIAL 65536 NEXT 1048576) TABLESPACE OLD_INDEX ENABLE)
     TABLESPACE OLD_DATA LOB (BODY) STORE AS (TABLESPACE OLD_LOB)
     PARTITION BY RANGE (ID) (PARTITION P1 VALUES LESS THAN (10) TABLESPACE OLD_PART);
     -- TABLESPACE KEEP_COMMENT`;
   const sql = apply(ddl, 'TABLE', both);
-  assert.match(sql, /USING INDEX PCTFREE 10 TABLESPACE "APP_IDX" ENABLE/);
+  assert.match(sql, /USING INDEX PCTFREE 10 STORAGE\(INITIAL 65536 NEXT 1048576\) TABLESPACE "APP_IDX" ENABLE/);
   assert.match(sql, /LOB \(BODY\) STORE AS \(TABLESPACE "APP_DATA"\)/);
   assert.match(sql, /VALUES LESS THAN \(10\) TABLESPACE "APP_DATA"/);
   assert.match(sql, /q'\[TABLESPACE "KEEP"\]'/);
