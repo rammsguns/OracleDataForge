@@ -1,6 +1,6 @@
 import oracledb from "oracledb";
 import { retargetSchema } from "./objectCopy.ts";
-import { compareObjectKey, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type DataDifference, type SchemaCompareRequest, type SchemaDifference } from "../src/utils/schemaCompare.ts";
+import { targetNamespaceCollision, compareObjectKey, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type DataDifference, type SchemaCompareRequest, type SchemaDifference } from "../src/utils/schemaCompare.ts";
 
 type Row = Record<string, unknown>;
 export async function compareRows(conn: oracledb.Connection, sql: string, binds: oracledb.BindParameters = {}): Promise<Row[]> {
@@ -123,6 +123,8 @@ export async function compareSchemaObjects(source: oracledb.Connection, target: 
     try {
       if (!src.has(key) && !dst.has(key)) throw new Error("Object is no longer visible. Reload the object list.");
       if (src.has(key)) {
+        const collision = targetNamespaceCollision(o, targetCatalog);
+        if (collision) throw new Error('Target namespace collision: ' + o.type + ' ' + o.name + ' conflicts with existing ' + collision.type + ' ' + collision.name + '. Resolve the target object before deployment.');
         item.sourceDdl = await readCompareDdl(source, o, req.sourceSchema, req.includeStorage);
         if (!item.sourceDdl.trim()) throw new Error("Source metadata is not accessible. Check DBMS_METADATA privileges.");
       }

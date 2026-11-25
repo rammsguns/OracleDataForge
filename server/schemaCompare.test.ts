@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type oracledb from "oracledb";
 import { compareCatalog, compareDataLiteral, compareSchema, compareSchemaObjects, compareTableData, diffCompareData, remapSxml } from "./schemaCompare.ts";
-import { compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareRequest, type SchemaCompareResult } from "../src/utils/schemaCompare.ts";
+import { targetNamespaceCollision, compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareRequest, type SchemaCompareResult } from "../src/utils/schemaCompare.ts";
 
 test("schema names preserve quoted case and reject SQL fragments", () => {
   assert.equal(compareSchema("dev", "OTHER"), "DEV");
@@ -159,4 +159,23 @@ test("script exports only selected objects, gates drops and data, and keeps DDL 
   assert.ok(full.indexOf("DROP TABLE OLD;") < full.indexOf("UPDATE T SET"));
   assert.match(full, /CURRENT_SCHEMA = "PROD"/);
   assert.ok(!deploymentScript(result, new Set(), true, true).includes("CREATE OR REPLACE PROCEDURE"));
+});
+
+
+test('comparison blocks shared-namespace collisions without reading or exposing DDL', async () => {
+  const view = {name: 'V', type: 'VIEW'};
+  const sourceCatalog = {schema: 'DEV', objects: [view], types: ['VIEW']};
+  const targetCatalog = {schema: 'PROD', objects: [{name: 'V', type: 'TABLE'}], types: ['TABLE']};
+  const conn = fakeConnection(() => {throw new Error('Metadata must not be read for a collision');});
+  const [result] = await compareSchemaObjects(conn, conn, {...input, objects: [view]}, sourceCatalog, targetCatalog);
+  assert.equal(result.status, 'error'); assert.equal(result.script, '');
+  assert.match(result.warning!, /VIEW V conflicts with existing TABLE V/);
+});
+
+test('Oracle namespace collision checks allow package bodies and separate index/trigger namespaces', () => {
+  const target = {schema: 'PROD', objects: [{name: 'P', type: 'PACKAGE'}, {name: 'T', type: 'INDEX'}, {name: 'X', type: 'TRIGGER'}], types: []};
+  assert.equal(targetNamespaceCollision({name: 'P', type: 'PACKAGE BODY'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'T', type: 'TABLE'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'X', type: 'TABLE'}, target), undefined);
+  assert.equal(targetNamespaceCollision({name: 'P', type: 'TABLE'}, target)?.type, 'PACKAGE');
 });

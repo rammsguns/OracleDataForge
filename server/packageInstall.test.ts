@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type oracledb from 'oracledb';
-import { buildPackageInstall, dependencyOrder, exportSeedTable, expandPackageSelection, packageClosure, tableUsage, SeedExportError } from './packageInstall.ts';
+import { buildPackageInstall, dependencyOrder, exportSeedTable, expandPackageSelection, packageClosure, packageSourceTexts, tableUsage, SeedExportError } from './packageInstall.ts';
 import { packageExportLog, type PackageInstallPlan } from '../src/utils/packageInstall.ts';
 import { compareObjectKey as key, type CompareCatalog } from '../src/utils/schemaCompare.ts';
 
@@ -263,6 +263,8 @@ test('ALWAYS identity seed plans preserve IDs with preparation, commit, restorat
   assert.ok(plan.script.indexOf('INSERT INTO') < plan.script.indexOf('\n\nCOMMIT;'));
   assert.ok(plan.script.indexOf('\n\nCOMMIT;') < plan.script.indexOf('GENERATED ALWAYS AS IDENTITY'));
   assert.match(plan.script, /START WITH LIMIT VALUE INCREMENT BY 1 MINVALUE 1 MAXVALUE 9999999999999999999999999999 CACHE 20 NOCYCLE NOORDER NOKEEP/);
+  assert.ok(plan.script.indexOf('START WITH LIMIT VALUE') < plan.script.indexOf('GENERATED ALWAYS AS IDENTITY'));
+  assert.ok(plan.identityRecoveryScript!.indexOf('START WITH LIMIT VALUE') < plan.identityRecoveryScript!.indexOf('GENERATED ALWAYS AS IDENTITY'));
   assert.match(plan.script, /9007199254740993/);
   assert.match(plan.identityRecoveryScript!, /ROLLBACK;\nALTER TABLE/);
   assert.match(plan.identityRecoveryScript!, /GENERATED ALWAYS AS IDENTITY/);
@@ -282,4 +284,32 @@ test('VARCHAR2 widening is scripted without applying changes, and wider target c
     if (width === 150) assert.deepEqual(result.schemaSql, ['ALTER TABLE "PROD"."CAD_TIPOS_REPORTE" MODIFY ("NOMBRE_ARCHIVO" VARCHAR2(500 BYTE));']);
     else assert.equal(result.schemaSql.length, 0);
   }
+});
+
+
+test('ALL_SOURCE assembly preserves line boundaries, dictionary offsets and existing terminators', () => {
+  const selected = new Set([key({name: 'P', type: 'PACKAGE BODY'})]);
+  const texts = packageSourceTexts([
+    {NAME: 'P', TYPE: 'PACKAGE BODY', LINE: 1, TEXT: 'BEGIN\r\n'},
+    {NAME: 'P', TYPE: 'PACKAGE BODY', LINE: 3, TEXT: 'SELECT * FROM'},
+    {NAME: 'P', TYPE: 'PACKAGE BODY', LINE: 4, TEXT: 'STATUS_CATALOG;'},
+    {NAME: 'P', TYPE: 'PACKAGE BODY', LINE: 5, TEXT: '-- UPDATE STATUS_CATALOG'},
+    {NAME: 'P', TYPE: 'PACKAGE BODY', LINE: 6, TEXT: 'DELETE FROM STATUS_CATALOG;'},
+    {NAME: 'OTHER', TYPE: 'PACKAGE BODY', LINE: 1, TEXT: 'SELECT * FROM OTHER_TABLE;'},
+  ], selected);
+  assert.equal(texts.length, 1);
+  assert.match(texts[0].text, /^BEGIN\n\nSELECT \* FROM\nSTATUS_CATALOG;/);
+  const usage = tableUsage('STATUS_CATALOG', texts);
+  assert.equal(usage.recommended, false);
+  assert.deepEqual(usage.evidence, ['PACKAGE BODY P:3 FROM STATUS_CATALOG', 'PACKAGE BODY P:6 DELETE FROM STATUS_CATALOG']);
+});
+
+test('package installer blocks conflicting target object types during both analysis and generation', async () => {
+  const conn = (source: boolean) => connection(sql => {
+    if (sql.includes('all_users')) return {rows: [{USERNAME: source ? 'DEV' : 'PROD'}]};
+    if (sql.includes('all_objects')) return {rows: source ? [{OBJECT_NAME: 'P', OBJECT_TYPE: 'PACKAGE'}, {OBJECT_NAME: 'V', OBJECT_TYPE: 'VIEW'}] : [{OBJECT_NAME: 'V', OBJECT_TYPE: 'TABLE'}]};
+    if (sql.includes('all_dependencies')) return {rows: [{NAME: 'P', TYPE: 'PACKAGE', REFERENCED_OWNER: 'DEV', REFERENCED_NAME: 'V', REFERENCED_TYPE: 'VIEW'}]};
+    throw new Error('Unexpected metadata extraction after collision: ' + sql);
+  });
+  for (const seedTables of [undefined, []]) await assert.rejects(() => buildPackageInstall(conn(true), conn(false), {...input, seedTables}, 'DEV', 'PROD'), /Target namespace collision: VIEW V conflicts with existing TABLE V/);
 });

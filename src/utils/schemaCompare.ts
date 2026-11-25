@@ -38,6 +38,14 @@ export interface SchemaCompareResult {
   objects: SchemaDifference[];
   warnings?: string[];
 }
+const sharedObjectNamespace = new Set(['TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SEQUENCE', 'SYNONYM', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'TYPE']);
+const namespaceType = (type: string) => type.replace(/^(PACKAGE|TYPE) BODY$/, '$1');
+export function targetNamespaceCollision(object: CompareObject, target: CompareCatalog): CompareObject | undefined {
+  const type = namespaceType(object.type);
+  if (!sharedObjectNamespace.has(type)) return undefined;
+  return target.objects.find(o => o.name === object.name && sharedObjectNamespace.has(namespaceType(o.type)) && namespaceType(o.type) !== type);
+}
+
 export const compareObjectKey = (o: CompareObject) => JSON.stringify([o.type, o.name]);
 export const quoteCompareIdentifier = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const comment = (s: string) => s.replace(/[\r\n\u2028\u2029]/g, " ");
