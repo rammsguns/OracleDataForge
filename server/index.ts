@@ -60,6 +60,7 @@ import {
 } from "./objectCopy.ts";
 import oracledb from "oracledb";
 import { compareCatalog, compareSchema, compareSchemaObjects } from "./schemaCompare.ts";
+import { buildPackageInstall, expandPackageSelection, dependencyOrder, packageMetadataTimeout } from "./packageInstall.ts";
 import type { SchemaCompareRequest } from "../src/utils/schemaCompare.ts";
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -5882,17 +5883,44 @@ app.post("/api/connections/:id/compare", requireSchemaMetadataAccess, async (req
     };
     source = await getOraConn(ends.source);
     target = await getOraConn(ends.target);
-    source.callTimeout = 60000; target.callTimeout = 60000;
+    const metadataTimeout = body.includePackageDependencies !== false && input.objects.some(o => /^(PACKAGE|PACKAGE BODY)$/.test(o.type)) ? packageMetadataTimeout() : 60000;
+    source.callTimeout = metadataTimeout; target.callTimeout = metadataTimeout;
     if (input.compareData) {
       await source.execute("SET TRANSACTION READ ONLY");
       await target.execute("SET TRANSACTION READ ONLY");
     }
     const src = await compareCatalog(source, input.sourceSchema);
     const dst = await compareCatalog(target, input.targetSchema);
-    const objects = await compareSchemaObjects(source, target, input, src, dst);
+    const expanded = body.includePackageDependencies !== false
+      ? await expandPackageSelection(source, src, input.objects)
+      : { objects: input.objects, warnings: [] };
+    const compared = await compareSchemaObjects(source, target, { ...input, objects: expanded.objects }, src, dst);
+    const objects = 'edges' in expanded ? dependencyOrder(compared, expanded.edges).ordered : compared;
     res.json({ sourceSchema: input.sourceSchema, targetSchema: input.targetSchema,
-      sourceName: ends.source.name, targetName: ends.target.name, comparedAt: new Date().toISOString(), objects });
+      sourceName: ends.source.name, targetName: ends.target.name, comparedAt: new Date().toISOString(), objects, warnings: expanded.warnings });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
+  finally {
+    await source?.rollback().catch(() => {}); await target?.rollback().catch(() => {});
+    await source?.close().catch(() => {}); await target?.close().catch(() => {});
+  }
+});
+
+app.post("/api/connections/:id/compare/packages", requireSchemaMetadataAccess, async (req, res) => {
+  const body = req.body ?? {};
+  const ends = copyEndpoints(String(body.sourceId ?? ""), routeId(req));
+  if ("error" in ends) return res.status(ends.status).json({ error: ends.error });
+  if (!Array.isArray(body.packages) || !body.packages.length || body.packages.length > 100 || body.packages.some((n: unknown) => typeof n !== "string" || !n.length || n.length > 128)) return res.status(400).json({ error: "Select between 1 and 100 source packages." });
+  if (body.seedTables !== undefined && (!Array.isArray(body.seedTables) || body.seedTables.length > 100 || body.seedTables.some((n: unknown) => typeof n !== "string" || !n.length || n.length > 128))) return res.status(400).json({ error: "Select up to 100 dependency tables for INSERT export." });
+  const rowLimit = Number(body.rowLimit ?? 1000);
+  if (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000) return res.status(400).json({ error: "Row limit must be between 1 and 10,000." });
+  let source: oracledb.Connection | undefined, target: oracledb.Connection | undefined;
+  try {
+    const input = { sourceId: ends.source.id, sourceSchema: compareSchema(body.sourceSchema, ends.source.user), targetSchema: compareSchema(body.targetSchema, ends.target.user), packages: [...new Set<string>(body.packages)], seedTables: body.seedTables as string[] | undefined, rowLimit };
+    source = await getOraConn(ends.source); target = await getOraConn(ends.target);
+    source.callTimeout = packageMetadataTimeout(); target.callTimeout = packageMetadataTimeout();
+    await source.execute("SET TRANSACTION READ ONLY"); await target.execute("SET TRANSACTION READ ONLY");
+    res.json(await buildPackageInstall(source, target, input, ends.source.name, ends.target.name));
+  } catch (e) { res.status(400).json({ error: errMsg(e) }); }
   finally {
     await source?.rollback().catch(() => {}); await target?.rollback().catch(() => {});
     await source?.close().catch(() => {}); await target?.close().catch(() => {});

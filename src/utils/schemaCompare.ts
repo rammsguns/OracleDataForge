@@ -8,6 +8,7 @@ export interface SchemaCompareRequest {
   compareData: boolean;
   rowLimit: number;
   includeStorage: boolean;
+  includePackageDependencies?: boolean;
 }
 export interface DataDifference {
   status: "same" | "different" | "limited" | "skipped" | "error";
@@ -25,6 +26,7 @@ export interface SchemaDifference extends CompareObject {
   targetDdl: string;
   script: string;
   warning?: string;
+  definitionCompared?: boolean;
   data?: DataDifference;
 }
 export interface SchemaCompareResult {
@@ -34,6 +36,7 @@ export interface SchemaCompareResult {
   targetName: string;
   comparedAt: string;
   objects: SchemaDifference[];
+  warnings?: string[];
 }
 export const compareObjectKey = (o: CompareObject) => JSON.stringify([o.type, o.name]);
 export const quoteCompareIdentifier = (s: string) => `"${s.replace(/"/g, '""')}"`;
@@ -48,6 +51,7 @@ export function deploymentScript(result: SchemaCompareResult, selected: Set<stri
     `-- Compared: ${result.comparedAt}`,
     "-- Review all statements and dependencies before deployment. DDL commits implicitly.",
     "-- Metadata differences may require manual steps; search for REVIEW below.",
+    ...(result.warnings ?? []).map(w => `-- REVIEW: ${comment(w)}`),
     "SET DEFINE OFF", "SET SQLBLANKLINES ON", "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK",
     `ALTER SESSION SET CURRENT_SCHEMA = ${quoteCompareIdentifier(result.targetSchema)};`, "",
   ];

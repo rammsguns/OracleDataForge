@@ -1,6 +1,7 @@
 /** Thin client for the local Oracle DataForge backend. */
 import type { StorageChange } from "./dbaSql";
 import type { CompareCatalog, SchemaCompareRequest, SchemaCompareResult } from "./schemaCompare";
+import type { PackageInstallPlan, PackageInstallRequest } from "./packageInstall";
 
 /**
  * How a connection reaches Oracle: `basic` is host/port/service over TCP, `wallet` is an
@@ -981,6 +982,7 @@ const compileScopeQuery = (ref: CompileScopeRef) =>
 export const api = {
   compareCatalog: (id: string, schema: string) => request<CompareCatalog>(`/api/connections/${encodeURIComponent(id)}/compare/catalog?schema=${encodeURIComponent(schema)}`),
   schemaCompare: (targetId: string, input: SchemaCompareRequest) => request<SchemaCompareResult>(`/api/connections/${encodeURIComponent(targetId)}/compare`, input),
+  packageInstall: (targetId: string, input: PackageInstallRequest) => request<PackageInstallPlan>(`/api/connections/${encodeURIComponent(targetId)}/compare/packages`, input),
   /** Writes compiled PL/SQL to GitHub through the local backend; the GitHub token stays server-side. */
   githubSync: (req: GitHubSyncRequest) => request<GitHubSyncResult>("/api/github/sync", req),
   /** The role the server will actually enforce for this browser — see SessionInfo. */

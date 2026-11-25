@@ -5,6 +5,7 @@ import { api } from "../utils/api";
 import { compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareResult } from "../utils/schemaCompare";
 import DiffView from "./DiffView";
 import ConnectionPicker from "./ConnectionPicker";
+import PackageInstall from "./PackageInstall";
 import { Btn, Spinner, inputCls } from "./ui";
 
 const statuses = ["same", "changed", "sourceOnly", "targetOnly", "error"] as const;
@@ -26,11 +27,13 @@ export default function SchemaCompare() {
   const [sourceSchema, setSourceSchema] = useState("");
   const [targetSchema, setTargetSchema] = useState("");
   const [catalogs, setCatalogs] = useState<[CompareCatalog, CompareCatalog] | null>(null);
+  const [packageMode, setPackageMode] = useState(false);
   const [types, setTypes] = useState(new Set<string>());
   const [picked, setPicked] = useState(new Set<string>());
   const [search, setSearch] = useState("");
   const [compareData, setCompareData] = useState(false);
   const [includeStorage, setIncludeStorage] = useState(false);
+  const [includePackageDependencies, setIncludePackageDependencies] = useState(true);
   const [rowLimit, setRowLimit] = useState(1000);
   const [busy, setBusy] = useState<"loading" | "comparing" | null>(null);
   const [connectingId, setConnectingId] = useState<string | null>(null);
@@ -83,7 +86,7 @@ export default function SchemaCompare() {
     try {
       const r = await api.schemaCompare(targetId, { sourceId,
         sourceSchema: `"${catalogs[0].schema.replace(/"/g, '""')}"`, targetSchema: `"${catalogs[1].schema.replace(/"/g, '""')}"`,
-        objects: chosen, compareData, rowLimit: compareData ? rowLimit : 1000, includeStorage });
+        objects: chosen, compareData, rowLimit: compareData ? rowLimit : 1000, includeStorage, includePackageDependencies });
       setResult(r); setSelected(new Set(r.objects.filter(o => o.status !== "same" && o.status !== "targetOnly" && o.status !== "error" || o.data?.status === "different").map(o => o.key)));
       setDetailKey(r.objects.find(o => o.status !== "same")?.key ?? r.objects[0]?.key ?? "");
       setPane("diff"); setStatus("all"); setIncludeData(false); setIncludeDrops(false);
@@ -120,6 +123,7 @@ export default function SchemaCompare() {
       <div className="flex gap-4 flex-wrap items-center">
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeStorage} onChange={e => { setIncludeStorage(e.target.checked); setResult(null); }} />Compare storage and tablespaces</label>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={compareData} onChange={e => { setCompareData(e.target.checked); setResult(null); }} />Compare table data</label>
+        <label className="flex gap-2 items-center"><input type="checkbox" checked={includePackageDependencies} onChange={e => { setIncludePackageDependencies(e.target.checked); setResult(null); }} />Include package dependencies (tables, views, sequences, indexes)</label>
         {compareData && <label>Maximum rows per table per side <input aria-label="Data row limit" className={`${inputCls} w-24 ml-2`} type="number" min={1} max={10000} value={rowLimit} onChange={e => { setRowLimit(Number(e.target.value)); setResult(null); }} /></label>}
         <Btn variant="outline" disabled={!connectionsReady} onClick={() => void load()}>Load objects</Btn>
       </div>
@@ -129,7 +133,9 @@ export default function SchemaCompare() {
     </fieldset>
     {error && <div role="alert" className="m-4 p-3 border border-err/30 bg-err/10 text-err rounded">{error}</div>}
     {busy && <div role="status" className="p-4 flex items-center gap-2 text-accenthi"><Spinner />{busy === "loading" ? "Loading object inventories…" : `Comparing ${chosen.length} objects${compareData ? " and table data" : ""}…`}</div>}
-    {catalogs && !result && <div className="p-5 space-y-3">
+    {catalogs && !result && <div className="p-5 flex gap-2"><Btn variant={!packageMode ? "primary" : "outline"} onClick={() => setPackageMode(false)}>Object comparison</Btn><Btn variant={packageMode ? "primary" : "outline"} onClick={() => setPackageMode(true)}>Package install with dependencies</Btn></div>}
+    {catalogs && packageMode && !result && connectionsReady && <div className="px-5 pb-5"><PackageInstall key={`${sourceId}:${targetId}:${catalogs[0].schema}:${catalogs[1].schema}`} sourceId={sourceId} targetId={targetId} catalogs={catalogs} /></div>}
+    {catalogs && !result && !packageMode && <div className="p-5 space-y-3">
       <div className="flex flex-wrap gap-2 items-center"><h3 className="font-semibold mr-auto">Object types</h3>
         <Btn onClick={() => setTypes(new Set(allTypes))}>All types</Btn><Btn onClick={() => setTypes(new Set())}>Clear types</Btn>
       </div>
@@ -150,6 +156,8 @@ export default function SchemaCompare() {
         <Btn className="ml-auto" disabled={!!busy} onClick={() => setResult(null)}>Change selection</Btn>
         <Btn onClick={() => download(JSON.stringify(result, null, 2), "schema-compare-report.json", "application/json")}><Download size={13} />Report</Btn>
       </div>
+      {!!result.warnings?.length && <div role="alert" className="text-warn border border-warn/30 rounded p-3">{result.warnings.map((w, i) => <p key={i}>{w}</p>)}</div>}
+      <p className="text-mute">{result.objects.length} objects compared, including expanded package dependencies when enabled. Source-only dependencies are selected for deployment automatically. Identical target objects need no CREATE statement.</p>
       <div className="flex gap-2 flex-wrap"><Btn variant={status === "all" ? "primary" : "outline"} onClick={() => setStatus("all")}>All {result.objects.length}</Btn>{statuses.map(k => <Btn key={k} variant={status === k ? "primary" : "outline"} onClick={() => setStatus(k)}>{labels[k]} {result.objects.filter(o => o.status === k).length}</Btn>)}</div>
       <div className="flex flex-wrap gap-3 items-center border border-bdr rounded p-3 bg-panel2">
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeDrops} onChange={e => setIncludeDrops(e.target.checked)} />Include target-only DROP statements</label>
