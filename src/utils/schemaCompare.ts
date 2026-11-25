@@ -1,6 +1,7 @@
+export interface DeploymentTablespaces { tableTablespace?: string; indexTablespace?: string }
 export interface CompareObject { name: string; type: string }
 export interface CompareCatalog { schema: string; objects: CompareObject[]; types: string[] }
-export interface SchemaCompareRequest {
+export interface SchemaCompareRequest extends DeploymentTablespaces {
   sourceId: string;
   sourceSchema: string;
   targetSchema: string;
@@ -29,7 +30,7 @@ export interface SchemaDifference extends CompareObject {
   definitionCompared?: boolean;
   data?: DataDifference;
 }
-export interface SchemaCompareResult {
+export interface SchemaCompareResult extends DeploymentTablespaces {
   sourceSchema: string;
   targetSchema: string;
   sourceName: string;
@@ -59,6 +60,7 @@ export function deploymentScript(result: SchemaCompareResult, selected: Set<stri
     `-- Compared: ${result.comparedAt}`,
     "-- Review all statements and dependencies before deployment. DDL commits implicitly.",
     "-- Metadata differences may require manual steps; search for REVIEW below.",
+    ...(result.tableTablespace || result.indexTablespace ? [`-- Creation tablespaces: table/MV = ${comment(result.tableTablespace || "default/source")}; indexes = ${comment(result.indexTablespace || "default/source")}. Existing objects are not relocated.`] : []),
     ...(result.warnings ?? []).map(w => `-- REVIEW: ${comment(w)}`),
     "SET DEFINE OFF", "SET SQLBLANKLINES ON", "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK",
     `ALTER SESSION SET CURRENT_SCHEMA = ${quoteCompareIdentifier(result.targetSchema)};`, "",

@@ -1,3 +1,4 @@
+import { readDeploymentTablespaces } from './deploymentTablespaces.ts';
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import { readDbaInsights } from "./dbaInsights.ts";
 import express from "express";
@@ -5879,7 +5880,7 @@ app.post("/api/connections/:id/compare", requireSchemaMetadataAccess, async (req
     const input: SchemaCompareRequest = {
       sourceId: ends.source.id, sourceSchema: compareSchema(body.sourceSchema, ends.source.user),
       targetSchema: compareSchema(body.targetSchema, ends.target.user), objects: body.objects,
-      compareData: body.compareData === true, includeStorage: body.includeStorage === true, rowLimit,
+      compareData: body.compareData === true, includeStorage: body.includeStorage === true, rowLimit, ...readDeploymentTablespaces(body),
     };
     source = await getOraConn(ends.source);
     target = await getOraConn(ends.target);
@@ -5897,7 +5898,7 @@ app.post("/api/connections/:id/compare", requireSchemaMetadataAccess, async (req
     const compared = await compareSchemaObjects(source, target, { ...input, objects: expanded.objects }, src, dst);
     const objects = 'edges' in expanded ? dependencyOrder(compared, expanded.edges).ordered : compared;
     res.json({ sourceSchema: input.sourceSchema, targetSchema: input.targetSchema,
-      sourceName: ends.source.name, targetName: ends.target.name, comparedAt: new Date().toISOString(), objects, warnings: expanded.warnings });
+      sourceName: ends.source.name, targetName: ends.target.name, comparedAt: new Date().toISOString(), objects, tableTablespace: input.tableTablespace, indexTablespace: input.indexTablespace, warnings: expanded.warnings });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
   finally {
     await source?.rollback().catch(() => {}); await target?.rollback().catch(() => {});
@@ -5915,7 +5916,7 @@ app.post("/api/connections/:id/compare/packages", requireSchemaMetadataAccess, a
   if (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10000) return res.status(400).json({ error: "Row limit must be between 1 and 10,000." });
   let source: oracledb.Connection | undefined, target: oracledb.Connection | undefined;
   try {
-    const input = { sourceId: ends.source.id, sourceSchema: compareSchema(body.sourceSchema, ends.source.user), targetSchema: compareSchema(body.targetSchema, ends.target.user), packages: [...new Set<string>(body.packages)], seedTables: body.seedTables as string[] | undefined, rowLimit };
+    const input = { ...readDeploymentTablespaces(body), sourceId: ends.source.id, sourceSchema: compareSchema(body.sourceSchema, ends.source.user), targetSchema: compareSchema(body.targetSchema, ends.target.user), packages: [...new Set<string>(body.packages)], seedTables: body.seedTables as string[] | undefined, rowLimit };
     source = await getOraConn(ends.source); target = await getOraConn(ends.target);
     source.callTimeout = packageMetadataTimeout(); target.callTimeout = packageMetadataTimeout();
     await source.execute("SET TRANSACTION READ ONLY"); await target.execute("SET TRANSACTION READ ONLY");

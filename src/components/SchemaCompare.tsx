@@ -5,6 +5,8 @@ import { api } from "../utils/api";
 import { compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareResult } from "../utils/schemaCompare";
 import DiffView from "./DiffView";
 import ConnectionPicker from "./ConnectionPicker";
+import DeploymentTablespaceFields from "./DeploymentTablespaceFields";
+import type { DeploymentTablespaces } from "../utils/schemaCompare";
 import PackageInstall from "./PackageInstall";
 import { Btn, Spinner, inputCls } from "./ui";
 
@@ -32,6 +34,7 @@ export default function SchemaCompare() {
   const [picked, setPicked] = useState(new Set<string>());
   const [search, setSearch] = useState("");
   const [compareData, setCompareData] = useState(false);
+  const [tablespaces, setTablespaces] = useState<DeploymentTablespaces>({});
   const [includeStorage, setIncludeStorage] = useState(false);
   const [includePackageDependencies, setIncludePackageDependencies] = useState(true);
   const [rowLimit, setRowLimit] = useState(1000);
@@ -86,7 +89,7 @@ export default function SchemaCompare() {
     try {
       const r = await api.schemaCompare(targetId, { sourceId,
         sourceSchema: `"${catalogs[0].schema.replace(/"/g, '""')}"`, targetSchema: `"${catalogs[1].schema.replace(/"/g, '""')}"`,
-        objects: chosen, compareData, rowLimit: compareData ? rowLimit : 1000, includeStorage, includePackageDependencies });
+        ...tablespaces, objects: chosen, compareData, rowLimit: compareData ? rowLimit : 1000, includeStorage, includePackageDependencies });
       setResult(r); setSelected(new Set(r.objects.filter(o => o.status !== "same" && o.status !== "targetOnly" && o.status !== "error" || o.data?.status === "different").map(o => o.key)));
       setDetailKey(r.objects.find(o => o.status !== "same")?.key ?? r.objects[0]?.key ?? "");
       setPane("diff"); setStatus("all"); setIncludeData(false); setIncludeDrops(false);
@@ -127,6 +130,7 @@ export default function SchemaCompare() {
         {compareData && <label>Maximum rows per table per side <input aria-label="Data row limit" className={`${inputCls} w-24 ml-2`} type="number" min={1} max={10000} value={rowLimit} onChange={e => { setRowLimit(Number(e.target.value)); setResult(null); }} /></label>}
         <Btn variant="outline" disabled={!connectionsReady} onClick={() => void load()}>Load objects</Btn>
       </div>
+      <DeploymentTablespaceFields value={tablespaces} onChange={value => { setTablespaces(value); setResult(null); }} />
       {!connectionsReady && <p className="text-mute">Connect both the source and target to load or compare objects.</p>}
       {compareData && <p className="text-mute">Rows match by primary key. Each database is read at its own consistent snapshot. Tables over the limit or with unsupported columns are reported as incomplete or skipped.</p>}
       <p className="text-mute">Blank schema uses the connection user. Other schemas require dictionary and DBMS_METADATA access. All visible object types are listed; unsupported metadata is reported per object.</p>
@@ -134,7 +138,7 @@ export default function SchemaCompare() {
     {error && <div role="alert" className="m-4 p-3 border border-err/30 bg-err/10 text-err rounded">{error}</div>}
     {busy && <div role="status" className="p-4 flex items-center gap-2 text-accenthi"><Spinner />{busy === "loading" ? "Loading object inventories…" : `Comparing ${chosen.length} objects${compareData ? " and table data" : ""}…`}</div>}
     {catalogs && !result && <div className="p-5 flex gap-2"><Btn variant={!packageMode ? "primary" : "outline"} onClick={() => setPackageMode(false)}>Object comparison</Btn><Btn variant={packageMode ? "primary" : "outline"} onClick={() => setPackageMode(true)}>Package install with dependencies</Btn></div>}
-    {catalogs && packageMode && !result && connectionsReady && <div className="px-5 pb-5"><PackageInstall key={`${sourceId}:${targetId}:${catalogs[0].schema}:${catalogs[1].schema}`} sourceId={sourceId} targetId={targetId} catalogs={catalogs} /></div>}
+    {catalogs && packageMode && !result && connectionsReady && <div className="px-5 pb-5"><PackageInstall key={`${sourceId}:${targetId}:${catalogs[0].schema}:${catalogs[1].schema}`} sourceId={sourceId} targetId={targetId} catalogs={catalogs} tablespaces={tablespaces} /></div>}
     {catalogs && !result && !packageMode && <div className="p-5 space-y-3">
       <div className="flex flex-wrap gap-2 items-center"><h3 className="font-semibold mr-auto">Object types</h3>
         <Btn onClick={() => setTypes(new Set(allTypes))}>All types</Btn><Btn onClick={() => setTypes(new Set())}>Clear types</Btn>

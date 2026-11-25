@@ -129,6 +129,8 @@ docs/                Reference documentation
 ```
 ## Package install scripts
 
+Both Object comparison and Package install support **Table / materialized-view tablespace** and **Index tablespace** overrides. Enter target tablespace names before comparing or generating SQL; quote case-sensitive names. Overrides apply only to new CREATE statements, including table/MV data, LOB and partition storage, standalone indexes, and indexes created for primary/unique keys. Blank fields retain existing storage/default behavior; existing target objects are not relocated. Target tablespaces must exist and the deployment user needs quota. Temporary/external/clustered tables, domain indexes, and TABLESPACE SET layouts require their dedicated storage configuration.
+
 The regular **Object comparison** flow also expands selected packages and package bodies by default. Keep **Include package dependencies** checked to compare their tables, views, sequences, indexes and other transitive dependencies. Missing dependencies are selected for deployment automatically; identical target objects do not need CREATE statements.
 
 In **Schema Compare**, choose the DEV source and PROD target, connect both, and **Load objects**. Open **Package install with dependencies**, select source packages, then **Analyze package dependencies**.

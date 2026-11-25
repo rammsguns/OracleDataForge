@@ -102,6 +102,10 @@ test('full package plan installs dependencies before INSERTs and blocks deployme
   assert.equal(JSON.parse(log.mock.calls[0].arguments[0]).event, 'seed-export-failed');
   assert.equal(plan.objects.length, 3);
   assert.equal(plan.exports[0].rows, 1);
+  const placed = await buildPackageInstall(conn(true), conn(false), {...input, seedTables: [], tableTablespace: 'INSTALL_DATA', indexTablespace: 'INSTALL_IDX'}, 'DEV', 'PROD');
+  assert.equal(placed.tableTablespace, '"INSTALL_DATA"');
+  assert.equal(placed.indexTablespace, '"INSTALL_IDX"');
+  assert.match(placed.script, /CREATE TABLE "PROD"."STATUS_CATALOG" TABLESPACE "INSTALL_DATA"/);
   assert.ok(plan.script.indexOf('CREATE TABLE') < plan.script.indexOf('CREATE OR REPLACE PACKAGE BODY'));
   assert.ok(plan.script.lastIndexOf('CREATE ') < plan.script.indexOf('INSERT INTO'));
   assert.match(plan.script, /"PROD"\."STATUS_CATALOG"/);

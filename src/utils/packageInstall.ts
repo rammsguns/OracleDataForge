@@ -1,6 +1,6 @@
-import type { CompareObject, SchemaCompareResult } from "./schemaCompare.ts";
+import type { CompareObject, SchemaCompareResult, DeploymentTablespaces } from "./schemaCompare.ts";
 
-export interface PackageInstallRequest {
+export interface PackageInstallRequest extends DeploymentTablespaces {
   sourceId: string;
   sourceSchema: string;
   targetSchema: string;
@@ -31,5 +31,5 @@ export interface PackageInstallPlan extends SchemaCompareResult {
 
 /** Diagnostic download deliberately excludes generated SQL and source row contents. */
 export function packageExportLog(plan: PackageInstallPlan) {
-  return { comparedAt: plan.comparedAt, source: {name: plan.sourceName, schema: plan.sourceSchema}, target: {name: plan.targetName, schema: plan.targetSchema}, packages: plan.roots, warnings: plan.warnings, commitsSeedData: plan.commitsSeedData, exports: plan.exports.map(({script: _script, schemaSql: _schema, preparationSql: _preparation, finalizeSql: _finalize, ...entry}) => entry) };
+  return { comparedAt: plan.comparedAt, source: {name: plan.sourceName, schema: plan.sourceSchema}, target: {name: plan.targetName, schema: plan.targetSchema}, packages: plan.roots, tablespaces: {table: plan.tableTablespace, index: plan.indexTablespace}, warnings: plan.warnings, commitsSeedData: plan.commitsSeedData, exports: plan.exports.map(({script: _script, schemaSql: _schema, preparationSql: _preparation, finalizeSql: _finalize, ...entry}) => entry) };
 }

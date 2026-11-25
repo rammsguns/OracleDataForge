@@ -1,3 +1,4 @@
+import { readDeploymentTablespaces } from './deploymentTablespaces.ts';
 import oracledb from "oracledb";
 import { identitySequenceOptions } from "./tableDataCopy.ts";
 import { compareCatalog, compareRows, compareSchemaObjects, compareDataLiteral } from "./schemaCompare.ts";
@@ -365,6 +366,7 @@ export function packageSourceTexts(rows: Row[], selected: ReadonlySet<string>) {
 }
 
 export async function buildPackageInstall(source: oracledb.Connection, target: oracledb.Connection, input: PackageInstallRequest, sourceName: string, targetName: string): Promise<PackageInstallPlan> {
+  const tablespaces = readDeploymentTablespaces(input);
   const src = await packageStage('Reading source object inventory', () => compareCatalog(source, input.sourceSchema));
   const dst = await packageStage('Reading target object inventory', () => compareCatalog(target, input.targetSchema));
   const closure = await packageClosure(source, src, input.packages);
@@ -435,6 +437,7 @@ export async function buildPackageInstall(source: oracledb.Connection, target: o
   for (const o of objects.filter(o => o.status === "changed" && !install.includes(o))) warnings.push(`Existing target dependency ${o.type} ${o.name} differs and is retained. Review compatibility or deploy its changes with Object comparison.`);
   for (const o of objects.filter(o => o.type === "TRIGGER" && install.includes(o))) warnings.push(`Missing trigger ${o.name} will be created before seed INSERTs; review its side effects.`);
   const lines = ["-- Oracle DataForge: package install (review before execution)", `-- ${cleanComment(sourceName)} / ${cleanComment(input.sourceSchema)} -> ${cleanComment(targetName)} / ${cleanComment(input.targetSchema)}`,
+    ...(tablespaces.tableTablespace || tablespaces.indexTablespace ? [`-- Creation tablespaces: table/MV = ${tablespaces.tableTablespace || "default"}; indexes = ${tablespaces.indexTablespace || "default"}. Existing objects are not relocated.`] : []),
     ...warnings.map(w => `-- REVIEW: ${cleanComment(w)}`),
     "SET DEFINE OFF", "SET SQLBLANKLINES ON", "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK", `ALTER SESSION SET CURRENT_SCHEMA = ${qi(input.targetSchema)};`];
   if (exports.some(e => e.error)) lines.push("-- INCOMPLETE EXPORT: resolve failed tables before deployment.", "BEGIN RAISE_APPLICATION_ERROR(-20002, 'Seed export incomplete; review the export log and regenerate.'); END;\n/");
@@ -455,6 +458,6 @@ export async function buildPackageInstall(source: oracledb.Connection, target: o
   if (commitsSeedData) lines.push('-- Identity finalization requires committing seed data before DDL. Review before execution.', 'COMMIT;', ...identityFinalization);
   const identityRecoveryScript = commitsSeedData ? ['-- Recovery after an interrupted identity seed install.', '-- Rolls back uncommitted seed data before restoring identity modes and sequence settings.', '-- Run only after reviewing the failed install. Already committed data is preserved.', 'WHENEVER SQLERROR CONTINUE', 'ROLLBACK;', ...identityFinalization].join('\n') + '\n' : undefined;
   lines.push('-- Review existing target triggers and foreign keys before running INSERTs.', commitsSeedData ? '-- Seed data was explicitly committed for identity finalization.' : '-- Explicit COMMIT required after reviewing seed data. DDL above commits implicitly.', '-- Verify target ALL_OBJECTS.STATUS and ALL_ERRORS; Oracle can create invalid PL/SQL without stopping the script.');
-  return { sourceName, targetName, sourceSchema: input.sourceSchema, targetSchema: input.targetSchema, comparedAt: new Date().toISOString(), roots: input.packages, objects,
+  return { ...tablespaces, sourceName, targetName, sourceSchema: input.sourceSchema, targetSchema: input.targetSchema, comparedAt: new Date().toISOString(), roots: input.packages, objects,
     dependencies: closure.objects.map(o => ({ object: o, requires: closure.edges.get(key(o)) ?? [] })), suggestions, warnings, exports, commitsSeedData, identityRecoveryScript, script: lines.join("\n\n") + "\n" };
 }

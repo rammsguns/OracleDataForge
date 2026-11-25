@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { api } from "../utils/api";
-import type { CompareCatalog } from "../utils/schemaCompare";
+import type { CompareCatalog, DeploymentTablespaces } from "../utils/schemaCompare";
 import { packageExportLog, type PackageInstallPlan } from "../utils/packageInstall";
 import { Btn, Spinner, inputCls } from "./ui";
 
-export default function PackageInstall({ sourceId, targetId, catalogs }: { sourceId: string; targetId: string; catalogs: [CompareCatalog, CompareCatalog] }) {
+export default function PackageInstall({ sourceId, targetId, catalogs, tablespaces = {} }: { sourceId: string; targetId: string; catalogs: [CompareCatalog, CompareCatalog]; tablespaces?: DeploymentTablespaces }) {
   const [packages, setPackages] = useState(new Set<string>());
   const [search, setSearch] = useState("");
   const [seeds, setSeeds] = useState(new Set<string>());
@@ -13,13 +13,18 @@ export default function PackageInstall({ sourceId, targetId, catalogs }: { sourc
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [preview, setPreview] = useState(false);
+  const optionsStamp = JSON.stringify(tablespaces);
+  const optionsRef = useRef(optionsStamp); optionsRef.current = optionsStamp;
+  useEffect(() => setPreview(false), [optionsStamp]);
   const change = (current: Set<string>, name: string) => { const next = new Set(current); if (!next.delete(name)) next.add(name); return next; };
   const analyze = async (generate: boolean) => {
+    const requestedOptions = optionsRef.current;
     setBusy(true); setError(""); setPreview(false);
     try {
-      const result = await api.packageInstall(targetId, { sourceId,
+      const result = await api.packageInstall(targetId, { ...tablespaces, sourceId,
         sourceSchema: `"${catalogs[0].schema.replace(/"/g, '""')}"`, targetSchema: `"${catalogs[1].schema.replace(/"/g, '""')}"`,
         packages: [...packages], rowLimit: limit, ...(generate ? { seedTables: [...seeds] } : {}) });
+      if (requestedOptions !== optionsRef.current) return;
       setPlan(result);
       if (!generate) setSeeds(new Set());
       setPreview(generate);

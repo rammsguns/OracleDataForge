@@ -1,3 +1,4 @@
+import { applyCreationTablespaces } from './deploymentTablespaces.ts';
 import oracledb from "oracledb";
 import { retargetSchema } from "./objectCopy.ts";
 import { targetNamespaceCollision, compareObjectKey, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type DataDifference, type SchemaCompareRequest, type SchemaDifference } from "../src/utils/schemaCompare.ts";
@@ -138,7 +139,7 @@ export async function compareSchemaObjects(source: oracledb.Connection, target: 
         if (/^(TABLE|VIEW|MATERIALIZED VIEW|INDEX|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|PACKAGE BODY|TYPE|TYPE BODY|TRIGGER|SYNONYM|CLUSTER|DIMENSION)$/.test(o.type)) {
           item.script = `DROP ${o.type} ${qi(req.targetSchema)}.${qi(o.name)};`;
         } else item.warning = "Generate the removal script manually for this object type.";
-      } else if (!dst.has(key)) { item.status = "sourceOnly"; item.script = desired; }
+      } else if (!dst.has(key)) { item.status = "sourceOnly"; item.script = applyCreationTablespaces(desired, o.type, req); }
       else if (normalizeCompareDdl(desired) !== normalizeCompareDdl(item.targetDdl)) {
         item.status = "changed";
         if (replaceable.has(o.type)) item.script = desired;
