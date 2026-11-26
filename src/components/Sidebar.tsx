@@ -34,6 +34,7 @@ import {
   Users,
   Zap,
   Eye,
+  EyeOff,
 } from "lucide-react";
 import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
@@ -164,6 +165,16 @@ const KIND_LABEL: Record<string, string> = {
   graph: "Graph",
 };
 
+// Match the connection tree's categories: several distinct groups share a kind.
+const SCHEMA_OBJECT_TYPES = [
+  "Tables", "Views", "Indexes", "Packages", "Procedures", "Functions", "Operators",
+  "Queues", "Queues Tables", "Triggers", "Types", "Sequences", "Materialized Views",
+  "Materialized View Logs", "Synonyms", "Public Synonyms", "Database Links",
+  "Public Database Links", "Directories", "Editions", "XML Schemas", "Analytic Views",
+  "Scheduler", "Property Graph", "RDF Semantic Graph", "System-Generated Tables",
+  "Recycle Bin", "Other Users",
+];
+
 /** "package" → "Package", "dblink" → "DB Link" — used in editor tab titles. */
 const kindLabel = (kind: string) => KIND_LABEL[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
 
@@ -222,10 +233,31 @@ let cachedBump = 0;
 /** `connBusy` sentinel for an action that spans every connection rather than one */
 const ALL_BUSY = "*";
 
+const HIDDEN_CONNECTIONS_KEY = "dataforge-hidden-connections";
+function loadHiddenConnections(): string[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(HIDDEN_CONNECTIONS_KEY) ?? "[]");
+    return Array.isArray(saved) ? saved.filter((id): id is string => typeof id === "string") : [];
+  } catch { return []; }
+}
+
 export default function Sidebar() {
   const s = useStudio();
   const [search, setSearch] = useState("");
+  const [objectType, setObjectType] = useState("Packages");
   const [connsOpen, setConnsOpen] = useState(true);
+  // Kept separately from the registry so refreshing saved connections preserves this browser preference.
+  const [hiddenConnIds, setHiddenConnIds] = useState(loadHiddenConnections);
+  const [showHidden, setShowHidden] = useState(false);
+  useEffect(() => {
+    try { localStorage.setItem(HIDDEN_CONNECTIONS_KEY, JSON.stringify(hiddenConnIds)); }
+    catch { /* Browser storage may be unavailable. */ }
+  }, [hiddenConnIds]);
+  const setConnectionHidden = (id: string, hidden: boolean) => {
+    setHiddenConnIds(ids => hidden ? [...new Set([...ids, id])] : ids.filter(value => value !== id));
+    if (hidden) setShowHidden(false);
+  };
+  const hiddenCount = s.connections.filter(c => hiddenConnIds.includes(c.id)).length;
   const [expandedConnId, setExpandedConnId] = useState(s.activeConnId);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   /** how many items each group is currently rendering (see GROUP_PAGE) */
@@ -241,6 +273,7 @@ export default function Sidebar() {
   const [jobRunBusy, setJobRunBusy] = useState(false);
   /** id of the connection currently opening/closing its session (blocks double clicks) */
   const [connBusy, setConnBusy] = useState<string | null>(null);
+  const [browseAfterConnect, setBrowseAfterConnect] = useState<string | null>(null);
   /** label of the group being re-read on its own (one at a time — they share a session) */
   const [groupBusy, setGroupBusy] = useState<string | null>(null);
 
@@ -449,6 +482,20 @@ export default function Sidebar() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.schemaBump]);
 
+  // Connecting also browses the chosen schema once the store confirms success.
+  // Reconnect failures are reported by the store without rejecting its promise.
+  useEffect(() => {
+    if (!browseAfterConnect || connBusy) return;
+    const connection = s.connections.find(c => c.id === browseAfterConnect);
+    setBrowseAfterConnect(null);
+    if (connection?.status !== "connected" || s.activeConnId !== connection.id) return;
+    setConnsOpen(true);
+    setExpandedConnId(connection.id);
+    if (!liveSchemas[connection.id] || liveSchemas[connection.id].status === "error") refreshSchema(connection.id);
+    // The request is consumed once; changing filters does not reload the catalog.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browseAfterConnect, connBusy, s.connections, s.activeConnId]);
+
   const liveState = activeConn?.live ? liveSchemas[activeConn.id] : undefined;
   const schemaRefreshing = liveState?.status === "loading" || (liveState?.status === "ready" && !!liveState.refreshing);
   const schema: SchemaDef = liveState?.status === "ready" ? liveState.schema : EMPTY_SCHEMA;
@@ -459,6 +506,7 @@ export default function Sidebar() {
   const filteredGroups = useMemo(
     () =>
       schema.groups
+        .filter(g => objectType === "all" || g.label === objectType)
         .map((g) => ({
           ...g,
           items: g.items.filter((i) => !objectQuery || i.toLowerCase().includes(objectQuery)),
@@ -468,12 +516,12 @@ export default function Sidebar() {
           disabledSet: new Set(g.disabled ?? []),
         }))
         // empty categories stay visible (like SQL Developer) except while searching
-        .filter((g) => (objectQuery ? g.items.length > 0 : true)),
-    [schema, objectQuery]
+        .filter((g) => (objectQuery || objectType !== "all" ? g.items.length > 0 : true)),
+    [schema, objectQuery, objectType]
   );
   const filteredConns = useMemo(
-    () => s.connections.filter((c) => !q || c.name.toLowerCase().includes(q) || (c.id === s.activeConnId && filteredGroups.length > 0)),
-    [s.connections, s.activeConnId, q, filteredGroups]
+    () => s.connections.filter((c) => (!!q || showHidden || !hiddenConnIds.includes(c.id)) && (!q || c.name.toLowerCase().includes(q) || (c.id === s.activeConnId && filteredGroups.length > 0))),
+    [s.connections, s.activeConnId, q, filteredGroups, hiddenConnIds, showHidden]
   );
 
   // Object Editor tab — reused by kind+payload, so re-opening focuses the existing tab
@@ -644,55 +692,10 @@ export default function Sidebar() {
   };
 
   return (
-    <div className="h-full flex flex-col bg-panel border-r border-bdr min-w-0">
-      {/* search + collapse */}
-      <div className="p-2.5 border-b border-bdrsoft flex items-center gap-1.5">
-        <div className="relative flex-1 min-w-0">
-          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-mute" />
-          <input
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              if (e.target.value.trim()) setExpandedConnId(s.activeConnId);
-            }}
-            placeholder="Search connections & objects…"
-            aria-label="Search connections and schema objects"
-            className="w-full h-7.5 pl-8 pr-2 rounded-md bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
-          />
-        </div>
-        <button
-          onClick={s.toggleSidebar}
-          title="Collapse explorer (Ctrl+B)"
-          aria-label="Collapse explorer panel"
-          className="shrink-0 p-1.5 rounded-md text-mute hover:text-ink hover:bg-panel3 transition-colors"
-        >
-          <PanelLeftClose size={15} />
-        </button>
-      </div>
-
-      <div className="px-3 py-2 border-b border-bdrsoft bg-panel2/60 shrink-0" aria-live="polite">
-        <div className="text-[10px] font-bold uppercase tracking-wider text-mute">Selected connection</div>
-        {activeConn ? (
-          <>
-            <div className="flex items-center gap-2 min-w-0 mt-1">
-              <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[activeConn.status]}`} aria-hidden="true" />
-              <Database size={14} className="shrink-0" style={{ color: activeConn.color }} />
-              <span className="truncate text-[12px] font-semibold text-ink" title={activeConn.name}>{activeConn.name}</span>
-              <span className={`ml-auto shrink-0 text-[10px] font-semibold ${activeConn.status === "connected" ? "text-ok" : activeConn.status === "error" ? "text-err" : "text-mute"}`}>
-                {activeConn.status === "idle" ? "Offline" : activeConn.status === "error" ? "Failed" : "Connected"}
-              </span>
-            </div>
-            <div className="pl-4 mt-0.5 text-[10.5px] text-mute truncate" title={`${activeConn.user}@${activeConn.host}:${activeConn.port}${activeConn.database ? ` / ${activeConn.database}` : ""}`}>
-              {activeConn.user}@{activeConn.database || activeConn.host}
-              {activeConn.readOnly ? " · Read only" : ""}
-            </div>
-          </>
-        ) : (
-          <div className="mt-1 text-[12px] text-soft">Choose a connection below</div>
-        )}
-      </div>
-
-      <div className="flex-1 min-h-0 overflow-y-auto py-1">
+    <div className="desktop-navigator h-full flex flex-col bg-panel border-r border-bdr min-w-0">
+      {/* Navigation controls stay above filters; only the connection tree scrolls. */}
+      <div className="desktop-pane-heading"><Database size={14} /><span>Connections</span><button type="button" onClick={s.toggleSidebar} title="Hide Connections" aria-label="Hide Connections"><PanelLeftClose size={13} /></button></div>
+      <div className="shrink-0 border-b border-bdrsoft py-1">
         {/* connections */}
         <button
           className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-mute hover:text-soft"
@@ -701,7 +704,7 @@ export default function Sidebar() {
         >
           {connsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           Connections
-          <span className="text-[10px] font-normal normal-case tracking-normal">{s.connections.length}</span>
+          <span className="text-[10px] font-normal normal-case tracking-normal">{hiddenCount ? `${s.connections.length - hiddenCount} / ${s.connections.length}` : s.connections.length}</span>
           <span className="ml-auto flex items-center gap-0.5">
             {fullAccess && (
               <span
@@ -767,6 +770,77 @@ export default function Sidebar() {
             </span>
           </span>
         </button>
+        <div className="flex items-center gap-2 mx-3 mb-1 text-[11px]">
+          <button type="button" disabled={!s.connections.length || (hiddenCount === s.connections.length && !showHidden)}
+            title="Hide all saved connections, including connections outside the current search"
+            className="flex items-center gap-1 px-1.5 py-1 border border-bdr rounded text-soft hover:bg-panel3 disabled:opacity-40 disabled:cursor-default"
+            onClick={() => {
+              setHiddenConnIds(ids => [...new Set([...ids, ...s.connections.map(c => c.id)])]);
+              setShowHidden(false);
+              setConnsOpen(true);
+            }}
+          ><EyeOff size={12} />Hide All</button>
+          <button type="button" disabled={!hiddenCount}
+            title="Restore all hidden connections to the list"
+            className="flex items-center gap-1 px-1.5 py-1 border border-bdr rounded text-soft hover:bg-panel3 disabled:opacity-40 disabled:cursor-default"
+            onClick={() => { setHiddenConnIds([]); setShowHidden(false); setConnsOpen(true); }}
+          ><Eye size={12} />Show All</button>
+        </div>
+        {hiddenCount > 0 && <button type="button"
+          aria-pressed={showHidden}
+          onClick={() => { setShowHidden(value => !value); setConnsOpen(true); }}
+          className="flex items-center gap-1.5 mx-3 mb-1 px-1 py-1 text-[11px] text-mute hover:text-accenthi"
+        >{showHidden ? <EyeOff size={12} /> : <Eye size={12} />}{showHidden ? "Stop showing hidden connections" : "Show hidden connections"} ({hiddenCount})</button>}
+      </div>
+      <div className="desktop-connection-search p-2.5 border-b border-bdrsoft flex items-center gap-1.5 shrink-0">
+        <div className="relative flex-1 min-w-0">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-mute" />
+          <input
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              if (e.target.value.trim()) { setExpandedConnId(s.activeConnId); setConnsOpen(true); }
+            }}
+            placeholder="Search connections & objects…"
+            aria-label="Search connections and schema objects"
+            className="w-full h-7.5 pl-8 pr-2 rounded-md bg-panel2 border border-bdr text-[12px] placeholder:text-mute focus:border-accent focus:outline-none"
+          />
+        </div>
+        <button
+          onClick={s.toggleSidebar}
+          title="Collapse explorer (Ctrl+B)"
+          aria-label="Collapse explorer panel"
+          className="shrink-0 p-1.5 rounded-md text-mute hover:text-ink hover:bg-panel3 transition-colors"
+        >
+          <PanelLeftClose size={15} />
+        </button>
+      </div>
+
+      <div className="schema-type-filter"><label htmlFor="schema-object-type">Object type</label><select id="schema-object-type" value={objectType} onChange={e => setObjectType(e.target.value)}><option value="all">All objects</option>{[...new Set([...SCHEMA_OBJECT_TYPES, ...schema.groups.map(g => g.label)])].map(label => <option key={label} value={label}>{label}</option>)}</select>{objectType !== "all" && <button type="button" onClick={() => { setSearch(""); setObjectType("all"); }}>Clear filters</button>}</div>
+
+      {s.connections.some(c => c.status === "connected") && <div className="desktop-connection-summary px-3 py-2 border-b border-bdrsoft bg-panel2/60 shrink-0" aria-live="polite">
+        <div className="text-[10px] font-bold uppercase tracking-wider text-mute">Selected connection</div>
+        {activeConn ? (
+          <>
+            <div className="flex items-center gap-2 min-w-0 mt-1">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[activeConn.status]}`} aria-hidden="true" />
+              <Database size={14} className="shrink-0" style={{ color: activeConn.color }} />
+              <span className="truncate text-[12px] font-semibold text-ink" title={activeConn.name}>{activeConn.name}</span>
+              <span className={`ml-auto shrink-0 text-[10px] font-semibold ${activeConn.status === "connected" ? "text-ok" : activeConn.status === "error" ? "text-err" : "text-mute"}`}>
+                {activeConn.status === "idle" ? "Offline" : activeConn.status === "error" ? "Failed" : "Connected"}
+              </span>
+            </div>
+            <div className="pl-4 mt-0.5 text-[10.5px] text-mute truncate" title={`${activeConn.user}@${activeConn.host}:${activeConn.port}${activeConn.database ? ` / ${activeConn.database}` : ""}`}>
+              {activeConn.user}@{activeConn.database || activeConn.host}
+              {activeConn.readOnly ? " · Read only" : ""}
+            </div>
+          </>
+        ) : (
+          <div className="mt-1 text-[12px] text-soft">Choose a connection below</div>
+        )}
+      </div>}
+
+      <div className="flex-1 min-h-0 overflow-y-auto py-1">
         {connsOpen && s.connections.length === 0 && (
           <p className="px-6 py-2 text-[11.5px] text-mute leading-snug">
             No connections yet — click <Plus size={11} className="inline -mt-0.5" /> above to create a live Oracle connection
@@ -780,10 +854,11 @@ export default function Sidebar() {
           </p>
         )}
         {connsOpen && s.connections.length > 0 && filteredConns.length === 0 && (
-          <p className="px-6 py-2 text-[11px] text-mute">No matching connections</p>
+          <p className="px-6 py-2 text-[11px] text-mute">{hiddenCount === s.connections.length && !showHidden && !q ? "All connections are hidden. Use Show All to restore them." : "No matching connections"}</p>
         )}
         {connsOpen && filteredConns.length > 0 && <div className="border-b border-bdrsoft" aria-label="Saved connections">
           {filteredConns.map((c) => {
+            const hidden = hiddenConnIds.includes(c.id);
             const startEdit = () => {
               s.setEditingConn(c);
               s.setWizardOpen(true);
@@ -799,7 +874,7 @@ export default function Sidebar() {
               }
               if (c.status === "error") s.toast("error", `${c.name} is not connected — use Reconnect to try again.`);
             };
-            const doReconnect = () => runConnAction(c.id, s.reconnectConn);
+            const doReconnect = () => { setBrowseAfterConnect(c.id); runConnAction(c.id, s.reconnectConn); };
             const doDisconnect = () => runConnAction(c.id, s.disconnectConn);
             const askRemove = () =>
               s.askConfirm({
@@ -844,6 +919,7 @@ export default function Sidebar() {
                         action: () => { s.setActiveConnId(c.id); s.openTab("sessions", "Sessions"); },
                       }] : []),
                       { divider: true },
+                      { label: hidden ? "Show connection" : "Hide connection", action: () => setConnectionHidden(c.id, !hidden) },
                       { label: "Edit connection…", action: startEdit },
                       // opens the dialog with every connection preselected, not just this
                       // one — picking the subset is the dialog's job
@@ -859,37 +935,49 @@ export default function Sidebar() {
                   });
                 }}
               >
-                {/* Keep selection and the connection name separate from the controls: on a
-                    narrow Explorer the old one-row layout made both the name and buttons hard to see. */}
+                {/* Connecting is available beside the name even when the schema is collapsed. */}
+                <div className="flex items-center min-w-0 pr-1">
                 <button
                   type="button"
                   onClick={toggleTree}
                   aria-expanded={treeOpen}
                   aria-label={`${c.name} connection${treeOpen ? ", collapse schema" : ", expand schema"}`}
-                  className="w-full flex items-center gap-2 min-w-0 pl-6 pr-2.5 py-1.5 text-left cursor-pointer"
+                  className="flex-1 flex items-center gap-1.5 min-w-0 pl-2.5 pr-1.5 py-1.5 text-left cursor-pointer"
                   title={`Oracle — ${c.host}:${c.port} as ${c.user}${c.role && c.role !== "default" ? ` AS ${c.role}` : ""}${c.readOnly ? " · READ-ONLY" : ""}${offline ? " · NOT CONNECTED" : ""}`}
                 >
                   {treeOpen ? <ChevronDown size={12} className="shrink-0" /> : <ChevronRight size={12} className="shrink-0" />}
                   <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[c.status]}`} aria-label={c.status} />
                   <Database size={13} className="shrink-0" style={{ color: c.color }} />
                   <span className="truncate font-medium">{c.name}</span>
-                  {s.activeConnId === c.id && <span className="ml-auto shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-accenthi">Selected</span>}
+                  {hidden && <span className="text-[9px] text-mute shrink-0">Hidden</span>}
                   {c.readOnly && <Lock size={11} className="shrink-0 text-warn" aria-label="Read-only connection" />}
                 </button>
+                <button type="button" aria-label={`Connect ${c.name}`} aria-busy={busy}
+                  title={c.status === "connected" ? "Use this connected session" : "Connect — opens a new session"}
+                  disabled={connBusy !== null}
+                  className="shrink-0 flex items-center gap-1 px-1.5 py-1 border border-bdr rounded text-[10px] text-soft hover:text-ok hover:bg-panel3 disabled:opacity-40"
+                  onClick={() => {
+                    setBrowseAfterConnect(c.id);
+                    if (c.live && c.status !== "connected") doReconnect();
+                    else { setExpandedConnId(c.id); s.setActiveConnId(c.id); }
+                  }}
+                ><PlugZap size={12} className={busy ? "animate-pulse text-accenthi" : ""} />{busy ? "Connecting…" : "Connect"}</button>
+                <button type="button" aria-label={`${hidden ? "Show" : "Hide"} connection ${c.name}`}
+                  title={hidden ? "Show connection in the list" : "Hide connection from the list"}
+                  className="shrink-0 p-1 text-mute hover:text-accenthi hover:bg-panel3 rounded"
+                  onClick={() => setConnectionHidden(c.id, !hidden)}
+                >{hidden ? <Eye size={12} /> : <EyeOff size={12} />}</button>
+                </div>
                 {treeOpen && <div className="flex items-center gap-1 pl-10 pr-2 py-1 border-t border-bdrsoft/70 bg-panel2/35">
                   <span className={`text-[10px] font-semibold uppercase tracking-wide ${offline ? "text-mute" : c.status === "error" ? "text-err" : "text-ok"}`}>
                     {busy ? "Connecting…" : offline ? "Offline" : c.status}
                   </span>
                   <span className="text-[10px] text-mute uppercase">Oracle</span>
                   <span className="ml-auto flex items-center gap-0.5 shrink-0">
-                    {c.live && (
+                    {c.live && !offline && (
                     <button
-                      aria-label={`${offline ? "Connect" : "Reconnect"} ${c.name}`}
-                      title={
-                        offline
-                          ? "Connect — opens a new session"
-                          : "Reconnect — closes the pooled sessions and opens a new one"
-                      }
+                      aria-label={`Reconnect ${c.name}`}
+                      title="Reconnect — closes the pooled sessions and opens a new one"
                       disabled={busy}
                       className="p-1 rounded text-mute hover:text-ok hover:bg-panel3 disabled:opacity-40"
                       onClick={(e) => {
@@ -1019,7 +1107,7 @@ export default function Sidebar() {
         ) : liveState?.status === "ready" &&
           schema.groups.some((g) => g.kind === "database") &&
           filteredGroups.every((g) => g.items.length === 0) &&
-          !q ? (
+          !q && objectType === "all" ? (
           <div className="mx-2.5 my-1.5 border border-bdr rounded-lg px-2.5 py-2 text-[11.5px] text-soft">
             No user databases yet. Run{" "}
             <button
@@ -1041,8 +1129,8 @@ export default function Sidebar() {
             </button>
           </div>
         ) : (
-        filteredGroups.map((g) => {
-          const open = q ? true : (openGroups[g.label] ?? g.label === "Databases");
+        filteredGroups.length === 0 ? <p role="status" className="px-4 py-3 text-[12px] text-mute">No objects match the selected filters.</p> : filteredGroups.map((g) => {
+          const open = q || objectType !== "all" ? true : (openGroups[g.label] ?? g.label === "Databases");
           const limit = shown[g.label] ?? GROUP_PAGE;
           const visible = g.items.length > limit ? g.items.slice(0, limit) : g.items;
           const rest = g.items.length - visible.length;
@@ -1065,7 +1153,7 @@ export default function Sidebar() {
                   }}
                 >
                   {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                  <span className="text-accenthi">{KIND_ICON[g.kind]}</span>
+                  <span className={`desktop-object-icon object-${g.kind}`}>{KIND_ICON[g.kind]}</span>
                   {g.label}
                   <span className="ml-auto flex items-center gap-1 text-[10px] font-normal">
                     <span className="text-mute">{g.items.length}</span>

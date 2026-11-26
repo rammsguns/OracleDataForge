@@ -6,6 +6,7 @@ import { inferType, parseFile, toIdentifier, type ParsedTable } from "../utils/i
 import { download } from "../utils/sql";
 import type { Engine } from "../types";
 import { Btn, Field, inputCls, Modal } from "./ui";
+import ToolConnectionGate from "./ToolConnectionGate";
 
 export function ConnectionWizard() {
   const s = useStudio();
@@ -703,11 +704,10 @@ export function ImportWizard() {
   };
 
   // --- guards ---
-  if (!conn) {
+  if (!conn || conn.status !== "connected") {
     return (
-      <Modal title="Import CSV / JSON" onClose={close} width={460}>
-        <p className="text-[12.5px] text-mute">Select a live connection in the sidebar first — imports run against the active connection.</p>
-        <div className="flex justify-end pt-4"><Btn variant="primary" onClick={close}>Close</Btn></div>
+      <Modal title="Import CSV / JSON" onClose={close} width={640}>
+        <ToolConnectionGate title="Import Data">{null}</ToolConnectionGate>
       </Modal>
     );
   }

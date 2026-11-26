@@ -8,14 +8,16 @@ const statusLabel = (c: Connection) => c.status === "connected" ? "Connected" : 
 const endpoint = (c: Connection) => [c.host ? `${c.host}${c.port ? `:${c.port}` : ""}` : "", c.database].filter(Boolean).join(" / ");
 
 /** Search/filter state changes the available options without changing the selected database. */
-export default function ConnectionPicker({ connections, value, onChange, label, disabled = false }: {
+export default function ConnectionPicker({ connections, value, onChange, label, disabled = false, defaultOpen = false, inlineOptions = false }: {
   connections: Connection[];
   value: string;
   onChange: (id: string) => void;
   label: string;
   disabled?: boolean;
+  defaultOpen?: boolean;
+  inlineOptions?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const [access, setAccess] = useState("all");
@@ -65,7 +67,7 @@ export default function ConnectionPicker({ connections, value, onChange, label, 
       {selected && <span className={`text-[10px] shrink-0 ${selected.status === "connected" ? "text-ok" : selected.status === "error" ? "text-err" : "text-mute"}`}>{statusLabel(selected)}{selected.readOnly ? " · Read-only" : ""}</span>}
       <ChevronDown size={14} className={`shrink-0 text-mute transition-transform ${open ? "rotate-180" : ""}`} />
     </button>
-    {open && !disabled && <section id={popupId} aria-label={`${label} connection options`} className="absolute left-0 right-0 top-full mt-1 z-40 rounded-lg border border-bdr bg-panel shadow-2xl overflow-hidden">
+    {open && !disabled && <section id={popupId} aria-label={`${label} connection options`} className={`${inlineOptions ? "relative" : "absolute left-0 right-0 top-full z-40 shadow-2xl"} mt-1 rounded-lg border border-bdr bg-panel overflow-hidden`}>
       <div className="p-3 space-y-2 border-b border-bdrsoft bg-panel2">
         <div className="relative flex items-center"><Search size={14} className="absolute left-2 text-mute pointer-events-none" />
           <input ref={searchInput} aria-label={`Search ${label} connections`} value={search} placeholder="Search name, schema, host or service…"

@@ -17,11 +17,11 @@ import { useStudio } from "../state/store";
 import {
   api,
   ConfirmRequiredError,
-  type RoutineMember,
   type RoutineMeta,
   type RoutineParam,
   type RoutineRunResult,
 } from "../utils/api";
+import RoutineNavigator, { routineMemberKey } from "./RoutineNavigator";
 import CodeEditor from "./CodeEditor";
 import { Badge, Btn, EmptyState, Spinner, inputCls } from "./ui";
 import { generateRoutineBlock } from "../utils/plsqlBlock";
@@ -29,7 +29,7 @@ import { download } from "../utils/sql";
 import { getRunBuffer, runKey, setRunBuffer, type ArgState, type BlockState, type RoutineTestCase } from "../utils/runBuffers";
 import { editableArg, inputError, matchesExpected } from "../utils/routineTesting";
 
-const memberKeyOf = (m: RoutineMember) => `${m.name}#${m.overload ?? ""}`;
+const memberKeyOf = routineMemberKey;
 
 /** Examples are placeholders; inputs always start editable. */
 const freshArg = (): ArgState => ({ value: "", isNull: false, useDefault: false });
@@ -293,29 +293,15 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
   }
 
   return (
-    <div className="h-full flex flex-col min-w-0" onKeyDown={e => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && mode === 'form') { e.preventDefault(); void run(); }
+    <div className="routine-workbench h-full flex flex-col min-w-0" onKeyDown={e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && mode === 'form') { e.preventDefault(); e.stopPropagation(); void run(); }
     }}>
       {/* toolbar */}
-      <div className="flex items-center gap-2 px-3 py-2 flex-wrap border-b border-bdr shrink-0">
+      <div className="routine-toolbar flex items-center gap-2 px-3 py-2 flex-wrap border-b border-bdr shrink-0">
         <FlaskConical size={15} className="text-accenthi shrink-0" />
         <span className="font-mono text-[13px] font-semibold truncate">{meta.name}</span>
         <Badge tone="accent">{meta.type}</Badge>
-        {isPkg && (
-          <select
-            value={mKey}
-            disabled={running}
-            onChange={(e) => { setMemberKey(e.target.value); setResult(null); setCheckResult(null); setRunError(null); setExpectation({ enabled: false, value: '', isNull: false }); }}
-            aria-label="Package member to run"
-            className={`${inputCls} !w-auto max-w-64 font-mono !h-7 text-[12px]`}
-          >
-            {meta.members.map((m) => (
-              <option key={memberKeyOf(m)} value={memberKeyOf(m)}>
-                {m.name}{m.overload ? ` (overload ${m.overload})` : ""} — {m.kind.toLowerCase()}
-              </option>
-            ))}
-          </select>
-        )}
+        {isPkg && <span className="routine-active-member" title={target}>{member.name}{member.overload ? ` · overload ${member.overload}` : ""}</span>}
         {!isPkg && <Badge tone="neutral">{member.kind}</Badge>}
         <div className="ml-auto flex items-center gap-1.5">
           {/* what Run executes — the parameter grid's typed binds, or the block as written */}
@@ -345,10 +331,15 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
-        <div className="rounded-lg border border-accent/30 bg-accentdim p-3 space-y-1 text-[12px]">
-          <h2 className="font-semibold">Test {target}</h2>
-          <p className="text-soft">1. Choose inputs → 2. Run test (Ctrl+Enter) → 3. Inspect return values and output.</p>
+      <div className="routine-body flex-1 min-h-0 flex">
+        <RoutineNavigator members={meta.members} selected={mKey} disabled={running} onSelect={key => {
+          setMemberKey(key); setResult(null); setCheckResult(null); setRunError(null);
+          setExpectation({ enabled: false, value: '', isNull: false });
+        }} />
+      <div className="routine-test-content flex-1 min-w-0 min-h-0 overflow-auto p-3 space-y-3">
+        <div className="routine-test-summary border border-bdrsoft p-3 space-y-1 text-[12px]">
+          <h2 className="font-semibold font-mono">{target}</h2>
+          <p className="text-soft">Set parameter values, then run the test (Ctrl+Enter) to inspect its output.</p>
           <p className="text-mute">Runs the compiled database version on {conn?.name}. Compile source edits before testing.</p>
           <p className="text-warn">Routine runs commit on success in a separate session. Worksheet autocommit and Rollback do not apply here. Commits inside your code also persist.</p>
         </div>
@@ -400,7 +391,7 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
 
         {/* parameters */}
         {recordReturn && <p className="text-[12px] text-soft">Record return supported: Run test will display {member.returnFields!.map(f => f.name).join(', ')} as separate output values.</p>}
-        <fieldset disabled={running} className="border border-bdrsoft rounded-md">
+        <fieldset disabled={running} className="routine-parameters border border-bdrsoft rounded-md">
           <header className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-bdrsoft">
             <span className="text-[11px] font-bold uppercase tracking-wider text-mute">
               Parameters{member.kind === "FUNCTION" && member.returnType ? ` · returns ${member.returnType}` : ""}
@@ -623,6 +614,7 @@ function LiveRoutineRunner({ connId, routine }: { connId: string; routine: strin
           </section>
         )}
 
+      </div>
       </div>
     </div>
   );
