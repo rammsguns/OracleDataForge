@@ -3,6 +3,7 @@ import { useState } from "react";
 import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { Btn, Field, Modal, inputCls } from "./ui";
+import DesktopMenu from "./DesktopMenu";
 import appPackage from "../../package.json";
 
 /**
@@ -88,17 +89,18 @@ export function TitleBar() {
   const conn = s.connections.find((c) => c.id === s.activeConnId);
 
   return (
-    <header className="h-11 flex items-center gap-2 px-3 border-b border-bdr bg-panel shrink-0">
+    <>
+    <header className="desktop-titlebar flex items-center gap-2 px-3 border-b border-bdr shrink-0">
       {/* brand */}
       <div className="flex items-center gap-2 mr-2">
-        <div className="w-6.5 h-6.5 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shadow-sm">
+        <div className="desktop-brand-icon flex items-center justify-center">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
             <path d="M5 7c0-1.7 3.1-3 7-3s7 1.3 7 3v10c0 1.7-3.1 3-7 3s-7-1.3-7-3V7z" stroke="white" strokeWidth="2" />
             <ellipse cx="12" cy="7" rx="7" ry="3" fill="white" />
           </svg>
         </div>
-        <span className="text-[13.5px] font-bold tracking-tight">
-          Oracle <span className="text-accenthi font-semibold">DataForge</span>
+        <span className="text-[12px] font-semibold tracking-tight">
+          Oracle <span className="font-semibold">DataForge</span>
         </span>
       </div>
 
@@ -248,6 +250,8 @@ export function TitleBar() {
         </Modal>
       )}
     </header>
+    <DesktopMenu onAbout={() => setAboutOpen(true)} onShortcuts={() => setShortcutsOpen(true)} onAccount={() => setAccountOpen(true)} />
+    </>
   );
 }
 
@@ -262,7 +266,7 @@ export function StatusBar() {
   const conn = s.connections.find((c) => c.id === s.activeConnId);
   const schema = schemaOf(conn);
   return (
-    <footer className="h-6 flex items-center gap-4 px-3 border-t border-bdr bg-panel text-[11px] text-mute shrink-0">
+    <footer className="desktop-statusbar h-6 flex items-center gap-4 px-3 border-t border-bdr bg-panel text-[11px] text-mute shrink-0">
       <span className="flex items-center gap-1.5">
         <span
           className={`w-1.5 h-1.5 rounded-full ${

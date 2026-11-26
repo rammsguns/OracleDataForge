@@ -133,7 +133,7 @@ function Shell() {
   }, []);
 
   return (
-    <div className="h-full flex flex-col bg-bg text-ink">
+    <div className="desktop-shell h-full flex flex-col bg-bg text-ink">
       <TitleBar />
       <div className="flex-1 flex min-h-0">
         {s.sidebarOpen ? (

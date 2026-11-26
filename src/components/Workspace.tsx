@@ -12,7 +12,6 @@ import {
   ListChecks,
   Network,
   Play,
-  Plus,
   Table2,
   Terminal,
   UserCog,
@@ -44,6 +43,7 @@ import UserAdmin from "./UserAdmin";
 import PlsqlRepository from "./PlsqlRepository";
 import Sessions from "./Sessions";
 import RetainedTool from "./RetainedTool";
+import ToolConnectionGate from "./ToolConnectionGate";
 import { EmptyState } from "./ui";
 
 const TAB_ICON: Record<TabKind, React.ReactNode> = {
@@ -85,6 +85,7 @@ const LAUNCHERS: { kind: TabKind; title: string; label: string }[] = [
 ];
 
 const TOOL_KINDS = new Set<TabKind>([...LAUNCHERS.map(tool => tool.kind), "run", "compile"]);
+const CONNECTION_TOOLS = new Set<TabKind>(["run", "erd", "perf", "dba", "dbamanager", "sessions", "deps", "versions", "compile", "joblog"]);
 function ToolContent({ tab }: { tab: Tab }) {
   switch (tab.kind) {
     case "run": return <RoutineRunner routine={tab.payload!} />;
@@ -111,13 +112,8 @@ export default function Workspace() {
   const s = useStudio();
   const active = s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0];
   const activeTabRef = useRef<HTMLDivElement>(null);
-  const focusLaunchedTab = useRef(false);
   useEffect(() => {
     activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    if (focusLaunchedTab.current) {
-      activeTabRef.current?.focus({ preventScroll: true });
-      focusLaunchedTab.current = false;
-    }
   }, [active.id]);
   const fullAccess = s.accessRole === "Administrator" || s.accessRole === "Developer";
   const viewerTabs: TabKind[] = ["worksheet", "data", "object", "history", "deps", "versions"];
@@ -125,28 +121,10 @@ export default function Workspace() {
   const canUseActive = canView(active.kind);
 
   return (
-    <div className="flex flex-col h-full min-w-0 bg-panel">
+    <div className="desktop-workspace flex flex-col h-full min-w-0 bg-panel">
       {harnessEnabled && s.accessRole === "Analyst" && <AssistPanel key={JSON.stringify(s.session)} text="" selection="" connectionId={s.activeConnId} schema="" editorId="analyst-documentation" onApply={() => {}} />}
-      <div className="flex items-center gap-2 px-2 py-1.5 border-b border-bdr shrink-0">
-        <select aria-label="Open tabs" value={active.id} onChange={(e) => s.setActiveTabId(e.target.value)} className="min-w-0 max-w-52 rounded border border-bdr bg-panel2 px-2 py-1 text-[12px]">
-          {s.tabs.map((tab) => <option key={tab.id} value={tab.id}>{tab.title}{tab.dirty ? " •" : ""}</option>)}
-        </select>
-        {s.accessRole !== "Analyst" && <button className="text-[12px] flex items-center gap-1 whitespace-nowrap rounded px-2 py-1 hover:bg-panel3" onClick={() => s.openTab("worksheet", `Worksheet ${s.tabs.filter((t) => t.kind === "worksheet").length + 1}`, `ws-${Date.now()}`)}><Plus size={14} /> Worksheet</button>}
-        <details className="relative ml-auto">
-          <summary className="cursor-pointer rounded border border-bdr px-3 py-1 text-[12px]">Tools</summary>
-          <div className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[65vh] overflow-auto rounded-lg border border-bdr bg-panel p-2 shadow-2xl">
-            {[
-              { label: "Development", kinds: ["history", "versions", "repository", "compare", "migration", "deps", "erd"] },
-              { label: "Database administration", kinds: ["perf", "dba", "dbamanager", "sessions", "joblog", "admin"] },
-            ].map((group) => <div key={group.label}>
-              <div className="px-2 py-2 text-[10px] uppercase text-mute">{group.label}</div>
-              {LAUNCHERS.filter((l) => group.kinds.includes(l.kind) && canView(l.kind)).map((l) => <button key={l.kind} className="w-full flex items-center gap-2 rounded px-2 py-2 text-left text-[12px] hover:bg-panel3" onClick={(e) => { if (active.kind === l.kind && !active.payload) activeTabRef.current?.focus({ preventScroll: true }); else focusLaunchedTab.current = true; s.openTab(l.kind, l.title); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{TAB_ICON[l.kind]}{l.label}</button>)}
-            </div>)}
-          </div>
-        </details>
-      </div>
       {/* Open documents have their own scrollable strip. */}
-      <div className="flex items-stretch border-b border-bdr bg-bg shrink-0 overflow-x-auto" role="tablist" aria-label="Workspace tabs">
+      <div className="desktop-document-tabs flex items-stretch border-b border-bdr bg-bg shrink-0 overflow-x-auto" role="tablist" aria-label="Workspace tabs">
         {s.tabs.map((t) => (
           <div
             key={t.id}
@@ -157,7 +135,7 @@ export default function Workspace() {
             onClick={() => s.setActiveTabId(t.id)}
             onKeyDown={(e) => e.key === "Enter" && s.setActiveTabId(t.id)}
             onAuxClick={(e) => e.button === 1 && s.closeTab(t.id)}
-            className={`group flex items-center gap-1.5 px-3 h-9 text-[12px] cursor-pointer border-r border-bdrsoft select-none whitespace-nowrap transition-colors ${
+            className={`group flex items-center gap-1.5 px-3 h-7 text-[12px] cursor-pointer border-r border-bdrsoft select-none whitespace-nowrap transition-colors ${
               t.id === active.id
                 ? "bg-panel text-ink border-t-2 border-t-[var(--accent)]"
                 : "text-mute hover:text-soft hover:bg-panel/60 border-t-2 border-t-transparent"
@@ -168,7 +146,7 @@ export default function Workspace() {
             {t.dirty && <span className="w-1.5 h-1.5 rounded-full bg-warn shrink-0" title="Unsaved changes" aria-label="Unsaved changes" />}
             <button
               aria-label={`Close ${t.title}`}
-              className="ml-1 p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-panel3 hover:text-ink transition-opacity"
+              className="ml-1 p-0.5 rounded opacity-60 group-hover:opacity-100 hover:bg-panel3 hover:text-ink transition-opacity"
               onClick={(e) => {
                 e.stopPropagation();
                 s.closeTab(t.id);
@@ -195,7 +173,9 @@ export default function Workspace() {
             tool contents, and authorization is always checked against the live store. */}
         {s.tabs.filter(tab => TOOL_KINDS.has(tab.kind) && canView(tab.kind)).map(tab => (
           <RetainedTool key={`${JSON.stringify(s.session)}:${s.accessRole}:${tab.id}`} active={tab.id === active.id} connectionScoped={!["compare", "migration", "dbamanager", "history", "admin", "repository"].includes(tab.kind)}>
-            <ToolContent tab={tab} />
+            {CONNECTION_TOOLS.has(tab.kind)
+              ? <ToolConnectionGate title={tab.title}><ToolContent tab={tab} /></ToolConnectionGate>
+              : <ToolContent tab={tab} />}
           </RetainedTool>
         ))}
         {!canUseActive ? <EmptyState icon={<UserCog />} title="Feature unavailable for this role" hint={s.accessRole === "Analyst" ? "Analyst access is limited to browsing table data." : "Choose a feature that your current role can access."} /> : <>

@@ -280,7 +280,7 @@ function loadWorksheets(): { tabs: Tab[]; sql: Record<string, string>; activeId:
 export function StudioProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const accessRole: AccessRole = session?.role ?? "Viewer";
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [theme, setTheme] = useState<"dark" | "light">("light");
   const [sidebarOpen, setSidebarOpen] = useState(() => loadLayout().sidebarOpen);
   const [connections, setConnections] = useState<Connection[]>(loadStoredConnections);
   const [activeConnId, setActiveConnId] = useState(() => loadStoredConnections()[0]?.id ?? "");

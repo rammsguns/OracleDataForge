@@ -4,6 +4,7 @@ import { useStudio } from "../state/store";
 import { api, type ApplyStmtResult, type ApplyTableResult, type TableMeta } from "../utils/api";
 import { compareTables, type TableComparison } from "../utils/tableCompare";
 import { tokenize } from "../utils/sql";
+import ConnectionPicker from "./ConnectionPicker";
 import ObjectCopy from "./ObjectCopy";
 import TableDataCopy from "./TableDataCopy";
 import { Btn, Badge, Spinner } from "./ui";
@@ -408,19 +409,15 @@ export default function MigrationAssistant() {
 
       {/* source/target picker — shared by both modes */}
       <div className="flex items-end gap-3 flex-wrap mb-4">
-        <label className="block">
+        <div className="min-w-56 flex-1 max-w-96">
           <div className="text-[11px] font-semibold text-soft mb-1 uppercase tracking-wider">Source (reference)</div>
-          <select value={sourceId} onChange={(e) => setSourceId(e.target.value)} aria-label="Source connection" className="h-8 px-2 rounded-md bg-panel2 border border-bdr text-[12.5px] focus:border-accent focus:outline-none min-w-56">
-            {oracleConns.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        </label>
+          <ConnectionPicker label="source" connections={oracleConns} value={sourceId} onChange={setSourceId} disabled={phase === "comparing" || applying} />
+        </div>
         <ArrowRight size={16} className="text-mute mb-2" />
-        <label className="block">
+        <div className="min-w-56 flex-1 max-w-96">
           <div className="text-[11px] font-semibold text-soft mb-1 uppercase tracking-wider">Target (to be updated)</div>
-          <select value={targetId} onChange={(e) => setTargetId(e.target.value)} aria-label="Target connection" className="h-8 px-2 rounded-md bg-panel2 border border-bdr text-[12.5px] focus:border-accent focus:outline-none min-w-56">
-            {oracleConns.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        </label>
+          <ConnectionPicker label="target" connections={oracleConns} value={targetId} onChange={setTargetId} disabled={phase === "comparing" || applying} />
+        </div>
         {mode === "compare" && (
           <Btn variant="primary" onClick={() => runCompare()} className="mb-0.5" disabled={phase === "comparing" || sourceId === targetId} title={sourceId === targetId ? "Pick two different connections" : "Compare schemas"}>
             <Diff size={13} /> Compare schemas
