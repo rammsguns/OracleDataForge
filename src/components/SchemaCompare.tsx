@@ -8,6 +8,8 @@ import ConnectionPicker from "./ConnectionPicker";
 import DeploymentTablespaceFields from "./DeploymentTablespaceFields";
 import type { DeploymentTablespaces } from "../utils/schemaCompare";
 import PackageInstall from "./PackageInstall";
+import { schemaDeploymentFiles, downloadSqlZip, type InstallScriptOutput } from "../utils/installScriptExport";
+import { InstallScriptOutputSelector, InstallScriptFileSelector } from "./InstallScriptOutput";
 import { Btn, Spinner, inputCls } from "./ui";
 
 const statuses = ["same", "changed", "sourceOnly", "targetOnly", "error"] as const;
@@ -19,6 +21,17 @@ function download(text: string, name: string, type = "text/plain") {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 const toggle = (set: Set<string>, key: string) => { const next = new Set(set); if (next.has(key)) next.delete(key); else next.add(key); return next; };
+const TABLESPACES_STORAGE_KEY = 'dataforge-schema-compare-tablespaces';
+function rememberedTablespaces(): DeploymentTablespaces {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TABLESPACES_STORAGE_KEY) ?? '{}');
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {};
+    return {
+      ...(typeof saved.tableTablespace === 'string' ? {tableTablespace: saved.tableTablespace} : {}),
+      ...(typeof saved.indexTablespace === 'string' ? {indexTablespace: saved.indexTablespace} : {}),
+    };
+  } catch { return {}; }
+}
 
 export default function SchemaCompare() {
   const s = useStudio();
@@ -29,16 +42,17 @@ export default function SchemaCompare() {
   const [sourceSchema, setSourceSchema] = useState("");
   const [targetSchema, setTargetSchema] = useState("");
   const [catalogs, setCatalogs] = useState<[CompareCatalog, CompareCatalog] | null>(null);
-  const [packageMode, setPackageMode] = useState(false);
+  const [typeCatalogs, setTypeCatalogs] = useState<Pick<CompareCatalog, 'schema' | 'types'>[] | null>(null);
+  const [packageMode, setPackageMode] = useState(true);
   const [types, setTypes] = useState(new Set<string>());
   const [picked, setPicked] = useState(new Set<string>());
   const [search, setSearch] = useState("");
   const [compareData, setCompareData] = useState(false);
-  const [tablespaces, setTablespaces] = useState<DeploymentTablespaces>({});
+  const [tablespaces, setTablespaces] = useState<DeploymentTablespaces>(rememberedTablespaces);
   const [includeStorage, setIncludeStorage] = useState(false);
   const [includePackageDependencies, setIncludePackageDependencies] = useState(true);
   const [rowLimit, setRowLimit] = useState(1000);
-  const [busy, setBusy] = useState<"loading" | "comparing" | null>(null);
+  const [busy, setBusy] = useState<"types" | "loading" | "comparing" | null>(null);
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const connectingRef = useRef<string | null>(null);
   const [error, setError] = useState("");
@@ -49,18 +63,32 @@ export default function SchemaCompare() {
   const [pane, setPane] = useState<"diff" | "source" | "target" | "data" | "script">("diff");
   const [includeDrops, setIncludeDrops] = useState(false);
   const [includeData, setIncludeData] = useState(false);
+  const [scriptOutput, setScriptOutput] = useState<InstallScriptOutput>("single");
+  const [scriptFile, setScriptFile] = useState("install.sql");
   const [resultSearch, setResultSearch] = useState("");
 
   const objects = useMemo(() => [...new Map((catalogs?.flatMap(c => c.objects) ?? []).map(o => [compareObjectKey(o), o])).values()]
     .sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name)), [catalogs]);
-  const allTypes = [...new Set(objects.map(o => o.type))];
+  const allTypes = [...new Set(typeCatalogs?.flatMap(c => c.types) ?? [])].filter(type => !packageMode || type === 'PACKAGE').sort();
   const visible = objects.filter(o => types.has(o.type) && `${o.name} ${o.type}`.toLowerCase().includes(search.toLowerCase()));
   const chosen = objects.filter(o => types.has(o.type) && picked.has(compareObjectKey(o)));
   const detail = result?.objects.find(o => o.key === detailKey);
   const script = useMemo(() => result ? deploymentScript(result, selected, includeDrops, includeData) : "", [result, selected, includeDrops, includeData]);
+  const files = useMemo(() => result && scriptOutput === "by-type" ? schemaDeploymentFiles(result, selected, includeDrops, includeData) : [], [result, selected, includeDrops, includeData, scriptOutput]);
+  const currentFile = files.find(f => f.name === scriptFile) ?? files[0];
+  const downloadDeployment = () => {
+    try { if (scriptOutput === "by-type") downloadSqlZip(files, "schema-deployment-by-type.zip"); else download(script, "schema-deployment.sql"); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
   const sourceKeys = new Set(catalogs?.[0].objects.map(compareObjectKey));
   const targetKeys = new Set(catalogs?.[1].objects.map(compareObjectKey));
-  const clearSetup = () => { setCatalogs(null); setResult(null); setError(""); };
+  const clearSetup = () => { setTypeCatalogs(null); setTypes(new Set()); setCatalogs(null); setPicked(new Set()); setResult(null); setError(""); };
+  const changeTypes = (value: Set<string>) => { setTypes(value); setCatalogs(null); setPicked(new Set()); setResult(null); setError(''); };
+  const changeTablespaces = (value: DeploymentTablespaces) => {
+    setTablespaces(value); setResult(null);
+    try { localStorage.setItem(TABLESPACES_STORAGE_KEY, JSON.stringify(value)); }
+    catch { /* Keep the current values usable when browser storage is unavailable. */ }
+  };
   const connect = async (id: string) => {
     if (busy || connectingRef.current || connections.find(c => c.id === id)?.status === "connected") return;
     connectingRef.current = id;
@@ -69,15 +97,24 @@ export default function SchemaCompare() {
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { connectingRef.current = null; setConnectingId(null); }
   };
+  const loadTypes = async () => {
+    if (busy || connectingRef.current || !connectionsReady) return;
+    setBusy('types'); clearSetup();
+    try {
+      setTypeCatalogs(await Promise.all([api.compareCatalogTypes(sourceId, sourceSchema), api.compareCatalogTypes(targetId, targetSchema)]));
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(null); }
+  };
   const load = async () => {
+    if (busy || !typeCatalogs || !types.size) return;
     if (connectingRef.current) return;
     if (!connectionsReady) { setError("Connect both the source and target before loading objects."); return; }
     setBusy("loading"); setError(""); setResult(null); setCatalogs(null);
     try {
-      const list = await Promise.all([api.compareCatalog(sourceId, sourceSchema), api.compareCatalog(targetId, targetSchema)]);
+      const selectedTypes = [...types];
+      const list = await Promise.all([api.compareCatalog(sourceId, sourceSchema, selectedTypes), api.compareCatalog(targetId, targetSchema, selectedTypes)]);
       setCatalogs(list as [CompareCatalog, CompareCatalog]);
       const union = [...new Map(list.flatMap(c => c.objects).map(o => [compareObjectKey(o), o])).values()];
-      setTypes(new Set(union.map(o => o.type)));
       setPicked(new Set(union.length <= 500 ? union.map(compareObjectKey) : []));
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(null); }
@@ -123,27 +160,39 @@ export default function SchemaCompare() {
         <div className="flex flex-col items-center gap-1 text-accenthi"><ArrowRight size={22} /><Btn title="Swap source and target" onClick={() => { setSourceId(targetId); setTargetId(sourceId); setSourceSchema(targetSchema); setTargetSchema(sourceSchema); clearSetup(); }}><ArrowLeftRight size={14} /></Btn></div>
         {connPicker("target")}
       </div>
+      <div role="group" aria-label="Deployment workflow" className="flex gap-2 flex-wrap">
+        {[{packageMode: true, label: 'Package install with dependencies'}, {packageMode: false, label: 'Object comparison'}].map(mode => <button key={mode.label} type="button" aria-pressed={packageMode === mode.packageMode}
+          className={`border rounded px-3 py-1.5 disabled:opacity-40 ${packageMode === mode.packageMode ? 'border-accent/50 bg-accentdim text-accenthi' : 'border-bdr text-soft hover:text-ink'}`}
+          onClick={() => { if (packageMode !== mode.packageMode) { setPackageMode(mode.packageMode); changeTypes(new Set()); } }}>{mode.label}</button>)}
+      </div>
+      <div className="space-y-3" role="group" aria-label="Object types to load">
+        <div className="flex gap-2 items-center flex-wrap"><h3 className="font-semibold mr-auto">Object types</h3>
+          <Btn variant="outline" disabled={!connectionsReady} onClick={() => void loadTypes()}>Load object types</Btn>
+          {typeCatalogs && <><Btn disabled={!allTypes.length} onClick={() => changeTypes(new Set(allTypes))}>All types</Btn><Btn disabled={!types.size} onClick={() => changeTypes(new Set())}>Clear types</Btn></>}
+        </div>
+        <p className="text-mute">Load type names first, select the types you need, then load objects. Object names are fetched only for the selected types.{packageMode && ' Package install starts with PACKAGE; dependency analysis discovers tables, views and other required objects later.'}</p>
+        {typeCatalogs && <div className="flex flex-wrap gap-2">{allTypes.map(type => <label key={type} className={`border rounded px-2 py-1.5 flex gap-2 items-center ${types.has(type) ? 'border-accent/50 bg-accentdim' : 'border-bdr text-mute'}`}>
+          <input aria-label={`Load object type ${type}`} type="checkbox" checked={types.has(type)} onChange={() => changeTypes(toggle(types, type))} />{type}
+        </label>)}{!allTypes.length && <p className="text-mute">No {packageMode ? 'package types' : 'object types'} are visible in these schemas.</p>}</div>}
+      </div>
+      <DeploymentTablespaceFields value={tablespaces} onChange={changeTablespaces} />
       <div className="flex gap-4 flex-wrap items-center">
+        {!packageMode && <>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeStorage} onChange={e => { setIncludeStorage(e.target.checked); setResult(null); }} />Compare storage and tablespaces</label>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={compareData} onChange={e => { setCompareData(e.target.checked); setResult(null); }} />Compare table data</label>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includePackageDependencies} onChange={e => { setIncludePackageDependencies(e.target.checked); setResult(null); }} />Include package dependencies (tables, views, sequences, indexes)</label>
         {compareData && <label>Maximum rows per table per side <input aria-label="Data row limit" className={`${inputCls} w-24 ml-2`} type="number" min={1} max={10000} value={rowLimit} onChange={e => { setRowLimit(Number(e.target.value)); setResult(null); }} /></label>}
-        <Btn variant="outline" disabled={!connectionsReady} onClick={() => void load()}>Load objects</Btn>
+        </>}
+        <Btn variant="outline" disabled={!connectionsReady || !typeCatalogs || !types.size} onClick={() => void load()}>Load objects</Btn>
       </div>
-      <DeploymentTablespaceFields value={tablespaces} onChange={value => { setTablespaces(value); setResult(null); }} />
       {!connectionsReady && <p className="text-mute">Connect both the source and target to load or compare objects.</p>}
-      {compareData && <p className="text-mute">Rows match by primary key. Each database is read at its own consistent snapshot. Tables over the limit or with unsupported columns are reported as incomplete or skipped.</p>}
-      <p className="text-mute">Blank schema uses the connection user. Other schemas require dictionary and DBMS_METADATA access. All visible object types are listed; unsupported metadata is reported per object.</p>
+      {!packageMode && compareData && <p className="text-mute">Rows match by primary key. Each database is read at its own consistent snapshot. Tables over the limit or with unsupported columns are reported as incomplete or skipped.</p>}
+      <p className="text-mute">Blank schema uses the connection user. Other schemas require dictionary and DBMS_METADATA access. Unsupported metadata is reported per object.</p>
     </fieldset>
     {error && <div role="alert" className="m-4 p-3 border border-err/30 bg-err/10 text-err rounded">{error}</div>}
-    {busy && <div role="status" className="p-4 flex items-center gap-2 text-accenthi"><Spinner />{busy === "loading" ? "Loading object inventories…" : `Comparing ${chosen.length} objects${compareData ? " and table data" : ""}…`}</div>}
-    {catalogs && !result && <div className="p-5 flex gap-2"><Btn variant={!packageMode ? "primary" : "outline"} onClick={() => setPackageMode(false)}>Object comparison</Btn><Btn variant={packageMode ? "primary" : "outline"} onClick={() => setPackageMode(true)}>Package install with dependencies</Btn></div>}
+    {busy && <div role="status" className="p-4 flex items-center gap-2 text-accenthi"><Spinner />{busy === 'types' ? 'Loading object types…' : busy === "loading" ? "Loading objects for selected types…" : `Comparing ${chosen.length} objects${compareData ? " and table data" : ""}…`}</div>}
     {catalogs && packageMode && !result && connectionsReady && <div className="px-5 pb-5"><PackageInstall key={`${sourceId}:${targetId}:${catalogs[0].schema}:${catalogs[1].schema}`} sourceId={sourceId} targetId={targetId} catalogs={catalogs} tablespaces={tablespaces} /></div>}
     {catalogs && !result && !packageMode && <div className="p-5 space-y-3">
-      <div className="flex flex-wrap gap-2 items-center"><h3 className="font-semibold mr-auto">Object types</h3>
-        <Btn onClick={() => setTypes(new Set(allTypes))}>All types</Btn><Btn onClick={() => setTypes(new Set())}>Clear types</Btn>
-      </div>
-      <div className="flex flex-wrap gap-2">{allTypes.map(type => <label key={type} className={`border rounded px-2 py-1.5 flex gap-2 items-center ${types.has(type) ? "border-accent/50 bg-accentdim" : "border-bdr text-mute"}`}><input type="checkbox" checked={types.has(type)} onChange={() => setTypes(toggle(types, type))} />{type}<span className="text-mute">{objects.filter(o => o.type === type).length}</span></label>)}</div>
       <div className="flex items-center flex-wrap gap-2"><Search size={14} /><input aria-label="Filter objects" className={inputCls} placeholder="Find objects…" value={search} onChange={e => setSearch(e.target.value)} />
         <Btn onClick={() => setPicked(new Set([...picked, ...visible.map(compareObjectKey)]))}>Select visible</Btn>
         <Btn onClick={() => setPicked(new Set([...picked].filter(k => !visible.some(o => compareObjectKey(o) === k))))}>Clear visible</Btn>
@@ -166,8 +215,9 @@ export default function SchemaCompare() {
       <div className="flex flex-wrap gap-3 items-center border border-bdr rounded p-3 bg-panel2">
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeDrops} onChange={e => setIncludeDrops(e.target.checked)} />Include target-only DROP statements</label>
         <label className="flex gap-2 items-center"><input type="checkbox" checked={includeData} onChange={e => setIncludeData(e.target.checked)} />Include data INSERT / UPDATE / DELETE</label>
+        <InstallScriptOutputSelector value={scriptOutput} onChange={setScriptOutput} />
         <Btn variant="primary" disabled={!selected.size} onClick={() => setPane("script")}>Generate script ({selected.size})</Btn>
-        <Btn variant="outline" disabled={!selected.size} onClick={() => download(script, "schema-deployment.sql")}><Download size={13} />Download SQL</Btn>
+        <Btn variant="outline" disabled={!selected.size} onClick={downloadDeployment}><Download size={13} />{scriptOutput === "single" ? "Download SQL" : "Download scripts by type (ZIP)"}</Btn>
       </div>
       {(includeDrops || includeData || result.objects.some(o => o.warning)) && <p className="text-warn">Review destructive changes, privileges, dependencies and triggers before deployment. Object ordering is by type; cross-object dependencies and cycles may need manual reordering. No changes have been applied.</p>}
       <div className="flex flex-wrap gap-2 items-center"><input aria-label="Filter comparison results" className={inputCls} placeholder="Find result…" value={resultSearch} onChange={e => setResultSearch(e.target.value)} /><Btn onClick={() => setSelected(new Set(result.objects.filter(o => o.status !== "same" && o.status !== "error" && (includeDrops || o.status !== "targetOnly") || o.data?.status === "different").map(o => o.key)))}>Select differences</Btn><Btn onClick={() => setSelected(new Set())}>Clear selection</Btn></div>
@@ -179,7 +229,7 @@ export default function SchemaCompare() {
         </tr>)}</tbody></table></div>
         <div className="flex flex-col min-w-0 max-h-[65vh]">
           <div className="flex gap-1 p-2 border-b border-bdr bg-panel2 flex-wrap">{(["diff", "source", "target", "data", "script"] as const).map(p => <Btn key={p} variant={pane === p ? "primary" : "ghost"} onClick={() => setPane(p)}>{{ diff: "Definition diff", source: "Source DDL", target: "Target DDL", data: "Data differences", script: "Deployment script" }[p]}</Btn>)}</div>
-          {pane === "script" ? <pre aria-label="Deployment script" className="p-3 overflow-auto text-[11px] flex-1 whitespace-pre">{script}</pre> : <>
+          {pane === "script" ? <>{scriptOutput === "by-type" && <div className="p-3 border-b border-bdr"><InstallScriptFileSelector files={files} value={currentFile?.name ?? "install.sql"} onChange={setScriptFile} /></div>}<pre aria-label="Deployment script" className="p-3 overflow-auto text-[11px] flex-1 whitespace-pre">{scriptOutput === "by-type" ? currentFile?.content : script}</pre></> : <>
             <div className="px-3 py-2 font-mono border-b border-bdrsoft">{detail?.type} {detail?.name}</div>
             {detail?.warning && <p className="p-3 text-warn bg-warn/5">{detail.warning}</p>}
             {pane === "diff" && detail && <><p className="px-3 py-1 text-mute">− Target definition · + Desired source definition (original schema names shown)</p><DiffView oldSrc={detail.targetDdl} newSrc={detail.sourceDdl} /></>}
@@ -189,6 +239,6 @@ export default function SchemaCompare() {
         </div>
       </div>
     </div>}
-    {!catalogs && !busy && <div className="p-12 text-center text-mute"><GitCompareArrows className="mx-auto mb-3 opacity-40" size={36} /><p>Choose source and target connections, then load objects to compare all types or a custom selection.</p></div>}
+    {!catalogs && !busy && <div className="p-12 text-center text-mute"><GitCompareArrows className="mx-auto mb-3 opacity-40" size={36} /><p>Choose source and target connections, load object types, select the types you need, then load objects.</p></div>}
   </div>;
 }

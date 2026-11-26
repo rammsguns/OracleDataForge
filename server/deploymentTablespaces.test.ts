@@ -3,6 +3,19 @@ import test from 'node:test';
 import { applyCreationTablespaces as apply, readDeploymentTablespaces as read } from './deploymentTablespaces.ts';
 const both = {tableTablespace: 'app_data', indexTablespace: 'app_idx'};
 
+test('placement is idempotent when metadata and downloads both apply overrides', () => {
+  for (const [type, ddl] of [
+    ['TABLE', 'CREATE TABLE T (ID NUMBER GENERATED ALWAYS AS IDENTITY NOT NULL ENABLE, PRIMARY KEY (ID) USING INDEX ENABLE);'],
+    ['INDEX', 'CREATE INDEX IX ON T (ID);'],
+    ['MATERIALIZED VIEW', 'CREATE MATERIALIZED VIEW MV BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS SELECT * FROM T;'],
+    ['TABLE', 'CREATE TABLE T (ID NUMBER PRIMARY KEY USING INDEX (CREATE INDEX IX ON T (ID)) ENABLE);'],
+  ]) {
+    const sql = apply(ddl, type, both);
+    assert.equal(apply(sql, type, both), sql);
+  }
+  assert.throws(() => read({tableTablespace: '"' + '漢'.repeat(43) + '"'}), /1–128 bytes/);
+});
+
 test('validates Oracle tablespace identifiers and quotes them without accepting SQL fragments', () => {
   assert.deepEqual(read(both), {tableTablespace: '"APP_DATA"', indexTablespace: '"APP_IDX"'});
   assert.equal(read({tableTablespace: '"Mixed Case"'}).tableTablespace, '"Mixed Case"');

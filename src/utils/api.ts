@@ -980,7 +980,8 @@ const compileScopeQuery = (ref: CompileScopeRef) =>
       : "scope=schema";
 
 export const api = {
-  compareCatalog: (id: string, schema: string) => request<CompareCatalog>(`/api/connections/${encodeURIComponent(id)}/compare/catalog?schema=${encodeURIComponent(schema)}`),
+  compareCatalogTypes: (id: string, schema: string) => request<Pick<CompareCatalog, 'schema' | 'types'>>(`/api/connections/${encodeURIComponent(id)}/compare/types?schema=${encodeURIComponent(schema)}`),
+  compareCatalog: (id: string, schema: string, types: string[]) => request<CompareCatalog>(`/api/connections/${encodeURIComponent(id)}/compare/catalog?${new URLSearchParams([['schema', schema], ...types.map(type => ['type', type])])}`),
   schemaCompare: (targetId: string, input: SchemaCompareRequest) => request<SchemaCompareResult>(`/api/connections/${encodeURIComponent(targetId)}/compare`, input),
   packageInstall: (targetId: string, input: PackageInstallRequest) => request<PackageInstallPlan>(`/api/connections/${encodeURIComponent(targetId)}/compare/packages`, input),
   /** Writes compiled PL/SQL to GitHub through the local backend; the GitHub token stays server-side. */

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type oracledb from "oracledb";
-import { compareCatalog, compareDataLiteral, compareSchema, compareSchemaObjects, compareTableData, diffCompareData, remapSxml } from "./schemaCompare.ts";
+import { compareCatalog, compareCatalogTypes, readCatalogTypes, compareDataLiteral, compareSchema, compareSchemaObjects, compareTableData, diffCompareData, remapSxml } from "./schemaCompare.ts";
 import { targetNamespaceCollision, compareObjectKey, deploymentScript, type CompareCatalog, type SchemaCompareRequest, type SchemaCompareResult } from "../src/utils/schemaCompare.ts";
 
 test("schema names preserve quoted case and reject SQL fragments", () => {
@@ -48,6 +48,40 @@ const input: SchemaCompareRequest = { sourceId: "dev", sourceSchema: "DEV", targ
 function fakeConnection(execute: (sql: string, binds: Record<string, unknown>) => unknown) {
   return { execute: async (sql: string, binds: Record<string, unknown>) => execute(sql, binds) } as unknown as oracledb.Connection;
 }
+test('type discovery projects only type names and keeps the same catalog visibility rules', async () => {
+  const queries: string[] = [];
+  const conn = fakeConnection((sql, binds) => {
+    queries.push(sql);
+    assert.equal(binds.owner, 'DEV');
+    if (sql.includes('all_users')) return {rows: [{USERNAME: 'DEV'}]};
+    assert.match(sql, /^SELECT DISTINCT object_type FROM all_objects/);
+    assert.match(sql, /generated = 'N'/);
+    assert.match(sql, /SELECT mview_name FROM all_mviews/);
+    return {rows: [{OBJECT_TYPE: 'PACKAGE'}, {OBJECT_TYPE: 'TABLE'}]};
+  });
+  assert.deepEqual(await compareCatalogTypes(conn, 'DEV'), {schema: 'DEV', types: ['PACKAGE', 'TABLE']});
+  assert.equal(queries.length, 2);
+  await assert.rejects(() => compareCatalogTypes(fakeConnection(() => ({rows: []})), 'MISSING'), /does not exist/);
+  await assert.rejects(() => compareCatalogTypes(fakeConnection(() => {throw new Error('ORA-01031');}), 'DEV'), /ORA-01031/);
+});
+
+test('catalog loading binds only explicitly selected types and rejects invalid or empty selections before querying', async () => {
+  const conn = fakeConnection((sql, binds) => {
+    if (sql.includes('all_users')) return {rows: [{USERNAME: 'DEV'}]};
+    assert.match(sql, /object_type IN \(:type0, :type1\)/);
+    assert.deepEqual(binds, {owner: 'DEV', type0: 'TABLE', type1: 'MATERIALIZED VIEW'});
+    return {rows: [{OBJECT_NAME: 'T', OBJECT_TYPE: 'TABLE'}]};
+  });
+  assert.deepEqual((await compareCatalog(conn, 'DEV', ['TABLE', 'MATERIALIZED VIEW', 'TABLE'])).objects, [{name: 'T', type: 'TABLE'}]);
+  assert.deepEqual(readCatalogTypes('PACKAGE'), ['PACKAGE']);
+  for (const value of [undefined, null, [], {}, [''], [1], [['TABLE']], ["TABLE') OR 1=1--"], Array(101).fill('TABLE')]) {
+    assert.throws(() => readCatalogTypes(value), /Select between/);
+  }
+  let calls = 0;
+  await assert.rejects(() => compareCatalog(fakeConnection(() => {calls++; return {rows: []};}), 'DEV', []), /Select between/);
+  assert.equal(calls, 0);
+});
+
 test("metadata errors propagate, never become an empty equal catalog", async () => {
   const conn = fakeConnection(() => { throw new Error("ORA-01031"); });
   await assert.rejects(() => compareCatalog(conn, "DEV"), /ORA-01031/);

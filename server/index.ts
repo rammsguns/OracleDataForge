@@ -60,7 +60,7 @@ import {
   type CopyKind,
 } from "./objectCopy.ts";
 import oracledb from "oracledb";
-import { compareCatalog, compareSchema, compareSchemaObjects } from "./schemaCompare.ts";
+import { compareCatalog, compareCatalogTypes, readCatalogTypes, compareSchema, compareSchemaObjects } from "./schemaCompare.ts";
 import { buildPackageInstall, expandPackageSelection, dependencyOrder, packageMetadataTimeout } from "./packageInstall.ts";
 import type { SchemaCompareRequest } from "../src/utils/schemaCompare.ts";
 
@@ -5852,14 +5852,27 @@ function copyEndpoints(sourceId: string, targetId: string): { source: LiveConnec
 }
 
 /** What a copy would do, without doing any of it: GET ?source=<id>&kind=tables */
-app.get("/api/connections/:id/compare/catalog", requireSchemaMetadataAccess, async (req, res) => {
+app.get("/api/connections/:id/compare/types", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(routeId(req));
   if (!c) return res.status(404).json({ error: "Unknown connection." });
   let conn: oracledb.Connection | undefined;
   try {
     const schema = compareSchema(req.query.schema, c.user);
     conn = await getOraConn(c);
-    res.json(await compareCatalog(conn, schema));
+    res.json(await compareCatalogTypes(conn, schema));
+  } catch (e) { res.status(400).json({ error: errMsg(e) }); }
+  finally { await conn?.close().catch(() => {}); }
+});
+
+app.get("/api/connections/:id/compare/catalog", requireSchemaMetadataAccess, async (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection." });
+  let conn: oracledb.Connection | undefined;
+  try {
+    const schema = compareSchema(req.query.schema, c.user);
+    const types = readCatalogTypes(req.query.type);
+    conn = await getOraConn(c);
+    res.json(await compareCatalog(conn, schema, types));
   } catch (e) { res.status(400).json({ error: errMsg(e) }); }
   finally { await conn?.close().catch(() => {}); }
 });

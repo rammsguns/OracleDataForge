@@ -200,8 +200,26 @@ test('virtual columns are recomputed and BY DEFAULT identity keys are preserved 
   const result = await exportSeedTable(conn, conn, input, 'CAD_TIPOS_REPORTE', true);
   assert.match(result.script, /SELECT 9007199254740993 FROM DUAL/);
   assert.doesNotMatch(result.script.split('\n').filter(l => !l.startsWith('--')).join('\n'), /COMPUTED_VALUE/);
-  assert.match(result.warnings.join(' '), /Virtual columns omitted/);
+  assert.match(result.infos.join(' '), /Virtual columns omitted/);
+  assert.match(result.infos.join(' '), /Identity IDs preserved for ID/);
   assert.match(result.warnings.join(' '), /synchronizing identity sequences/);
+  assert.doesNotMatch(result.warnings.join(' '), /Identity IDs preserved|Virtual columns omitted/);
+  assert.match(result.script, /\[INFO\] Identity IDs preserved/);
+  assert.match(result.script, /\[WARNING\] The generated script explicitly commits/);
+});
+
+test('empty identity tables do not claim seed commits or identity changes', async () => {
+  const conn = connection(sql => {
+    if (sql.includes('all_tab_cols')) return {rows: [{...columns[0], IDENTITY_COLUMN: 'YES'}]};
+    if (sql.includes('all_tab_identity_cols')) return {rows: [{COLUMN_NAME: 'ID', GENERATION_TYPE: 'ALWAYS', IDENTITY_OPTIONS: identityOptions}]};
+    if (sql.includes('all_constraints')) return {rows: [{COLUMN_NAME: 'ID'}]};
+    return {rows: []};
+  });
+  const result = await exportSeedTable(conn, conn, input, 'EMPTY_RECIPIENTS', true);
+  assert.equal(result.rows, 0);
+  assert.deepEqual(result.preparationSql, []);
+  assert.deepEqual(result.finalizeSql, []);
+  assert.doesNotMatch([...result.infos, ...result.warnings].join(' '), /explicitly commits|Identity IDs preserved|maintenance window/);
 });
 
 test('unknown identity modes and unsupported types include specific column details and a recovery action', async () => {
