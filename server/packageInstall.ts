@@ -3,7 +3,7 @@ import oracledb from "oracledb";
 import { identitySequenceOptions } from "./tableDataCopy.ts";
 import { compareCatalog, compareRows, compareSchemaObjects, compareDataLiteral } from "./schemaCompare.ts";
 import { targetNamespaceCollision, compareObjectKey as key, quoteCompareIdentifier as qi, type CompareCatalog, type CompareObject, type SchemaDifference } from "../src/utils/schemaCompare.ts";
-import type { PackageInstallPlan, PackageInstallRequest } from "../src/utils/packageInstall.ts";
+import { packageInstallMessages, type PackageInstallPlan, type PackageInstallRequest } from "../src/utils/packageInstall.ts";
 
 type Row = Record<string, unknown>;
 const cleanComment = (s: string) => s.replace(/[\r\n\u2028\u2029]/g, " ");
@@ -188,7 +188,7 @@ export class SeedExportError extends Error {
 
 export async function exportSeedTable(source: oracledb.Connection, target: oracledb.Connection, input: PackageInstallRequest, table: string, exists: boolean) {
   const details: import('../src/utils/packageInstall.ts').SeedExportDetails = { stage: 'describe source columns', sourceSchema: input.sourceSchema, targetSchema: input.targetSchema, table, columns: [], advice: 'Review the column diagnostics and retry. No partial table script was generated.' };
-  const warnings: string[] = [];
+  const warnings: string[] = [], infos: string[] = [];
   const preparationSql: string[] = [], finalizeSql: string[] = [], schemaSql: string[] = [];
   try {
     const describe = (conn: oracledb.Connection, owner: string) => compareRows(conn, `SELECT column_name, data_type, data_length, data_precision, data_scale, char_length, char_used, nullable, virtual_column, identity_column
@@ -197,7 +197,7 @@ export async function exportSeedTable(source: oracledb.Connection, target: oracl
     if (!allCols.length) throw new Error('No visible source columns. Verify table visibility and dictionary privileges.');
     const cols = allCols.filter(c => c.VIRTUAL_COLUMN !== 'YES');
     const virtuals = allCols.filter(c => c.VIRTUAL_COLUMN === 'YES');
-    if (virtuals.length) warnings.push('Virtual columns omitted; Oracle recomputes: ' + virtuals.map(c => String(c.COLUMN_NAME)).join(', '));
+    if (virtuals.length) infos.push('Virtual columns omitted; Oracle recomputes: ' + virtuals.map(c => String(c.COLUMN_NAME)).join(', '));
     if (!cols.length) throw new Error('No writable columns remain after omitting virtual columns.');
     details.columns = cols.filter(c => !scalarTypes.test(String(c.DATA_TYPE)) && !lobTypes.has(String(c.DATA_TYPE))).map(c => ({ name: String(c.COLUMN_NAME), type: String(c.DATA_TYPE), reason: 'Unsupported seed data type' }));
     if (details.columns.length) { details.advice = 'Use Oracle Data Pump or a type-specific export for these columns; they were not silently dropped.'; throw new Error('Unsupported columns: ' + details.columns.map(c => c.name + ' (' + c.type + ')').join(', ')); }
@@ -219,7 +219,7 @@ export async function exportSeedTable(source: oracledb.Connection, target: oracl
               const unit = a.DATA_TYPE === 'NVARCHAR2' ? '' : a.CHAR_USED === 'C' ? ' CHAR' : ' BYTE';
               schemaSql.push('ALTER TABLE ' + qi(input.targetSchema) + '.' + qi(table) + ' MODIFY (' + qi(name) + ' ' + a.DATA_TYPE + '(' + length + unit + '));');
               warnings.push('Target column ' + name + ' is narrower (' + targetLength + ' vs source ' + length + '). The generated script widens it before loading; review the ALTER statement.');
-            } else warnings.push('Target column ' + name + ' is wider than the source and is retained.');
+            } else infos.push('Target column ' + name + ' is wider than the source and is retained.');
             continue;
           }
         }
@@ -252,7 +252,6 @@ export async function exportSeedTable(source: oracledb.Connection, target: oracl
         finalizeSql.push('ALTER TABLE ' + targetTable + ' MODIFY (' + column + ' GENERATED AS IDENTITY (START WITH LIMIT VALUE ' + options + '));');
         if (mode.GENERATION_TYPE === 'ALWAYS') finalizeSql.push('ALTER TABLE ' + targetTable + ' MODIFY (' + column + ' GENERATED ALWAYS AS IDENTITY);');
       }
-      warnings.push('Identity IDs preserved for ' + identities.map(c => String(c.COLUMN_NAME)).join(', ') + '. The generated script explicitly commits seed data before synchronizing identity sequences and restoring ALWAYS modes. Run during a maintenance window; use the recovery script if interrupted.');
     }
     details.stage = 'read primary keys';
     const primaryKey = async (conn: oracledb.Connection, owner: string) => (await compareRows(conn, `SELECT cc.column_name FROM all_constraints c JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name
@@ -331,7 +330,18 @@ export async function exportSeedTable(source: oracledb.Connection, target: oracl
         } finally { for (const lob of locators) await lob.close().catch(() => {}); }
       }
     } finally { await cursor?.close(); }
-    return { table, rows: count, warnings, schemaSql, preparationSql: count ? preparationSql : [], finalizeSql: count ? finalizeSql : [], script: [!keys.length ? '-- REVIEW: No primary key; INSERTs are not rerunnable.' : '-- Existing primary keys are preserved; differing target values are not overwritten.', ...warnings.map(w => '-- REVIEW: ' + cleanComment(w)), ...scripts].join('\n') };
+    if (count && !keys.length) warnings.push('No primary key; INSERTs are not rerunnable.');
+    if (count && identities.length) {
+      infos.push('Identity IDs preserved for ' + identities.map(c => String(c.COLUMN_NAME)).join(', ') + '.');
+      warnings.push('The generated script explicitly commits seed data before synchronizing identity sequences and restoring ALWAYS modes. Run during a maintenance window; use the recovery script if interrupted.');
+    }
+    return {
+      table, rows: count, infos, warnings, schemaSql, preparationSql: count ? preparationSql : [], finalizeSql: count ? finalizeSql : [],
+      script: [
+        ...(keys.length ? ['-- [INFO] Existing primary keys are preserved; differing target values are not overwritten.'] : []),
+        ...infos.map(w => '-- [INFO] ' + cleanComment(w)), ...warnings.map(w => '-- [WARNING] ' + cleanComment(w)), ...scripts,
+      ].join('\n'),
+    };
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     throw new SeedExportError(message, { ...details, code: /\b(?:ORA-\d+|NJS-\d+)/.exec(message)?.[0] ?? 'SEED_EXPORT_FAILED' });
@@ -423,7 +433,7 @@ export async function buildPackageInstall(source: oracledb.Connection, target: o
       const details = e instanceof SeedExportError ? e.details : undefined;
       const elapsedMs = Date.now() - startedAt;
       exports.push({ table: o.name, rows: 0, script: '', error, details, elapsedMs });
-      console.error(JSON.stringify({ event: 'seed-export-failed', at: new Date().toISOString(), table: o.name, sourceSchema: input.sourceSchema, targetSchema: input.targetSchema, error, details, elapsedMs }));
+      console.error(JSON.stringify({ severity: 'error', event: 'seed-export-failed', at: new Date().toISOString(), table: o.name, sourceSchema: input.sourceSchema, targetSchema: input.targetSchema, error, details, elapsedMs }));
     }
   }
   for (const o of objects) if (o.status === "error" || o.warning) warnings.push(`${o.type} ${o.name}: ${o.warning ?? "Metadata unavailable"}`);
@@ -438,7 +448,7 @@ export async function buildPackageInstall(source: oracledb.Connection, target: o
   for (const o of objects.filter(o => o.type === "TRIGGER" && install.includes(o))) warnings.push(`Missing trigger ${o.name} will be created before seed INSERTs; review its side effects.`);
   const lines = ["-- Oracle DataForge: package install (review before execution)", `-- ${cleanComment(sourceName)} / ${cleanComment(input.sourceSchema)} -> ${cleanComment(targetName)} / ${cleanComment(input.targetSchema)}`,
     ...(tablespaces.tableTablespace || tablespaces.indexTablespace ? [`-- Creation tablespaces: table/MV = ${tablespaces.tableTablespace || "default"}; indexes = ${tablespaces.indexTablespace || "default"}. Existing objects are not relocated.`] : []),
-    ...warnings.map(w => `-- REVIEW: ${cleanComment(w)}`),
+    ...packageInstallMessages({warnings, objects, exports}).map(e => `-- [${e.severity.toUpperCase()}] ${cleanComment((e.table ? e.table + ': ' : e.object ? e.object.type + ' ' + e.object.name + ': ' : '') + e.message)}`),
     "SET DEFINE OFF", "SET SQLBLANKLINES ON", "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK", `ALTER SESSION SET CURRENT_SCHEMA = ${qi(input.targetSchema)};`];
   if (exports.some(e => e.error) || objects.some(o => o.status === 'error')) lines.push("-- INCOMPLETE DEPLOYMENT: resolve dependency metadata and seed export errors before deployment.", "BEGIN RAISE_APPLICATION_ERROR(-20002, 'Deployment plan incomplete; resolve metadata and export errors and regenerate.'); END;\n/");
   // Safe column widening precedes object compilation; identity preparation follows creation DDL.

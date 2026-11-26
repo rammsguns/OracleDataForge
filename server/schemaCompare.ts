@@ -14,15 +14,30 @@ export function compareSchema(value: unknown, fallback: string): string {
   if (!/^[A-Za-z][A-Za-z0-9_$#]{0,127}$/.test(s)) throw new Error("Enter a valid schema name (quote case-sensitive names).");
   return s.toUpperCase();
 }
-export async function compareCatalog(conn: oracledb.Connection, schema: string): Promise<CompareCatalog> {
-  const exists = await compareRows(conn, "SELECT username FROM all_users WHERE username = :owner", { owner: schema });
-  if (!exists.length) throw new Error(`Schema ${schema} does not exist or is not visible.`);
-  const rows = await compareRows(conn, `SELECT object_name, object_type FROM all_objects
-    WHERE owner = :owner AND subobject_name IS NULL AND generated = 'N'
+const catalogWhere = `WHERE owner = :owner AND subobject_name IS NULL AND generated = 'N'
       AND object_name NOT LIKE 'BIN$%'
       AND (object_type <> 'TABLE' OR object_name NOT IN
-        (SELECT mview_name FROM all_mviews WHERE owner = :owner))
-      ORDER BY object_type, object_name`, { owner: schema });
+        (SELECT mview_name FROM all_mviews WHERE owner = :owner))`;
+async function requireCatalogSchema(conn: oracledb.Connection, schema: string) {
+  const exists = await compareRows(conn, "SELECT username FROM all_users WHERE username = :owner", { owner: schema });
+  if (!exists.length) throw new Error(`Schema ${schema} does not exist or is not visible.`);
+}
+export function readCatalogTypes(value: unknown): string[] {
+  const types = typeof value === 'string' ? [value] : value;
+  if (!Array.isArray(types) || !types.length || types.length > 100 || types.some(t => typeof t !== 'string' || !/^[A-Z][A-Z0-9_ ]{0,127}$/.test(t))) throw new Error('Select between 1 and 100 object types before loading objects.');
+  return [...new Set<string>(types)];
+}
+export async function compareCatalogTypes(conn: oracledb.Connection, schema: string): Promise<Pick<CompareCatalog, 'schema' | 'types'>> {
+  await requireCatalogSchema(conn, schema);
+  const rows = await compareRows(conn, `SELECT DISTINCT object_type FROM all_objects ${catalogWhere} ORDER BY object_type`, {owner: schema});
+  return {schema, types: rows.map(r => String(r.OBJECT_TYPE))};
+}
+export async function compareCatalog(conn: oracledb.Connection, schema: string, selectedTypes?: string[]): Promise<CompareCatalog> {
+  const types = selectedTypes === undefined ? undefined : readCatalogTypes(selectedTypes);
+  await requireCatalogSchema(conn, schema);
+  const filter = types ? ` AND object_type IN (${types.map((_, i) => ':type' + i).join(', ')})` : '';
+  const rows = await compareRows(conn, `SELECT object_name, object_type FROM all_objects ${catalogWhere}${filter}
+      ORDER BY object_type, object_name`, { owner: schema, ...Object.fromEntries((types ?? []).map((type, i) => ['type' + i, type])) });
   if (rows.length > 20000) throw new Error("Schema has more than 20,000 objects; narrow the schema before comparing.");
   const objects = rows.map(r => ({ name: String(r.OBJECT_NAME), type: String(r.OBJECT_TYPE) }));
   return { schema, objects, types: [...new Set(objects.map(o => o.type))] };
