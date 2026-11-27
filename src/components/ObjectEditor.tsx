@@ -375,7 +375,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
       parts.length > 1 ? `${type} ${object} (spec and body)` : parts[0] === "body" ? `${type} BODY ${object}` : `${type} ${object}`;
     s.askConfirm({
       title: `Save and compile ${object}?`,
-      body: `${peers.length ? "Other open sessions: " + peers.map(peer => peer.name + " (" + (peer.editing ? "editing" : "viewing") + " " + peer.part + ")").join(", ") + ". Coordinate changes before saving. " : ""}${what} will be written to "${conn?.name ?? "this connection"}" with CREATE OR REPLACE — the version currently in the database is overwritten and dependent objects may go INVALID. The previous source is kept in version history.`,
+      body: `${peers.length ? "Other open sessions: " + peers.map(peer => (peer.email ? peer.name + " <" + peer.email + ">" : peer.name) + " (" + (peer.editing ? "editing" : "viewing") + " " + peer.part + ")").join(", ") + ". Coordinate changes before saving. " : ""}${what} will be written to "${conn?.name ?? "this connection"}" with CREATE OR REPLACE — the version currently in the database is overwritten and dependent objects may go INVALID. The previous source is kept in version history.`,
       confirmLabel: "Save & compile",
       onConfirm: () => {
         void runCompile(parts);
@@ -408,7 +408,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
       {type === "PACKAGE" && (
         <div role="status" className="px-4 py-2 border-b border-bdrsoft text-[12px] shrink-0 text-mute">
           {presenceError ? "Live presence unavailable; the list may be out of date. Save conflict checks remain active." : peers.length ? (
-            <span className="text-warn">Also open in {peers.length} other session{peers.length === 1 ? "" : "s"}: {peers.map((peer, i) => <span key={peer.id}>{i > 0 ? "; " : ""}<strong>{peer.name}</strong> — {peer.editing ? "editing (unsaved changes)" : "viewing"} {peer.part === "body" ? "body" : "specification"}</span>)}. Coordinate before saving.</span>
+            <span className="text-warn">Also open in {peers.length} other session{peers.length === 1 ? "" : "s"}: {peers.map((peer, i) => <span key={peer.id}>{i > 0 ? "; " : ""}<strong>{peer.name}{peer.email && peer.email !== peer.name ? " (" + peer.email + ")" : ""}</strong> — {peer.editing ? "editing (unsaved changes)" : "viewing"} {peer.part === "body" ? "body" : "specification"}</span>)}. Coordinate before saving.</span>
           ) : "No other package editors detected in this workspace."}
         </div>
       )}

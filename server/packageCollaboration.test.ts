@@ -4,16 +4,18 @@ import { PackageCollaboration, assertPackageUnchanged } from './packageCollabora
 
 test('presence lists all other sessions, including shared accounts, and isolates packages', () => {
   const p = new PackageCollaboration();
-  assert.deepEqual(p.heartbeat('db/schema/pkg', 'a', 'alice', 'Alice', false, 'spec', 0), []);
-  p.heartbeat('db/schema/pkg', 'b', 'bob', 'Bob', true, 'body', 1);
+  assert.deepEqual(p.heartbeat('db/schema/pkg', 'a', 'alice', 'Alice', false, 'spec', 0, 'alice@example.com'), []);
+  p.heartbeat('db/schema/pkg', 'b', 'bob', 'Bob', true, 'body', 1, 'bob@example.com');
   const peers = p.heartbeat('db/schema/pkg', 'c', 'alice', 'Alice', false, 'body', 2);
-  assert.deepEqual(peers.map(p => [p.name, p.editing, p.part]), [['Alice', false, 'spec'], ['Bob', true, 'body']]);
+  assert.deepEqual(peers.map(p => [p.name, p.email, p.editing, p.part]), [['Alice', 'alice@example.com', false, 'spec'], ['Bob', 'bob@example.com', true, 'body']]);
   assert.deepEqual(p.heartbeat('db/other/pkg', 'd', 'd', 'Dan', false, 'spec', 3), []);
   assert.throws(() => p.heartbeat('db/schema/pkg', 'b', 'alice', 'Alice', false, 'spec', 4), /another user/);
   p.leave('db/schema/pkg', 'b', 'alice');
   assert.equal(p.heartbeat('db/schema/pkg', 'a', 'alice', 'Alice', false, 'spec', 5).length, 2);
   p.leave('db/schema/pkg', 'b', 'bob');
-  assert.equal(p.heartbeat('db/schema/pkg', 'a', 'alice', 'Alice', true, 'body', 6).length, 1);
+  const remaining = p.heartbeat('db/schema/pkg', 'a', 'alice', 'Alice', true, 'body', 6);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].email, null, 'Shared sessions without account email remain identifiable by name');
 });
 
 test('closed and disconnected editors expire without blocking later saves', () => {

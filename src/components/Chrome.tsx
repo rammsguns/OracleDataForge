@@ -186,6 +186,11 @@ export function TitleBar() {
             </div>
             <section aria-label="Changelog">
               <h3 className="font-semibold text-ink mb-1">Changelog</h3>
+              <div className="font-mono text-accenthi">1.2.2 — 2026-11-27</div>
+              <ul className="list-disc pl-5 space-y-1 mt-1 mb-3">
+                <li>Show workspace account emails for other sessions viewing or editing the same package.</li>
+                <li>Fix LAN connections through the development proxy while preserving origin checks and authentication.</li>
+              </ul>
               <div className="font-mono text-accenthi">1.2.1 — 2026-11-27</div>
               <ul className="list-disc pl-5 space-y-1 mt-1">
                 <li>See other sessions viewing or editing a package specification or body.</li>

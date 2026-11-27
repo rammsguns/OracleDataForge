@@ -24,8 +24,8 @@ test('package presence names viewers/editors; blocked saves retain edits and ori
   setEdits(key, { spec: mine, body: '', part: 'spec', original: { spec: original, body: '' }, baseline: { spec: original, body: '' } });
   t.mock.method(api, 'source', async () => ({ name: 'TEST_PKG', type: 'PACKAGE', source: newer }));
   t.mock.method(api, 'packagePresence', async () => ({ peers: [
-    { id: 'alice', name: 'Alice', editing: false, part: 'spec' },
-    { id: 'bob', name: 'Bob', editing: true, part: 'body' },
+    { id: 'alice', name: 'Alice', email: 'alice@example.com', editing: false, part: 'spec' },
+    { id: 'bob', name: 'Bob', email: 'bob@example.com', editing: true, part: 'body' },
   ] }));
   t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
   let saveCalls = 0;
@@ -35,18 +35,22 @@ test('package presence names viewers/editors; blocked saves retain edits and ori
   });
   const compiled = t.mock.method(api, 'compile', async () => { throw Error('Must not compile a blocked save'); });
   let confirm: (() => void) | undefined;
-  const studio = { activeConnId: 'test', accessRole: 'Developer', connections: [{ id: 'test', name: 'Test', live: true, readOnly: false }], setTabDirty: () => {}, toast: () => {}, askConfirm: (dialog: { onConfirm: () => void }) => { confirm = dialog.onConfirm; } } as unknown as ReturnType<typeof useStudio>;
+  let confirmationBody = '';
+  const studio = { activeConnId: 'test', accessRole: 'Developer', connections: [{ id: 'test', name: 'Test', live: true, readOnly: false }], setTabDirty: () => {}, toast: () => {}, askConfirm: (dialog: { onConfirm: () => void; body: string }) => { confirm = dialog.onConfirm; confirmationBody = dialog.body; } } as unknown as ReturnType<typeof useStudio>;
   const host = browser.document.createElement('div'); browser.document.body.append(host);
   const root = createRoot(host as unknown as HTMLElement);
   t.after(async () => { await act(async () => root.unmount()); host.remove(); });
   await act(async () => { root.render(<StudioSnapshot value={studio}><ObjectEditor object="TEST_PKG" tabId="test-tab" /></StudioSnapshot>); });
   assert.match(host.textContent!, /Alice.*viewing.*Bob.*editing \(unsaved changes\).*body/);
+  assert.match(host.textContent!, /alice@example.com/);
+  assert.match(host.textContent!, /bob@example.com/);
   const editor = host.querySelector('textarea')!;
   assert.equal(editor.value, mine);
   const button = host.querySelector('button[title^="Save & compile"]')!;
   assert.ok(button);
   await act(async () => { (button as unknown as HTMLButtonElement).click(); });
   assert.ok(confirm);
+  assert.match(confirmationBody, /alice@example.com.*bob@example.com/);
   await act(async () => { confirm!(); });
   assert.equal(saveCalls, 1);
   assert.equal(compiled.mock.callCount(), 0);

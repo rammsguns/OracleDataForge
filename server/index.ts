@@ -7231,7 +7231,7 @@ app.post("/api/connections/:id/package-presence", requireSchemaMetadataAccess, (
   if (leave === true) { packageCollaboration.leave(key, editorId, owner); return res.json({ peers: [] }); }
   try {
     const displayName = res.locals.userName ?? res.locals.userEmail ?? "Shared local session";
-    const peers = packageCollaboration.heartbeat(key, editorId, owner, displayName, editing === true && FULL_ACCESS_ROLES.includes(res.locals.role as Role) && !c.readOnly, part);
+    const peers = packageCollaboration.heartbeat(key, editorId, owner, displayName, editing === true && FULL_ACCESS_ROLES.includes(res.locals.role as Role) && !c.readOnly, part, Date.now(), res.locals.userEmail ?? null);
     res.json({ peers });
   } catch (e) { res.status(409).json({ error: errMsg(e) }); }
 });

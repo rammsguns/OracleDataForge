@@ -1,18 +1,18 @@
 /** Presence is advisory; source comparison and serialized saves prevent stale editor writes. */
 export class PackageCollaboration {
-  private viewers = new Map<string, Map<string, { owner: string; name: string; editing: boolean; part: string; touched: number }>>();
+  private viewers = new Map<string, Map<string, { owner: string; name: string; email: string | null; editing: boolean; part: string; touched: number }>>();
   private busy = new Set<string>();
   constructor(private ttl = 90_000) {}
 
-  heartbeat(key: string, id: string, owner: string, name: string, editing: boolean, part: string, now = Date.now()) {
+  heartbeat(key: string, id: string, owner: string, name: string, editing: boolean, part: string, now = Date.now(), email: string | null = null) {
     this.expire(now);
     let entries = this.viewers.get(key);
     if (!entries) { entries = new Map(); this.viewers.set(key, entries); }
     const previous = entries.get(id);
     if (previous && previous.owner !== owner) throw new Error('Editor belongs to another user. Reopen this tab.');
     if (!previous && [...this.viewers.values()].reduce((n, v) => n + v.size, 0) >= 2000) throw new Error('Too many open package editors. Close unused tabs.');
-    entries.set(id, { owner, name, editing, part, touched: now });
-    return [...entries].filter(([other]) => other !== id).map(([id, entry]) => ({ id, name: entry.name, editing: entry.editing, part: entry.part }));
+    entries.set(id, { owner, name, email, editing, part, touched: now });
+    return [...entries].filter(([other]) => other !== id).map(([id, entry]) => ({ id, name: entry.name, email: entry.email, editing: entry.editing, part: entry.part }));
   }
 
   leave(key: string, id: string, owner: string) {
