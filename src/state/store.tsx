@@ -24,6 +24,7 @@ import { discardEditsFor } from "../utils/editBuffers";
 import { discardTableBuffer } from "../utils/tableBuffers";
 import { discardDataPreview } from "../utils/dataBrowserCache";
 import { destructiveCheck, formatSql, isReadOnlySql } from "../utils/sql";
+import { useFontSizePreference } from "../utils/useFontSizePreference";
 
 export interface ConfirmState {
   title: string;
@@ -68,6 +69,10 @@ interface Store {
 
   reopenWorksheets: boolean;
   setReopenWorksheets: (enabled: boolean) => void;
+  worksheetMenuFontSize: number;
+  setWorksheetMenuFontSize: (size: number) => void;
+  appFontSize: number;
+  setAppFontSize: (size: number) => void;
   worksheetSaveError: boolean;
   tabs: Tab[];
   activeTabId: string;
@@ -289,6 +294,8 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     try { return localStorage.getItem(REOPEN_WORKSHEETS_KEY) !== "false"; } catch { return true; }
   });
   const [worksheetSaveError, setWorksheetSaveError] = useState(false);
+  const [worksheetMenuFontSize, setWorksheetMenuFontSize] = useFontSizePreference("dataforge-worksheet-menu-font-size", 8);
+  const [appFontSize, setAppFontSize] = useFontSizePreference("dataforge-app-font-size", 13);
   const [tabs, setTabs] = useState<Tab[]>(initialWorksheets.tabs);
   const [activeTabId, setActiveTabId] = useState(initialWorksheets.activeId);
   const [worksheetSql, setWorksheetSql] = useState<Record<string, string>>(initialWorksheets.sql);
@@ -1049,6 +1056,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setActiveConnId,
       reopenWorksheets,
       setReopenWorksheets,
+      worksheetMenuFontSize,
+      setWorksheetMenuFontSize,
+      appFontSize,
+      setAppFontSize,
       worksheetSaveError,
       tabs,
       activeTabId,
@@ -1104,7 +1115,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       editDataRequest,
       setEditDataRequest,
     }),
-    [reopenWorksheets, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, reportConnectionError, captureConnectionStatus, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
+    [appFontSize, setAppFontSize, reopenWorksheets, worksheetMenuFontSize, setWorksheetMenuFontSize, worksheetSaveError, getTransactionId, isAutoCommit, changeTableRow, autoCommit, transactionBusy, toggleAutoCommit, finishTransaction, accessRole, session, refreshSession, theme, sidebarOpen, connections, addConnection, updateConnection, reportConnectionError, captureConnectionStatus, removeConnection, disconnectConn, disconnectAll, reconnectConn, editingConn, activeConnId, tabs, activeTabId, openTab, closeTab, setTabDirty, bumpSchema, refreshGroups, groupRefresh, sql, running, result, runSql, doFormat, planVisible, plan, planLoading, runExplain, schemaBump, history, toggleFavorite, clearHistory, insertSql, openSqlWorksheet, toasts, toast, dismissToast, confirm, wizardOpen, importOpen, exportConnsOpen, importConnsOpen, refreshConnections, selectedObject, editDataRequest]
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

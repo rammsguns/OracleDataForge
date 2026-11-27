@@ -4,6 +4,7 @@ import { schemaOf, useStudio } from "../state/store";
 import { api } from "../utils/api";
 import { Btn, Field, Modal, inputCls } from "./ui";
 import DesktopMenu from "./DesktopMenu";
+import FontSizeControl from "./FontSizeControl";
 import appPackage from "../../package.json";
 
 /**
@@ -133,6 +134,7 @@ export function TitleBar() {
         >
           <Info size={14} /> <span>About</span>
         </button>
+        <FontSizeControl label="App" value={s.appFontSize} defaultSize={13} onChange={s.setAppFontSize} align="right" />
         <button
           type="button"
           onClick={() => setAccountOpen(true)}
