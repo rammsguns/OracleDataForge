@@ -85,7 +85,7 @@ function HealthRing({ score }: { score: number }) {
           strokeDasharray={`${(score / 100) * c} ${c}`} transform="rotate(-90 42 42)"
           style={{ transition: "stroke-dasharray 400ms ease" }}
         />
-        <text x="42" y="47" textAnchor="middle" fill="var(--ink)" style={{ fontSize: 20, fontWeight: 700 }}>{score}</text>
+        <text x="42" y="47" textAnchor="middle" fill="var(--ink)" className="text-[20px] font-bold">{score}</text>
       </svg>
       <div>
         <div className="text-[10.5px] uppercase tracking-wider text-mute font-semibold">Health score</div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   AlignLeft,
   Maximize2,
@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { useStudio } from "../state/store";
 import SqlEditor from "./SqlEditor";
+import FontSizeControl from "./FontSizeControl";
 import AssistPanel from "./AssistPanel";
 import { useHarnessEnabled } from "../utils/useHarnessEnabled";
 import ResultsGrid from "./ResultsGrid";
@@ -93,9 +94,10 @@ export default function SqlWorksheet() {
     : null;
 
   return (
-    <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden">
+    <div className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden" style={{ "--app-font-scale": 1, "--worksheet-menu-font-size": `${s.worksheetMenuFontSize}px` } as CSSProperties}>
       {/* worksheet toolbar */}
-      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
+      <div className="worksheet-menu flex items-center gap-1 px-2 py-1.5 border-b border-bdrsoft shrink-0 flex-wrap">
+        <FontSizeControl label="Worksheet menu" value={s.worksheetMenuFontSize} defaultSize={8} onChange={s.setWorksheetMenuFontSize} />
         <Btn variant="primary" onClick={runSql} title="Run selected statements in order or statement at cursor (Ctrl+Enter)" disabled={worksheetBusy}>
           <Play size={12} fill="currentColor" />
           Run
@@ -161,7 +163,7 @@ export default function SqlWorksheet() {
           <kbd className="hidden md:inline">Enter</kbd>
         </div>
       </div>
-      <div className="flex flex-wrap items-center gap-2 px-3 py-1 border-b border-bdrsoft text-[12px]">
+      <div className="worksheet-menu flex flex-wrap items-center gap-2 px-3 py-1 border-b border-bdrsoft text-[12px]">
         <button type="button" role="switch" aria-checked={s.autoCommit} onClick={s.toggleAutoCommit}
           disabled={worksheetBusy || !s.activeConnId || !['Administrator', 'Developer'].includes(s.accessRole) || activeConnection?.readOnly}
           className="rounded border border-bdr px-2 py-1 hover:bg-panel3 disabled:opacity-50">Auto-commit: {s.autoCommit ? 'On' : 'Off'}</button>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { PanelLeftOpen } from "lucide-react";
 import { loadLayout, saveLayout, StudioProvider, useStudio } from "./state/store";
 import Sidebar from "./components/Sidebar";
@@ -133,7 +133,7 @@ function Shell() {
   }, []);
 
   return (
-    <div className="desktop-shell h-full flex flex-col bg-bg text-ink">
+    <div className="desktop-shell h-full flex flex-col bg-bg text-ink" style={{ "--app-font-scale": s.appFontSize / 13 } as CSSProperties}>
       <TitleBar />
       <div className="flex-1 flex min-h-0">
         {s.sidebarOpen ? (
