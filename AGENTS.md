@@ -4,4 +4,4 @@ Always start the app bound to `0.0.0.0` so it is reachable from other devices. S
 
 # Pull requests and merges
 
-Always use the `oracle-dataforge-pr-merge` skill when creating, publishing, verifying, or merging pull requests for this project. Read `C:/Users/931244/.codex/skills/oracle-dataforge-pr-merge/SKILL.md` and follow its workflow, including any applicable fallback reference.
+Always use the `oracle-dataforge-pr-merge` skill when creating, publishing, verifying, or merging pull requests for this project. Locate its `SKILL.md` through the available skills catalog and follow its workflow, including any applicable fallback reference.
