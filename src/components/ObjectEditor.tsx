@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, CircleAlert, Copy, Download, FileCode2, Hammer, Info, Lightbulb, Loader2, Package, PenLine, Play, RefreshCw, Search } from "lucide-react";
 import { useStudio } from "../state/store";
-import { api, type ObjectSource } from "../utils/api";
+import { api, type ObjectSource, type PackagePeer } from "../utils/api";
 import CodeEditor, { type CodeEditorHandle } from "./CodeEditor";
 import { editKey, getEdits, setEdits } from "../utils/editBuffers";
 import { hintForError } from "../utils/plsqlHints";
@@ -92,6 +92,11 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
   const [spec, setSpec] = useState("");
   const [body, setBody] = useState("");
   const [orig, setOrig] = useState({ spec: "", body: "" });
+  const [baseline, setBaseline] = useState<{ spec: string | null; body: string | null }>({ spec: null, body: null });
+  const [peers, setPeers] = useState<PackagePeer[]>([]);
+  const [presenceError, setPresenceError] = useState(false);
+  const [saveConflict, setSaveConflict] = useState<string | null>(null);
+  const [editorId] = useState(() => "editor_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2));
   const [loaded, setLoaded] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [propertiesOpen, setPropertiesOpen] = useState(false);
@@ -167,8 +172,9 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
         setSrc(r);
         const specSrc = r.source ?? "";
         const bodySrc = r.bodySource ?? "";
-        setOrig({ spec: specSrc, body: bodySrc });
         const mem = getEdits(memKey);
+        setOrig(mem?.original ?? { spec: specSrc, body: bodySrc });
+        setBaseline(mem ? mem.baseline ?? { spec: null, body: null } : { spec: specSrc, body: bodySrc });
         setSpec(mem?.spec ?? specSrc);
         setBody(mem?.body ?? bodySrc);
         setLoaded(true);
@@ -179,12 +185,40 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
 
   // keep in-progress edits + selected part while this tab is unmounted (inactive tabs unmount)
   useEffect(() => {
-    if (loaded) setEdits(memKey, { spec, body, part });
-  }, [memKey, spec, body, part, loaded]);
+    if (loaded) setEdits(memKey, { spec, body, part, original: orig, baseline });
+  }, [memKey, spec, body, part, loaded, orig, baseline]);
 
   const dirtySpec = loaded && spec !== orig.spec;
   const dirtyBody = loaded && body !== orig.body;
   const dirty = dirtySpec || dirtyBody;
+  const presenceStatus = useRef({ dirty, part });
+  presenceStatus.current = { dirty, part };
+  const heartbeatRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (!loaded || src?.type !== "PACKAGE") return;
+    let alive = true;
+    let sequence = 0;
+    const heartbeat = () => {
+      const request = ++sequence;
+      const status = presenceStatus.current;
+      void api.packagePresence(connId, { name: src.name, editorId, editing: status.dirty, part: status.part }).then(result => {
+        if (alive && request === sequence) { setPeers(result.peers); setPresenceError(false); }
+      }).catch(() => { if (alive && request === sequence) setPresenceError(true); });
+    };
+    heartbeatRef.current = heartbeat;
+    heartbeat();
+    const timer = setInterval(heartbeat, 5000);
+    const resume = () => { if (!document.hidden) heartbeat(); };
+    document.addEventListener("visibilitychange", resume);
+    return () => {
+      alive = false;
+      heartbeatRef.current = null;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", resume);
+      void fetch("/api/connections/" + connId + "/package-presence", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: src.name, editorId, part: presenceStatus.current.part, leave: true }) }).catch(() => {});
+    };
+  }, [connId, src?.name, src?.type, loaded, editorId]);
+  useEffect(() => { heartbeatRef.current?.(); }, [dirty, part]);
   const reloadSource = async () => {
     if (compiling || refreshing) return;
     setRefreshing(true);
@@ -199,8 +233,10 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
       setSpec(nextSpec);
       setBody(nextBody);
       setOrig({ spec: nextSpec, body: nextBody });
+      setBaseline({ spec: nextSpec, body: nextBody });
+      setSaveConflict(null);
       setPartState(nextPart);
-      setEdits(memKey, { spec: nextSpec, body: nextBody, part: nextPart });
+      setEdits(memKey, { spec: nextSpec, body: nextBody, part: nextPart, original: { spec: nextSpec, body: nextBody }, baseline: { spec: nextSpec, body: nextBody } });
       setPanel(null);
       setActiveErr(null);
       setHintIdx(null);
@@ -268,15 +304,23 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
       for (const p of parts) {
         const source = p === "body" ? body : spec;
         const t = p === "body" ? `${type} BODY` : type;
-        const q = await api.query(connId, source, true);
+        const q = type === "PACKAGE"
+          ? await api.packageQuery(connId, source, src!.name, t, baseline[p])
+          : await api.query(connId, source, true);
         const qe = q.error;
         if (qe) {
           // the statement itself failed (bad CREATE line, read-only, …) — nothing was saved
+          if (type === "PACKAGE") setSaveConflict(qe.message);
           setPanel({ kind: "exec", message: `${qe.code}: ${qe.message}`, line: qe.line, part: p });
           if (p !== part) setPartState(p);
           setActiveErr({ part: p, line: qe.line });
           requestAnimationFrame(() => editorRef.current?.goTo(qe.line, 1));
           return;
+        }
+        if (type === "PACKAGE") {
+          const savedSource = "packageSource" in q && typeof q.packageSource === "string" ? q.packageSource : null;
+          setBaseline(previous => ({ ...previous, [p]: savedSource }));
+          setSaveConflict(null);
         }
         const v = q.versioned;
         if (v && v.action !== "UNCHANGED" && v.version != null) {
@@ -331,7 +375,7 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
       parts.length > 1 ? `${type} ${object} (spec and body)` : parts[0] === "body" ? `${type} BODY ${object}` : `${type} ${object}`;
     s.askConfirm({
       title: `Save and compile ${object}?`,
-      body: `${what} will be written to "${conn?.name ?? "this connection"}" with CREATE OR REPLACE — the version currently in the database is overwritten and dependent objects may go INVALID. The previous source is kept in version history.`,
+      body: `${peers.length ? "Other open sessions: " + peers.map(peer => peer.name + " (" + (peer.editing ? "editing" : "viewing") + " " + peer.part + ")").join(", ") + ". Coordinate changes before saving. " : ""}${what} will be written to "${conn?.name ?? "this connection"}" with CREATE OR REPLACE — the version currently in the database is overwritten and dependent objects may go INVALID. The previous source is kept in version history.`,
       confirmLabel: "Save & compile",
       onConfirm: () => {
         void runCompile(parts);
@@ -361,6 +405,23 @@ function LiveObjectEditor({ connId, object, tabId }: { connId: string; object: s
 
   return (
     <div className="h-full flex flex-col min-h-0 df-fade">
+      {type === "PACKAGE" && (
+        <div role="status" className="px-4 py-2 border-b border-bdrsoft text-[12px] shrink-0 text-mute">
+          {presenceError ? "Live presence unavailable; the list may be out of date. Save conflict checks remain active." : peers.length ? (
+            <span className="text-warn">Also open in {peers.length} other session{peers.length === 1 ? "" : "s"}: {peers.map((peer, i) => <span key={peer.id}>{i > 0 ? "; " : ""}<strong>{peer.name}</strong> — {peer.editing ? "editing (unsaved changes)" : "viewing"} {peer.part === "body" ? "body" : "specification"}</span>)}. Coordinate before saving.</span>
+          ) : "No other package editors detected in this workspace."}
+        </div>
+      )}
+      {saveConflict && <div role="alert" className="px-4 py-2 text-[12px] text-warn bg-warn/8 border-b border-warn/30">
+        <p>{saveConflict}</p>
+        <Btn variant="outline" onClick={() => {
+          const file = new Blob([spec + (body ? "\n/\n\n" + body + "\n/\n" : "")], { type: "text/plain" });
+          const url = URL.createObjectURL(file);
+          const link = document.createElement("a"); link.href = url; link.download = object + "-my-edits.sql"; link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }}>Download my edits</Btn>
+        <span className="ml-2">Keep a copy before using Refresh to reconcile with the database.</span>
+      </div>}
       {/* toolbar */}
       <div className="flex items-center gap-2.5 px-4 py-2 border-b border-bdrsoft flex-wrap shrink-0">
         {/* SQL Developer's editor toolbar: flat icon-only buttons leading the row, grouped by

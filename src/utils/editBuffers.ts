@@ -5,6 +5,8 @@ export interface EditBuffers {
   spec: string;
   body: string;
   part: "spec" | "body";
+  original?: { spec: string; body: string };
+  baseline?: { spec: string | null; body: string | null };
 }
 
 const buffers = new Map<string, EditBuffers>();

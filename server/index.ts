@@ -2,6 +2,7 @@ import { readDeploymentTablespaces } from './deploymentTablespaces.ts';
 import { readPerformanceResources, type ResourceReport } from "./performanceResources.ts";
 import { readDbaInsights } from "./dbaInsights.ts";
 import express from "express";
+import { PackageCollaboration, assertPackageUnchanged } from "./packageCollaboration.ts";
 import { describeTarget, describeRows } from './worksheetDescribe.ts';
 import { copyTableRows, CopyStoppedError, copyFilterError, parseCopyTableFilters, countCopyRows, lobCopyTables, enabledCopyTriggers, validateCopyCounts, nonEmptyCopyTables, readTableDependencies, parseCopyRowLimit, parseCopyTableRowLimits, parseCopyTotalLimit, truncateBlocker, truncateCopyTables } from './tableDataCopy.ts';
 import { copyRowLimitFor, limitedCopyCount, tableDataSelection, TABLE_COPY_MAX_ROWS, TABLE_COPY_MAX_TABLES } from '../src/utils/tableDataDependencies.ts';
@@ -1801,6 +1802,7 @@ function appendChangeLog(entry: ChangeLogEntry) {
 
 interface CodeChange {
   action: "CREATE" | "DROP";
+  schema?: string;
   type: string; // PROCEDURE | FUNCTION | PACKAGE | PACKAGE BODY | TRIGGER
   name: string;
 }
@@ -1821,7 +1823,8 @@ function detectCodeChange(engine: string, sql: string): CodeChange | null {
   const parts = m[2].split(".");
   let name = parts[parts.length - 1].replace(/[`"]/g, "");
   if (engine === "oracle" && !/"/.test(m[2])) name = name.toUpperCase();
-  return { action, type, name };
+  const schema = parts.length > 1 ? (parts[0].includes('"') ? parts[0].replace(/"/g, "") : parts[0].toUpperCase()) : undefined;
+  return { action, type, name, schema };
 }
 
 /** Canonical source as stored by Oracle (user_source keeps line breaks per line). */
@@ -7212,6 +7215,27 @@ app.post("/api/connections/:id/compile/invalid", requireFullAccess, async (req, 
   }
 });
 
+// One server coordinates all browsers and saved connections to the same endpoint/schema.
+const packageCollaboration = new PackageCollaboration();
+const packageKey = (c: LiveConnection, name: string) => JSON.stringify([oraConnectString(c), c.user, name]);
+app.post("/api/connections/:id/package-presence", requireSchemaMetadataAccess, (req, res) => {
+  const c = registry.get(routeId(req));
+  if (!c) return res.status(404).json({ error: "Unknown connection." });
+  const { name, editorId, editing, part, leave } = req.body ?? {};
+  if (typeof name !== "string" || !name || name.length > 128 || typeof editorId !== "string" || !/^[a-zA-Z0-9_-]{8,100}$/.test(editorId) || !["spec", "body"].includes(part)) {
+    return res.status(400).json({ error: "Invalid package editor presence." });
+  }
+  const key = packageKey(c, name);
+  const owner = worksheetOwner(req);
+  res.setHeader("Cache-Control", "no-store");
+  if (leave === true) { packageCollaboration.leave(key, editorId, owner); return res.json({ peers: [] }); }
+  try {
+    const displayName = res.locals.userName ?? res.locals.userEmail ?? "Shared local session";
+    const peers = packageCollaboration.heartbeat(key, editorId, owner, displayName, editing === true && FULL_ACCESS_ROLES.includes(res.locals.role as Role) && !c.readOnly, part);
+    res.json({ peers });
+  } catch (e) { res.status(409).json({ error: errMsg(e) }); }
+});
+
 /** Real source/DDL of one object, for the Object Editor: ?name= */
 app.get("/api/connections/:id/source", requireSchemaMetadataAccess, async (req, res) => {
   const c = registry.get(routeId(req));
@@ -8264,7 +8288,22 @@ app.post("/api/connections/:id/query", async (req, res) => {
     catch { return res.json({ columns: [], rows: [], durationMs: 0, rowsReturned: 0, error: { message: "Audit log unavailable. No statement was executed.", line: 1, code: "AUDIT-UNAVAILABLE" } }); }
   }
   let querySucceeded = false;
+  let releasePackage: (() => void) | undefined;
+  let packageSource: string | null | undefined;
   try {
+    const change = detectCodeChange(c.engine, sql);
+    const guard = req.body?.packageGuard;
+    if (guard && (!change || !change.type.startsWith("PACKAGE") || change.action !== "CREATE" || change.name !== guard.name || change.type !== guard.type || (change.schema !== undefined && change.schema !== c.user))) {
+      throw new Error("The edited statement must replace the package and part originally opened. Your edits are preserved.");
+    }
+    if (change?.type.startsWith("PACKAGE")) {
+      releasePackage = packageCollaboration.acquire(packageKey(c, change.name));
+      if (guard) {
+        const current = await oraObjectSource(c, change.name, "PACKAGE");
+        if (current.error || current.systemObject) throw new Error(current.error || "Editing Oracle-maintained packages is blocked.");
+        assertPackageUnchanged(guard.expected, change.type === "PACKAGE BODY" ? current.bodySource : current.source);
+      }
+    }
     const transactionId = req.body?.transactionId;
     const closeTransaction = req.body?.closeTransaction === true;
     if (closeTransaction && !/^\s*(COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql)) throw new Error('Only COMMIT or ROLLBACK can close a worksheet session.');
@@ -8272,6 +8311,12 @@ app.post("/api/connections/:id/query", async (req, res) => {
       ? await worksheetSessions.use(String(transactionId), worksheetOwner(req), c.id, conn => oraQuery(c, sql, conn), closeTransaction)
       : await oraQuery(c, sql);
     querySucceeded = true;
+    if (guard && change) {
+      try {
+        const saved = await oraObjectSource(c, change.name, "PACKAGE");
+        packageSource = (change.type === "PACKAGE BODY" ? saved.bodySource : saved.source) ?? null;
+      } catch { packageSource = null; }
+    }
     if (queryAudit) appendDbaAudit(DBA_AUDIT_FILE, { ...queryAudit, outcome: "success" });
     // auto-version code objects on success — must never break the query path
     let versioned: VersionedInfo | null = null;
@@ -8280,7 +8325,7 @@ app.post("/api/connections/:id/query", async (req, res) => {
     } catch (err) {
       console.error("Version capture failed:", err);
     }
-    res.json({ ...out, durationMs: Date.now() - started, error: null, versioned });
+    res.json({ ...out, durationMs: Date.now() - started, error: null, versioned, packageSource });
   } catch (e) {
     const err = e as { code?: string; errorNum?: number } & Partial<DbmsOutput>;
     const code = err.errorNum ? `ORA-${String(err.errorNum).padStart(5, "0")}` : err.code ?? "SQL-ERROR";
@@ -8303,7 +8348,7 @@ app.post("/api/connections/:id/query", async (req, res) => {
         ...(helpUrl ? { helpUrl } : {}),
       },
     });
-  }
+  } finally { releasePackage?.(); }
 });
 
 /**
