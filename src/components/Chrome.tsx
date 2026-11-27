@@ -184,6 +184,14 @@ export function TitleBar() {
                 <li>Disable triggers and identify disabled triggers and jobs by their gray appearance.</li>
               </ul>
             </div>
+            <section aria-label="Changelog">
+              <h3 className="font-semibold text-ink mb-1">Changelog</h3>
+              <div className="font-mono text-accenthi">1.2.1 — 2026-11-27</div>
+              <ul className="list-disc pl-5 space-y-1 mt-1">
+                <li>See other sessions viewing or editing a package specification or body.</li>
+                <li>Block stale package saves when database source changes, preserving local edits for download and reconciliation.</li>
+              </ul>
+            </section>
             <a className="text-accenthi hover:underline" href="https://github.com/rammsguns/OracleDataForge" target="_blank" rel="noopener noreferrer">Project repository ↗</a>
             <div className="flex justify-end"><Btn variant="outline" onClick={() => setAboutOpen(false)}>Close</Btn></div>
           </div>

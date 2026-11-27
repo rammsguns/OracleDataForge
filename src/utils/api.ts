@@ -716,6 +716,8 @@ export interface ObjectCopyResult {
   note?: string;
 }
 
+export interface PackagePeer { id: string; name: string; editing: boolean; part: string }
+
 export interface ObjectSource {
   properties?: { owner: string; type: string; status: string; created: string | null; lastDdlTime: string | null; objectId: number }[];
   name: string;
@@ -1053,6 +1055,10 @@ export const api = {
   deps: (id: string, name: string) => request<DepsReport>(`/api/connections/${id}/deps?name=${encodeURIComponent(name)}`),
   erd: (id: string) => request<ErdResult>(`/api/connections/${id}/erd`),
   /** `type` disambiguates objects whose names differ only in case (lowercase synonym vs uppercase view). */
+  packagePresence: (id: string, presence: { name: string; editorId: string; editing: boolean; part: string; leave?: boolean }) =>
+    request<{ peers: PackagePeer[] }>(`/api/connections/${id}/package-presence`, presence),
+  packageQuery: (id: string, sql: string, name: string, type: string, expected: string | null) =>
+    request<LiveQueryResult & { packageSource?: string | null }>(`/api/connections/${id}/query`, { sql, confirm: true, packageGuard: { name, type, expected } }),
   source: (id: string, name: string, type?: string) =>
     request<ObjectSource>(
       `/api/connections/${id}/source?name=${encodeURIComponent(name)}${type ? `&type=${encodeURIComponent(type)}` : ""}`

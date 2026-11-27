@@ -80,6 +80,14 @@ The wallet is unpacked on the backend and never reaches the browser; the host, p
 
 `SYS` connections are opened as `SYSDBA` automatically. New connections start in read-only mode; explicitly disable it when DDL, DML, compilation, imports, or routine execution are required.
 
+## Concurrent package editing
+
+Package editors show other open sessions, their workspace account names, whether they have unsaved changes, and the specification/body they are viewing. Status refreshes every five seconds. Shared credentials appear under the same account name as separate sessions; named workspace accounts identify individual people. Closed tabs leave the list, and disconnected sessions expire after 90 seconds.
+
+Save & compile compares the selected part with the database source originally loaded. If it changed, the save is blocked and your edits stay in the editor. Use **Download my edits**, then **Refresh** and reconcile with the latest database source before saving again. Specification and body are checked separately; when saving both, a conflict on the body can occur after the specification has already saved.
+
+Presence covers package editors connected to this backend. Saves through its SQL query endpoint are coordinated within that server. Other Oracle tools and separate DataForge servers do not announce presence or share the save coordinator; changes they make before the source check are detected, but they can still race a save. SQL worksheets and deployment tools do not perform the editor's original-source comparison.
+
 ## Production build
 
 ```bash
