@@ -716,7 +716,7 @@ export interface ObjectCopyResult {
   note?: string;
 }
 
-export interface PackagePeer { id: string; name: string; editing: boolean; part: string }
+export interface PackagePeer { id: string; name: string; email: string | null; editing: boolean; part: string }
 
 export interface ObjectSource {
   properties?: { owner: string; type: string; status: string; created: string | null; lastDdlTime: string | null; objectId: number }[];

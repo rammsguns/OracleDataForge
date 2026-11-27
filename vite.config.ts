@@ -9,7 +9,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://localhost:3001",
+      "/api": {
+        target: "http://localhost:3001",
+        // Keep Host aligned with the browser Origin, including LAN addresses.
+        // Vite's string shorthand enables changeOrigin and breaks the backend origin guard.
+        changeOrigin: false,
+      },
     },
     watch: {
       // the backend writes data/ (versions, changelog, connections) at runtime and none of
